@@ -33,6 +33,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - The litellm floor is now 1.101.0, the version verified to map
   `reasoning_effort` to adaptive thinking on Claude.
+- Script adapters run as asyncio subprocesses, so fan-out and independent
+  stages overlap instead of running one at a time. A script that times out or
+  is cancelled has its whole process group killed.
 
 ## [0.7.0] - 2026-10-05
 
