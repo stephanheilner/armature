@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from typing import Any
 
@@ -15,7 +16,8 @@ def _parser() -> argparse.ArgumentParser:
         description="Send an event to ARMATURE_EVENTS. Does nothing when it is unset.",
     )
     parser.add_argument("kind", nargs="?", help="Event kind, such as step_start or finding")
-    parser.add_argument("--step", help="Step id the event belongs to")
+    parser.add_argument("--step", default=os.environ.get("ARMATURE_STEP_ID") or None,
+                        help="Step id the event belongs to (default: ARMATURE_STEP_ID)")
     parser.add_argument("--json", dest="json_payload", help="Payload as a JSON object")
     parser.add_argument("--field", dest="fields", action="append", default=[],
                         help="Payload field as key=value, repeatable")

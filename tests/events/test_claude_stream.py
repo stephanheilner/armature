@@ -182,6 +182,19 @@ def test_cli_single_event_fields_and_json():
         reader.close()
 
 
+def test_cli_step_defaults_to_the_running_step():
+    reader = DatagramReader()
+    try:
+        env = {**os.environ, "ARMATURE_EVENTS": reader.endpoint, "ARMATURE_EVENTS_TOKEN": "t",
+               "ARMATURE_STEP_ID": "hello"}
+        proc = _cli(["log", "--field", "message=hi"], b"", env)
+        assert proc.returncode == 0, proc.stderr
+        [event] = reader.wait_for(1)
+        assert event["step_id"] == "hello"
+    finally:
+        reader.close()
+
+
 def test_cli_rejects_bad_input():
     env = {k: v for k, v in os.environ.items() if k != "ARMATURE_EVENTS"}
     assert _cli(["finding", "--json", "[1]"], b"", env).returncode != 0
