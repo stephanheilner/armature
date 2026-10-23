@@ -28,11 +28,11 @@ def test_yaml_with_env_overrides(tmp_path):
     path = tmp_path / "server.yaml"
     path.write_text("database_url: sqlite:///a.db\nhost: 0.0.0.0\nallow_public_bind: true\n"
                     "oidc:\n  issuer: https://okta.example\n  client_id: abc\n  client_secret_ref: OIDC_SECRET\n"
-                    "  admin_groups: [armature-admins]\n  group_roles: {mobile-devs: contributor}\n")
+                    "  admin_groups: [armature-admins]\n  group_roles:\n    mobile-devs: [{scope_kind: team, scope: mobile, role: contributor}]\n")
     cfg = load_config(path, env={"ARMATURE_SERVER_DATABASE_URL": "sqlite:///b.db", "ARMATURE_SERVER_PORT": "9000"})
     assert cfg.database_url == "sqlite:///b.db"
     assert cfg.port == 9000
-    assert cfg.oidc.group_roles == {"mobile-devs": "contributor"}
+    assert cfg.oidc.group_roles["mobile-devs"][0].role == "contributor"
 
 
 def test_env_cannot_force_public_bind_without_flag(tmp_path):
@@ -56,4 +56,4 @@ def test_bad_values_refused(field, value):
 
 def test_unknown_role_in_group_roles_refused():
     with pytest.raises(ValidationError):
-        ServerConfig(oidc={"issuer": "i", "client_id": "c", "client_secret_ref": "s", "group_roles": {"g": "root"}})
+        ServerConfig(oidc={"issuer": "i", "client_id": "c", "client_secret_ref": "s", "group_roles": {"g": [{"scope_kind": "team", "scope": "t", "role": "root"}]}})

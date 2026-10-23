@@ -130,7 +130,7 @@ def test_membership_source_defaults_to_manual(engine):
     user_id = new_id()
     with engine.begin() as conn:
         conn.execute(insert(users).values(id=user_id, username="u", last_totp_step=0, is_admin=False, disabled=False,
-                                          must_change_password=False, created_at=utcnow()))
+                                          created_at=utcnow()))
         conn.execute(insert(memberships).values(id=new_id(), user_id=user_id, scope_kind="team", scope_id=new_id(),
                                                 role="viewer", created_at=utcnow()))
         assert conn.execute(select(memberships.c.source)).scalar_one() == "manual"

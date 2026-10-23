@@ -18,7 +18,25 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   prompted password and a TOTP secret. Secrets are sealed with AES-256-GCM
   under HKDF sub-keys of the master key, bound to their team, id, and name.
   The server refuses a non-loopback bind unless `allow_public_bind` is set.
-  `armature server run` is not implemented yet.
+- **`armature server run`** serves a signed-in JSON API and the browser UI
+  under `base_path`, and refuses to start without an admin or a master key.
+  Local users join through a single-use invite link, valid for 72 hours,
+  where they set a password and enroll TOTP. Admins invite anyone, and a team
+  lead invites into a team they lead. Sign-in is password plus TOTP, with
+  replay blocked by a conditional update, or OIDC (authorization code with
+  PKCE, accounts linked on issuer and subject only, roles recomputed from
+  `oidc.group_roles` on every sign-in, admin only through
+  `oidc.admin_groups`, step-up only through a fresh provider sign-in).
+  Sessions are HMAC-keyed rows with 30-minute idle and 12-hour absolute
+  limits, a `__Secure-armature` cookie, an Origin and CSRF check on every
+  mutation, per-address and per-user throttles, HSTS, and step-up for users
+  and secrets. Five roles (admin, team lead, project lead, contributor,
+  viewer) are checked per route against the team and project read from the
+  database. `create-admin` now confirms a TOTP code before it exits.
+  `trust_real_ip` reads `X-Real-IP` from a proxy on the same host
+  (docs/platform/DEPLOY.md). `oidc.group_roles` now maps a group to a list of
+  `{scope_kind, scope, role}` grants. Names are case-sensitive and usernames
+  case-insensitive on every database.
 - **`reasoning_effort` on model tiers and roles.** A tier can set
   `reasoning_effort: low | medium | high | xhigh | max`, and a role can
   override it, resolved role → tier → omitted like `temperature` and

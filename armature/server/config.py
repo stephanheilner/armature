@@ -18,7 +18,17 @@ CONFIG_ENV = "ARMATURE_SERVER_CONFIG"
 DEFAULT_CONFIG_PATH = Path("~/.armature/server.yaml")
 ENV_PREFIX = "ARMATURE_SERVER_"
 
-Role = Literal["admin", "team_lead", "project_lead", "contributor", "viewer"]
+ScopedRole = Literal["team_lead", "project_lead", "contributor", "viewer"]
+
+
+class GroupGrant(BaseModel):
+    """A role a group grants in one team, or one project named ``team/project``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scope_kind: Literal["team", "project"]
+    scope: str
+    role: ScopedRole
 
 
 class OIDCConfig(BaseModel):
@@ -27,8 +37,10 @@ class OIDCConfig(BaseModel):
     issuer: str
     client_id: str
     client_secret_ref: str
+    scopes: list[str] = Field(default_factory=lambda: ["openid", "profile", "email"])
+    groups_claim: str = "groups"
     admin_groups: list[str] = Field(default_factory=list)
-    group_roles: dict[str, Role] = Field(default_factory=dict)
+    group_roles: dict[str, list[GroupGrant]] = Field(default_factory=dict)
 
 
 class ServerConfig(BaseModel):
@@ -40,6 +52,7 @@ class ServerConfig(BaseModel):
     host: str = "127.0.0.1"
     port: int = Field(default=8098, ge=1, le=65535)
     allow_public_bind: bool = False
+    trust_real_ip: bool = False
     master_key: str = Field(default_factory=lambda: f"file:{Path('~/.armature/master.key').expanduser()}")
     oidc: OIDCConfig | None = None
     password_login: bool = True

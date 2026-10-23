@@ -89,3 +89,9 @@ def resolve_for_run(conn: Connection, keyring: Keyring, team_id: str, names: lis
     # AAD comes from the scope the caller asked for, never from row columns a writer could change.
     return {name: keyring.open_(r.ciphertext, aad(None if r.scope == INSTANCE_SCOPE else team_id, r.id, name))
             for name, r in chosen.items()}
+
+
+def resolve_instance(conn: Connection, keyring: Keyring, name: str) -> str | None:
+    row = conn.execute(select(secrets.c.id, secrets.c.ciphertext)
+                       .where(secrets.c.scope == INSTANCE_SCOPE, secrets.c.name == name)).first()
+    return keyring.open_(row.ciphertext, aad(None, row.id, name)) if row else None

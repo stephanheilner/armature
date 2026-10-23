@@ -23,6 +23,11 @@ def _timestamp():
     return sa.DateTime(timezone=True).with_variant(mysql.DATETIME(fsp=6), "mysql")
 
 
+# MySQL's default collation ignores case, so names use a binary one there.
+def _name(length):
+    return sa.String(length=length).with_variant(mysql.VARCHAR(length, collation="utf8mb4_bin"), "mysql")
+
+
 def upgrade() -> None:
     """Upgrade schema."""
     op.create_table('audit',
@@ -78,7 +83,7 @@ def upgrade() -> None:
     )
     op.create_table('teams',
     sa.Column('id', sa.String(length=36), nullable=False),
-    sa.Column('name', sa.String(length=191), nullable=False),
+    sa.Column('name', _name(191), nullable=False),
     sa.Column('created_at', _timestamp(), nullable=False),
     sa.PrimaryKeyConstraint('id', name=op.f('pk_teams')),
     sa.UniqueConstraint('name', name=op.f('uq_teams_name'))
@@ -95,7 +100,6 @@ def upgrade() -> None:
     sa.Column('last_totp_step', sa.BigInteger(), nullable=False),
     sa.Column('is_admin', sa.Boolean(), nullable=False),
     sa.Column('disabled', sa.Boolean(), nullable=False),
-    sa.Column('must_change_password', sa.Boolean(), nullable=False),
     sa.Column('totp_confirmed_at', _timestamp(), nullable=True),
     sa.Column('created_at', _timestamp(), nullable=False),
     sa.Column('last_login_at', _timestamp(), nullable=True),
@@ -120,7 +124,7 @@ def upgrade() -> None:
     sa.Column('team_id', sa.String(length=36), nullable=True),
     sa.Column('scope', sa.String(length=36), nullable=False),
     sa.Column('kind', sa.String(length=16), nullable=False),
-    sa.Column('key', sa.String(length=191), nullable=False),
+    sa.Column('key', _name(191), nullable=False),
     sa.Column('current_version', sa.Integer(), nullable=False),
     sa.Column('created_at', _timestamp(), nullable=False),
     sa.Column('updated_at', _timestamp(), nullable=False),
@@ -149,7 +153,7 @@ def upgrade() -> None:
     op.create_table('projects',
     sa.Column('id', sa.String(length=36), nullable=False),
     sa.Column('team_id', sa.String(length=36), nullable=False),
-    sa.Column('name', sa.String(length=191), nullable=False),
+    sa.Column('name', _name(191), nullable=False),
     sa.Column('platform', sa.String(length=32), nullable=True),
     sa.Column('enabled_workflows', sa.JSON(), nullable=True),
     sa.Column('branch_filters', sa.JSON(), nullable=True),
@@ -175,7 +179,7 @@ def upgrade() -> None:
     sa.Column('id', sa.String(length=36), nullable=False),
     sa.Column('team_id', sa.String(length=36), nullable=True),
     sa.Column('scope', sa.String(length=36), nullable=False),
-    sa.Column('name', sa.String(length=128), nullable=False),
+    sa.Column('name', _name(128), nullable=False),
     sa.Column('ciphertext', sa.Text(), nullable=False),
     sa.Column('key_id', sa.String(length=8), nullable=False),
     sa.Column('updated_at', _timestamp(), nullable=False),
@@ -185,6 +189,19 @@ def upgrade() -> None:
     sa.PrimaryKeyConstraint('id', name=op.f('pk_secrets')),
     sa.UniqueConstraint('scope', 'name', name=op.f('uq_secrets_scope_name'))
     )
+    op.create_table('invites',
+    sa.Column('id', sa.String(length=36), nullable=False),
+    sa.Column('token_hmac', sa.String(length=64), nullable=False),
+    sa.Column('user_id', sa.String(length=36), nullable=False),
+    sa.Column('created_by', sa.String(length=36), nullable=True),
+    sa.Column('created_at', _timestamp(), nullable=False),
+    sa.Column('expires_at', _timestamp(), nullable=False),
+    sa.Column('used_at', _timestamp(), nullable=True),
+    sa.ForeignKeyConstraint(['user_id'], ['users.id'], name=op.f('fk_invites_user_id_users')),
+    sa.PrimaryKeyConstraint('id', name=op.f('pk_invites')),
+    sa.UniqueConstraint('token_hmac', name=op.f('uq_invites_token_hmac'))
+    )
+    op.create_index(op.f('ix_invites_user_id'), 'invites', ['user_id'])
     op.create_table('sessions',
     sa.Column('token_hmac', sa.String(length=64), nullable=False),
     sa.Column('user_id', sa.String(length=36), nullable=False),
@@ -200,7 +217,7 @@ def upgrade() -> None:
     op.create_table('workflows',
     sa.Column('id', sa.String(length=36), nullable=False),
     sa.Column('team_id', sa.String(length=36), nullable=False),
-    sa.Column('name', sa.String(length=191), nullable=False),
+    sa.Column('name', _name(191), nullable=False),
     sa.Column('current_version', sa.Integer(), nullable=False),
     sa.Column('created_at', _timestamp(), nullable=False),
     sa.Column('updated_at', _timestamp(), nullable=False),
@@ -306,6 +323,7 @@ def downgrade() -> None:
     op.drop_table('runs')
     op.drop_table('workflows')
     op.drop_table('sessions')
+    op.drop_table('invites')
     op.drop_table('secrets')
     op.drop_table('providers')
     op.drop_table('projects')

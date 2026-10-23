@@ -28,7 +28,7 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 from sqlalchemy.dialects.mysql import DATETIME as MYSQL_DATETIME
-from sqlalchemy.dialects.mysql import MEDIUMTEXT
+from sqlalchemy.dialects.mysql import MEDIUMTEXT, VARCHAR
 
 metadata = MetaData(naming_convention={
     "ix": "ix_%(table_name)s_%(column_0_N_name)s",
@@ -81,6 +81,11 @@ def scope_of(team_id: str | None) -> str:
 LongText = Text().with_variant(MEDIUMTEXT(), "mysql")
 
 
+# MySQL's default collation ignores case, so names that differ only in case would collide there and not elsewhere.
+def name_type(length: int) -> String:
+    return String(length).with_variant(VARCHAR(length, collation="utf8mb4_bin"), "mysql")
+
+
 def _id() -> Column:
     return Column("id", String(36), primary_key=True)
 
@@ -96,7 +101,7 @@ def _in(column: str, values: tuple[str, ...]) -> str:
 teams = Table(
     "teams", metadata,
     _id(),
-    Column("name", String(191), nullable=False, unique=True),
+    Column("name", name_type(191), nullable=False, unique=True),
     _ts("created_at"),
 )
 
@@ -104,7 +109,7 @@ projects = Table(
     "projects", metadata,
     _id(),
     Column("team_id", String(36), ForeignKey("teams.id"), nullable=False),
-    Column("name", String(191), nullable=False),
+    Column("name", name_type(191), nullable=False),
     Column("platform", String(32)),
     Column("enabled_workflows", JSON),
     Column("branch_filters", JSON),
@@ -125,7 +130,6 @@ users = Table(
     Column("last_totp_step", BigInteger, nullable=False, default=0),
     Column("is_admin", Boolean, nullable=False, default=False),
     Column("disabled", Boolean, nullable=False, default=False),
-    Column("must_change_password", Boolean, nullable=False, default=False),
     _ts("totp_confirmed_at", nullable=True),
     _ts("created_at"),
     _ts("last_login_at", nullable=True),
@@ -146,6 +150,17 @@ memberships = Table(
     CheckConstraint(_in("role", ROLES), name="role"),
     CheckConstraint(_in("source", ("manual", "oidc")), name="source"),
     Index(None, "scope_kind", "scope_id"),
+)
+
+invites = Table(
+    "invites", metadata,
+    _id(),
+    Column("token_hmac", String(64), nullable=False, unique=True),
+    Column("user_id", String(36), ForeignKey("users.id"), nullable=False, index=True),
+    Column("created_by", String(36)),
+    _ts("created_at"),
+    _ts("expires_at"),
+    _ts("used_at", nullable=True),
 )
 
 sessions = Table(
@@ -189,7 +204,7 @@ workflows = Table(
     "workflows", metadata,
     _id(),
     Column("team_id", String(36), ForeignKey("teams.id"), nullable=False),
-    Column("name", String(191), nullable=False),
+    Column("name", name_type(191), nullable=False),
     Column("current_version", Integer, nullable=False, default=0),
     _ts("created_at"),
     _ts("updated_at"),
@@ -202,7 +217,7 @@ documents = Table(
     Column("team_id", String(36), ForeignKey("teams.id")),
     Column("scope", String(36), nullable=False),
     Column("kind", String(16), nullable=False),
-    Column("key", String(191), nullable=False),
+    Column("key", name_type(191), nullable=False),
     Column("current_version", Integer, nullable=False, default=0),
     _ts("created_at"),
     _ts("updated_at"),
@@ -252,7 +267,7 @@ secrets = Table(
     _id(),
     Column("team_id", String(36), ForeignKey("teams.id")),
     Column("scope", String(36), nullable=False),
-    Column("name", String(128), nullable=False),
+    Column("name", name_type(128), nullable=False),
     Column("ciphertext", Text, nullable=False),
     Column("key_id", String(8), nullable=False),
     _ts("updated_at"),
