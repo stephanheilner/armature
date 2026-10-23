@@ -10,6 +10,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **`armature server init`, `migrate`, and `create-admin`** (the new
+  `server` extra, with `postgres` and `mysql` extras for those drivers).
+  `init` writes `~/.armature/server.yaml` if missing, generates a mode 0600
+  master key file, migrates SQLite, MySQL 8, or Postgres to every table in
+  the platform design with Alembic, and creates the first admin with a
+  prompted password and a TOTP secret. Secrets are sealed with AES-256-GCM
+  under HKDF sub-keys of the master key, bound to their team, id, and name.
+  The server refuses a non-loopback bind unless `allow_public_bind` is set.
+  `armature server run` is not implemented yet.
 - **`reasoning_effort` on model tiers and roles.** A tier can set
   `reasoning_effort: low | medium | high | xhigh | max`, and a role can
   override it, resolved role → tier → omitted like `temperature` and

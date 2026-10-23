@@ -1,0 +1,361 @@
+"""SQLAlchemy Core tables for the server (DESIGN.md, "Data model").
+
+Portable types only, so the same metadata runs on SQLite, MySQL 8, and
+Postgres. Ids are UUID strings. Indexed strings stay at 191 characters or
+fewer, the longest utf8mb4 key MySQL accepts in a composite index.
+"""
+from __future__ import annotations
+
+from datetime import UTC, datetime
+
+from sqlalchemy import (
+    JSON,
+    BigInteger,
+    Boolean,
+    CheckConstraint,
+    Column,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    MetaData,
+    Numeric,
+    PrimaryKeyConstraint,
+    String,
+    Table,
+    Text,
+    TypeDecorator,
+    UniqueConstraint,
+)
+from sqlalchemy.dialects.mysql import DATETIME as MYSQL_DATETIME
+from sqlalchemy.dialects.mysql import MEDIUMTEXT
+
+metadata = MetaData(naming_convention={
+    "ix": "ix_%(table_name)s_%(column_0_N_name)s",
+    "uq": "uq_%(table_name)s_%(column_0_N_name)s",
+    "ck": "ck_%(table_name)s_%(constraint_name)s",
+    "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
+    "pk": "pk_%(table_name)s",
+})
+
+ROLES = ("admin", "team_lead", "project_lead", "contributor", "viewer")
+PROVIDER_KINDS = ("bedrock", "anthropic", "claude-subscription", "openai-compatible", "ollama")
+DOCUMENT_KINDS = ("role", "prompt", "mission")
+
+INSTANCE_SCOPE = "*"
+
+
+class UTCDateTime(TypeDecorator):
+    """Aware UTC datetimes in and out on every backend. SQLite and MySQL keep no offset, so UTC is implied."""
+
+    impl = DateTime(timezone=True)
+    cache_ok = True
+
+    def load_dialect_impl(self, dialect):
+        if dialect.name == "mysql":
+            return dialect.type_descriptor(MYSQL_DATETIME(fsp=6))
+        return dialect.type_descriptor(DateTime(timezone=True))
+
+    def process_bind_param(self, value: datetime | None, dialect) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+            raise ValueError("naive datetime refused, pass an aware one")
+        value = value.astimezone(UTC)
+        return value if dialect.name == "postgresql" else value.replace(tzinfo=None)
+
+    def process_result_value(self, value: datetime | None, dialect) -> datetime | None:
+        if value is None:
+            return None
+        return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
+SCOPE_MATCHES_TEAM = f"(team_id IS NULL AND scope = '{INSTANCE_SCOPE}') OR (team_id IS NOT NULL AND scope = team_id)"
+
+
+def scope_of(team_id: str | None) -> str:
+    return INSTANCE_SCOPE if team_id is None else team_id
+
+
+# MySQL TEXT stops at 64 KB, too small for a long prompt or workflow body.
+LongText = Text().with_variant(MEDIUMTEXT(), "mysql")
+
+
+def _id() -> Column:
+    return Column("id", String(36), primary_key=True)
+
+
+def _ts(name: str, nullable: bool = False) -> Column:
+    return Column(name, UTCDateTime(), nullable=nullable)
+
+
+def _in(column: str, values: tuple[str, ...]) -> str:
+    return f"{column} IN ({', '.join(repr(v) for v in values)})"
+
+
+teams = Table(
+    "teams", metadata,
+    _id(),
+    Column("name", String(191), nullable=False, unique=True),
+    _ts("created_at"),
+)
+
+projects = Table(
+    "projects", metadata,
+    _id(),
+    Column("team_id", String(36), ForeignKey("teams.id"), nullable=False),
+    Column("name", String(191), nullable=False),
+    Column("platform", String(32)),
+    Column("enabled_workflows", JSON),
+    Column("branch_filters", JSON),
+    _ts("created_at"),
+    UniqueConstraint("team_id", "name"),
+)
+
+users = Table(
+    "users", metadata,
+    _id(),
+    Column("username", String(64), unique=True),
+    Column("display_name", String(191)),
+    Column("email", String(191)),
+    Column("oidc_iss", String(191)),
+    Column("oidc_sub", String(191)),
+    Column("password_hash", String(255)),
+    Column("totp_secret_enc", Text),
+    Column("last_totp_step", BigInteger, nullable=False, default=0),
+    Column("is_admin", Boolean, nullable=False, default=False),
+    Column("disabled", Boolean, nullable=False, default=False),
+    Column("must_change_password", Boolean, nullable=False, default=False),
+    _ts("totp_confirmed_at", nullable=True),
+    _ts("created_at"),
+    _ts("last_login_at", nullable=True),
+    UniqueConstraint("oidc_iss", "oidc_sub"),
+)
+
+memberships = Table(
+    "memberships", metadata,
+    _id(),
+    Column("user_id", String(36), ForeignKey("users.id"), nullable=False),
+    Column("scope_kind", String(16), nullable=False),
+    Column("scope_id", String(36), nullable=False),
+    Column("role", String(16), nullable=False),
+    Column("source", String(16), nullable=False, default="manual", server_default="manual"),
+    _ts("created_at"),
+    UniqueConstraint("user_id", "scope_kind", "scope_id"),
+    CheckConstraint(_in("scope_kind", ("team", "project")), name="scope_kind"),
+    CheckConstraint(_in("role", ROLES), name="role"),
+    CheckConstraint(_in("source", ("manual", "oidc")), name="source"),
+    Index(None, "scope_kind", "scope_id"),
+)
+
+sessions = Table(
+    "sessions", metadata,
+    Column("token_hmac", String(64), primary_key=True),
+    Column("user_id", String(36), ForeignKey("users.id"), nullable=False, index=True),
+    Column("csrf", String(64), nullable=False),
+    _ts("created_at"),
+    _ts("last_seen_at"),
+    _ts("step_up_at", nullable=True),
+    Column("ip", String(45)),
+)
+
+login_attempts = Table(
+    "login_attempts", metadata,
+    _id(),
+    Column("username", String(191)),
+    Column("ip", String(45)),
+    Column("succeeded", Boolean, nullable=False),
+    _ts("at"),
+    Index(None, "ip", "at"),
+    Index(None, "username", "at"),
+)
+
+audit = Table(
+    "audit", metadata,
+    _id(),
+    _ts("at"),
+    Column("actor_id", String(36)),
+    Column("team_id", String(36)),
+    Column("action", String(64), nullable=False),
+    Column("target_kind", String(32)),
+    Column("target_id", String(191)),
+    Column("detail", JSON),
+    Column("ip", String(45)),
+    Index(None, "team_id", "at"),
+    Index(None, "at"),
+)
+
+workflows = Table(
+    "workflows", metadata,
+    _id(),
+    Column("team_id", String(36), ForeignKey("teams.id"), nullable=False),
+    Column("name", String(191), nullable=False),
+    Column("current_version", Integer, nullable=False, default=0),
+    _ts("created_at"),
+    _ts("updated_at"),
+    UniqueConstraint("team_id", "name"),
+)
+
+documents = Table(
+    "documents", metadata,
+    _id(),
+    Column("team_id", String(36), ForeignKey("teams.id")),
+    Column("scope", String(36), nullable=False),
+    Column("kind", String(16), nullable=False),
+    Column("key", String(191), nullable=False),
+    Column("current_version", Integer, nullable=False, default=0),
+    _ts("created_at"),
+    _ts("updated_at"),
+    CheckConstraint(_in("kind", DOCUMENT_KINDS), name="kind"),
+    UniqueConstraint("scope", "kind", "key"),
+    CheckConstraint(SCOPE_MATCHES_TEAM, name="scope"),
+)
+
+versions = Table(
+    "versions", metadata,
+    _id(),
+    Column("object_kind", String(16), nullable=False),
+    Column("object_id", String(36), nullable=False),
+    Column("version", Integer, nullable=False),
+    Column("body", LongText, nullable=False),
+    Column("author_id", String(36)),
+    _ts("created_at"),
+    Column("note", Text),
+    UniqueConstraint("object_kind", "object_id", "version"),
+)
+
+packs = Table(
+    "packs", metadata,
+    _id(),
+    Column("name", String(191), nullable=False, unique=True),
+    Column("version", String(64), nullable=False),
+    Column("source", Text, nullable=False),
+    Column("pinned_ref", String(191), nullable=False),
+    Column("installed_by", String(36)),
+    _ts("installed_at"),
+)
+
+providers = Table(
+    "providers", metadata,
+    _id(),
+    Column("team_id", String(36), ForeignKey("teams.id"), nullable=False, index=True),
+    Column("kind", String(32), nullable=False),
+    Column("config", JSON),
+    Column("aliases", JSON),
+    _ts("created_at"),
+    _ts("updated_at"),
+    CheckConstraint(_in("kind", PROVIDER_KINDS), name="kind"),
+)
+
+secrets = Table(
+    "secrets", metadata,
+    _id(),
+    Column("team_id", String(36), ForeignKey("teams.id")),
+    Column("scope", String(36), nullable=False),
+    Column("name", String(128), nullable=False),
+    Column("ciphertext", Text, nullable=False),
+    Column("key_id", String(8), nullable=False),
+    _ts("updated_at"),
+    Column("updated_by", String(36)),
+    UniqueConstraint("scope", "name"),
+    CheckConstraint(SCOPE_MATCHES_TEAM, name="scope"),
+)
+
+settings = Table(
+    "settings", metadata,
+    Column("key", String(191), primary_key=True),
+    Column("value", JSON),
+    _ts("updated_at", nullable=True),
+    Column("updated_by", String(36)),
+)
+
+triggers = Table(
+    "triggers", metadata,
+    _id(),
+    Column("team_id", String(36), ForeignKey("teams.id"), nullable=False),
+    Column("workflow_id", String(36), ForeignKey("workflows.id"), nullable=False, index=True),
+    Column("kind", String(32), nullable=False),
+    Column("config", JSON),
+    Column("enabled", Boolean, nullable=False, default=True),
+    _ts("created_at"),
+)
+
+jobs = Table(
+    "jobs", metadata,
+    _id(),
+    Column("team_id", String(36), ForeignKey("teams.id"), nullable=False),
+    Column("project_id", String(36), ForeignKey("projects.id")),
+    Column("workflow_id", String(36), ForeignKey("workflows.id"), nullable=False),
+    Column("run_id", String(36), ForeignKey("runs.id")),
+    Column("inputs", JSON),
+    Column("status", String(16), nullable=False, default="queued"),
+    Column("claimed_by", String(191)),
+    _ts("claimed_at", nullable=True),
+    _ts("heartbeat_at", nullable=True),
+    _ts("lease_expires_at", nullable=True),
+    Column("attempts", Integer, nullable=False, default=0),
+    _ts("created_at"),
+    Index(None, "status", "created_at"),
+)
+
+runs = Table(
+    "runs", metadata,
+    _id(),
+    Column("team_id", String(36), ForeignKey("teams.id"), nullable=False),
+    Column("project_id", String(36), ForeignKey("projects.id")),
+    Column("workflow_id", String(36), ForeignKey("workflows.id")),
+    Column("workflow_version", Integer),
+    Column("status", String(16), nullable=False),
+    Column("triggered_by", String(36)),
+    Column("trigger_kind", String(32)),
+    Column("cancelled_by", String(36)),
+    Column("rerun_of", String(36)),
+    _ts("started_at"),
+    _ts("finished_at", nullable=True),
+    Column("cost_usd", Numeric(14, 6)),
+    Column("input_tokens", BigInteger),
+    Column("output_tokens", BigInteger),
+    Column("summary", JSON),
+    Index(None, "team_id", "started_at"),
+)
+
+run_steps = Table(
+    "run_steps", metadata,
+    Column("run_id", String(36), ForeignKey("runs.id"), nullable=False),
+    Column("step_id", String(191), nullable=False),
+    Column("status", String(16), nullable=False),
+    _ts("started_at", nullable=True),
+    _ts("finished_at", nullable=True),
+    Column("cost_usd", Numeric(14, 6)),
+    Column("input_tokens", BigInteger),
+    Column("output_tokens", BigInteger),
+    Column("error", Text),
+    Column("output", JSON),
+    PrimaryKeyConstraint("run_id", "step_id"),
+)
+
+# Only the primary key: the event writer does one batched insert a second.
+run_events = Table(
+    "run_events", metadata,
+    Column("run_id", String(36), nullable=False, autoincrement=False),
+    Column("seq", BigInteger, nullable=False, autoincrement=False),
+    _ts("ts"),
+    Column("kind", String(32), nullable=False),
+    Column("step_id", String(191)),
+    Column("payload", JSON),
+    PrimaryKeyConstraint("run_id", "seq"),
+)
+
+findings = Table(
+    "findings", metadata,
+    _id(),
+    Column("run_id", String(36), ForeignKey("runs.id"), nullable=False, index=True),
+    Column("project_id", String(36), ForeignKey("projects.id")),
+    Column("finding_key", String(64), nullable=False),
+    Column("path", Text),
+    Column("line", Integer),
+    Column("severity", String(16)),
+    Column("disposition", String(32)),
+    Column("body", Text),
+    Index(None, "project_id", "finding_key"),
+)

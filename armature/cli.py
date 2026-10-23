@@ -15,6 +15,9 @@ app.add_typer(mission_app, name="mission")
 from armature.packaging.cli import package_app  # noqa: E402
 app.add_typer(package_app, name="package")
 
+from armature.server.cli import server_app  # noqa: E402
+app.add_typer(server_app, name="server")
+
 
 @app.command()
 def new(

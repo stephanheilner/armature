@@ -68,6 +68,22 @@ service = [
     "fastapi>=0.111",
     "uvicorn[standard]>=0.30",
 ]
+server = [
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.30",
+    "sqlalchemy>=2.0",
+    "alembic>=1.13",
+    "authlib>=1.3",
+    "cryptography>=42",
+    "pyotp>=2.9",
+    "python-multipart>=0.0.9",
+]
+postgres = [
+    "psycopg[binary]>=3",
+]
+mysql = [
+    "pymysql>=1.1",
+]
 wizard = [
     "questionary>=2.0",
 ]
@@ -93,6 +109,7 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
     "docker: marks tests that require a running Docker daemon (skipped without one)",
+    "db_matrix: runs against Postgres or MySQL when ARMATURE_TEST_PG_URL or ARMATURE_TEST_MYSQL_URL is set",
 ]
 
 [tool.hatch.build.targets.wheel]
