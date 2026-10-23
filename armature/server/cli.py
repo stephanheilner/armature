@@ -1,4 +1,4 @@
-"""`armature server` commands: init, migrate, create-admin, run, and import-ops."""
+"""`armature server` commands: init, migrate, create-admin, run, import-ops, and import-history."""
 from __future__ import annotations
 
 import getpass
@@ -266,3 +266,58 @@ def import_ops_cmd(
     for line in report.lines():
         typer.echo(line)
     typer.echo("Dry run: nothing was written." if dry_run else "Import committed.")
+
+
+def _since(value: str | None):
+    from datetime import UTC, datetime
+    if value is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        _fail("--since takes a date such as 2026-10-01 or an ISO time.")
+    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed
+
+
+@server_app.command("import-history")
+def import_history_cmd(
+    ops_dir: Path = typer.Argument(..., help="An armature-ops checkout whose config/dashboard.json names the "
+                                             "dashboard database. Nothing in it or the database is written"),
+    config: Path | None = ConfigOption,
+    traces: Path = typer.Option(Path("~/.armature/traces.db"), "--traces",
+                                help="traces.db to read runs the dashboard lacks from, opened read-only"),
+    no_traces: bool = typer.Option(False, "--no-traces", help="Import only the dashboard's runs"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Print the counts and roll every change back"),
+    since: str | None = typer.Option(None, "--since", help="Only runs started on or after this date (UTC)"),
+    limit: int | None = typer.Option(None, "--limit", min=1, help="At most this many runs, oldest first"),
+):
+    """Copy past runs, their steps, findings, and a timeline from the dashboard and traces.db into the database."""
+    import time
+
+    from armature.server.db import make_engine, utcnow
+    from armature.server.import_history import import_history, ops_source
+
+    cfg = _load(config)
+    started = time.monotonic()
+    try:
+        source = ops_source(ops_dir, None if no_traces else traces.expanduser())
+    except Exception as exc:  # noqa: BLE001
+        # The class alone for a driver error, which can echo the connection string.
+        _fail(f"Dashboard unavailable: {exc if isinstance(exc, ValueError) else exc.__class__.__name__}")
+    kept = "" if dry_run else " Batches committed before it stay."
+    engine = make_engine(cfg.database_url)
+    try:
+        report = import_history(engine, source, now=utcnow(), since=_since(since), limit=limit,
+                                traces=not no_traces, dry_run=dry_run,
+                                progress=lambda line: typer.echo(line, err=True))
+    except ValueError as exc:
+        _fail(f"Import stopped: {exc}.{kept}")
+    except Exception as exc:  # noqa: BLE001
+        _fail(f"Import stopped: {exc.__class__.__name__}.{kept}")
+    finally:
+        source.close()
+        engine.dispose()
+    for line in report.lines():
+        typer.echo(line)
+    typer.echo(f"{'Dry run: nothing was written' if dry_run else 'Import committed'} "
+               f"in {time.monotonic() - started:.1f}s.")

@@ -106,6 +106,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `/api/documents`, `/api/documents/{id}`, `/api/teams/{id}/providers`,
   and the admin-only `/api/settings` read them, and the UI shows
   workflows, roles and prompts, and each team's providers.
+- **`armature server import-history <ops-dir>`** copies every past run from
+  the armature-ops dashboard's Postgres, read in a read-only transaction,
+  into `runs`, `run_steps`, `findings`, and a synthesized `run_events`
+  timeline marked `imported`, so the runs list and run page show the steps,
+  costs, findings, and who triggered each run. A run keeps its dashboard id,
+  or gets a stable UUID with the original in `trigger_ref.source_run_id`. Its
+  team and project come from its repository, then the repositories its
+  target names, then the one team that owns its workflow, then the first
+  team with its pipeline, then `mobile`. Role reviews become child steps of
+  `reviews` with their text (cut at 8 KB and redacted), and the team lead's
+  comments, decisions, and changes become findings. Jira work, fixes, and
+  merges add `trigger_ref` details and a text event. Runs only `traces.db`
+  holds are imported from their trace rows when their workflow exists on
+  the server. A rerun skips a run whose content hash in
+  `trigger_ref.import_hash` still matches and replaces the steps, events,
+  and findings of one that changed. It takes `--dry-run`, `--since`,
+  `--limit`, and `--no-traces`, commits every 100 runs, and prints counts
+  only.
 - **`reasoning_effort` on model tiers and roles.** A tier can set
   `reasoning_effort: low | medium | high | xhigh | max`, and a role can
   override it, resolved role → tier → omitted like `temperature` and
