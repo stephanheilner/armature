@@ -22,13 +22,12 @@ from armature.server.auth import valid_token
 from armature.server.crypto import Keyring
 from armature.server.db import new_id
 from armature.server.db.schema import (
-    INSTANCE_SCOPE,
     projects,
     run_tokens,
     runner_keys,
     runs,
-    workflows,
 )
+from armature.server.defs import resolve_workflow
 
 KEY_PREFIX = "ark_"
 TOKEN_TTL = timedelta(hours=48)
@@ -141,10 +140,8 @@ def register_run(conn: Connection, keyring: Keyring, *, key: Any, body: dict[str
     if rerun_of is not None and (not isinstance(rerun_of, str) or conn.execute(
             select(runs.c.id).where(runs.c.id == rerun_of, runs.c.team_id == team_id)).first() is None):
         raise RegistrationError(404, "No such run to re-run in this runner key's team.")
-    # The team's own workflow of that name wins over an instance one.
-    workflow_id = conn.execute(select(workflows.c.id).where(
-        workflows.c.name == workflow, workflows.c.scope.in_([team_id, INSTANCE_SCOPE]))
-        .order_by(workflows.c.scope == INSTANCE_SCOPE).limit(1)).scalar()
+    resolved = resolve_workflow(conn, workflow, team_id, project_id)
+    workflow_id = resolved.id if resolved is not None else None
     run_id = new_id()
     row = {"id": run_id, "team_id": team_id, "project_id": project_id, "workflow_id": workflow_id,
            "workflow_name": workflow, "status": "running", "actor": actor, "trigger_kind": trigger_kind,

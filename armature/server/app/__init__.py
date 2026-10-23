@@ -17,6 +17,7 @@ from armature.server.app import (
     routes_defs,
     routes_live,
     routes_oidc,
+    routes_packs,
     routes_runner,
     static,
 )
@@ -64,7 +65,7 @@ def create_app(cfg: ServerConfig, engine: Engine, keyring: Keyring, *, clock: Ca
         return {"ok": True}
 
     for router in (health, routes_auth.router, routes_api.router, routes_defs.router, routes_live.router,
-                   routes_runner.router, routes_oidc.router, static.router):
+                   routes_runner.router, routes_oidc.router, routes_packs.router, static.router):
         app.include_router(router, prefix=base)
 
     if base:
@@ -72,6 +73,7 @@ def create_app(cfg: ServerConfig, engine: Engine, keyring: Keyring, *, clock: Ca
         def base_redirect() -> RedirectResponse:
             return RedirectResponse(f"{base}/", status_code=302)
 
-    app.add_middleware(BodyLimit, overrides={f"{base}/api/events": routes_runner.EVENTS_BODY_LIMIT})
+    overrides = {f"{base}{path}": routes_defs.DEFS_BODY_LIMIT for path in routes_defs.DEFS_PATHS}
+    app.add_middleware(BodyLimit, overrides={**overrides, f"{base}/api/events": routes_runner.EVENTS_BODY_LIMIT})
     app.add_middleware(SecurityHeaders, hsts=not app.state.server.insecure_localhost)
     return app

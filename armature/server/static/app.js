@@ -1,12 +1,13 @@
 import { api, configure, setCsrf, url } from './api.js';
-import { clear, element, errorBox, loading, pageHeader, stepUpDialog } from './dom.js';
+import { clear, confirmDialog, element, errorBox, loading, pageHeader, stepUpDialog } from './dom.js';
+import { hasUnsaved, mayLeave, release } from './guard.js';
 import { parseHash } from './router.js';
 import { isSso, navFor, setSession, ssoStepUpPath, user } from './session.js';
 
 const NAV_GROUPS = [
   ['Work', [['runs', 'Runs', 'list'], ['teams', 'Teams', 'team']]],
-  ['Definitions', [['workflows', 'Workflows', 'flow'], ['roles', 'Roles and prompts', 'doc']]],
-  ['Manage', [['users', 'Users', 'people'], ['secrets', 'Secrets', 'key']]],
+  ['Definitions', [['workflows', 'Workflows', 'flow'], ['roles', 'Roles and prompts', 'doc'], ['packs', 'Packs', 'box']]],
+  ['Manage', [['users', 'Users', 'people'], ['secrets', 'Secrets', 'key'], ['settings', 'Settings', 'gear']]],
   ['You', [['account', 'Account', 'person']]],
 ];
 
@@ -19,6 +20,8 @@ const ICON_PATHS = {
   doc: 'M4 1.5h5.5L12 4v10.5H4zM9.5 1.5V4H12M6 7.5h4M6 10h4',
   key: 'M10.5 1.5a4 4 0 1 1-3.2 6.4L2 13.2V15h2.5v-1.5H6V12h1.5l1-1A4 4 0 0 1 10.5 1.5zM11.5 4.5h.01',
   person: 'M8 7.5a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM2.5 15c0-3 2.5-5.5 5.5-5.5s5.5 2.5 5.5 5.5',
+  box: 'M2 4.5L8 1.5l6 3v7l-6 3-6-3zM2 4.5l6 3 6-3M8 7.5v7',
+  gear: 'M8 10a2 2 0 1 0 0-4 2 2 0 0 0 0 4zM8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.4 3.4l1.4 1.4M11.2 11.2l1.4 1.4M3.4 12.6l1.4-1.4M11.2 4.8l1.4-1.4',
   menu: 'M2 4h12M2 8h12M2 12h12',
   collapse: 'M10 3L5 8l5 5',
 };
@@ -43,18 +46,25 @@ const VIEW_LOADERS = {
   secrets: () => import('./views/secrets.js'),
   workflows: () => import('./views/workflows.js'),
   workflow: () => import('./views/workflows.js'),
+  'new-workflow': () => import('./views/workflows.js'),
   roles: () => import('./views/roles.js'),
   document: () => import('./views/roles.js'),
+  'new-document': () => import('./views/roles.js'),
+  packs: () => import('./views/packs.js'),
+  settings: () => import('./views/settings.js'),
   account: () => import('./views/account.js'),
 };
 
-const NAV_PARENT = { project: 'teams', run: 'runs', workflow: 'workflows', document: 'roles' };
+const NAV_PARENT = { project: 'teams', run: 'runs', workflow: 'workflows', 'new-workflow': 'workflows', document: 'roles', 'new-document': 'roles' };
 
 let allowedViews = [];
 let renderSequence = 0;
 let viewController = null;
+let shownHash = location.hash;
 
 async function route() {
+  release();
+  shownHash = location.hash;
   const parsed = parseHash(location.hash);
   const { name, args, query } = parsed;
   closeDrawer();
@@ -203,6 +213,18 @@ function buildTopbar() {
   });
 }
 
+// The address goes back while the dialog is open, so a cancel leaves the page and its URL as they were.
+async function leaveThenRoute() {
+  const target = location.hash;
+  if (hasUnsaved()) {
+    if (target !== shownHash) history.replaceState(null, '', shownHash || location.pathname + location.search);
+    const leave = await mayLeave(() => confirmDialog('Leave without saving?', 'Your edits on this page are not saved. Leaving discards them.', 'Leave'));
+    if (!leave) return;
+    if (target !== shownHash) history.replaceState(null, '', target);
+  }
+  route();
+}
+
 function stepUp() {
   if (!isSso()) return stepUpDialog();
   location.assign(url(ssoStepUpPath(location.hash)));
@@ -230,7 +252,10 @@ async function start() {
   buildTopbar();
   window.armatureThemeToggles?.();
   document.getElementById('skip').addEventListener('click', () => document.getElementById('content').focus());
-  window.addEventListener('hashchange', route);
+  window.addEventListener('hashchange', leaveThenRoute);
+  window.addEventListener('beforeunload', (unloadEvent) => {
+    if (hasUnsaved()) unloadEvent.preventDefault();
+  });
   route();
 }
 

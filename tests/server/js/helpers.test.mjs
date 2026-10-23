@@ -164,9 +164,9 @@ test('a network failure reads as unreachable', async () => {
 test('navFor hides what a role cannot use', () => {
   const lead = { user: { id: 1 }, memberships: [{ scope_kind: 'team', scope_id: 't', role: 'team_lead' }] };
   const viewer = { user: { id: 2 }, memberships: [{ scope_kind: 'project', scope_id: 'p', role: 'viewer' }] };
-  assert.deepEqual(navFor({ user: { is_admin: true } }), ['runs', 'teams', 'workflows', 'roles', 'users', 'secrets', 'account']);
-  assert.deepEqual(navFor(lead), ['runs', 'teams', 'workflows', 'roles', 'users', 'secrets', 'account']);
-  assert.deepEqual(navFor(viewer), ['runs', 'teams', 'workflows', 'roles', 'account']);
+  assert.deepEqual(navFor({ user: { is_admin: true } }), ['runs', 'teams', 'workflows', 'roles', 'packs', 'users', 'secrets', 'settings', 'account']);
+  assert.deepEqual(navFor(lead), ['runs', 'teams', 'workflows', 'roles', 'packs', 'users', 'secrets', 'account']);
+  assert.deepEqual(navFor(viewer), ['runs', 'teams', 'workflows', 'roles', 'packs', 'account']);
   assert.deepEqual(navFor({ user: null }), []);
 });
 

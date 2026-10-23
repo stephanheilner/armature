@@ -175,6 +175,10 @@ that schema. Only admins install or upgrade packs, because a pack is code.
 Project leads compose workflows from installed adapters and edit prompts and
 roles.
 
+A run resolves `pack/adapter` refs on the host that runs it, from
+`ARMATURE_PACKS_PATH` and then `~/.armature/packs`, the server's default
+`packs_dir`, so every runner host needs the same packs installed.
+
 armature-ops becomes three packs: `github-review` (PR role review, incremental
 review, discuss, fix loop, and daily review), `jira-work`, and `mobile-port`.
 Its scripts move with little change, because packs still run through

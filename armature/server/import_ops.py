@@ -517,7 +517,7 @@ def _import_providers(ctx: _Context, env: dict[str, str]) -> None:
     aliases.setdefault("lead", LEAD_DEFAULT)
     aliases["fast"] = FAST_MODEL
     bedrock = {"region": env.get("AWS_REGION_NAME") or env.get("AWS_REGION") or None,
-               "credential_secret": BEDROCK_SECRET}
+               "credential_secret": BEDROCK_SECRET, "credential_scope": "instance"}
     for slug, team_id in ctx.team_ids.items():
         _upsert_provider(ctx, slug, team_id, "bedrock", bedrock, aliases)
         if slug in SUBSCRIPTION_TEAMS:

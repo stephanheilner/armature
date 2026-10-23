@@ -62,6 +62,7 @@ class ServerConfig(BaseModel):
     lost_after_minutes: int = Field(default=30, ge=1)
     sse_per_user: int = Field(default=8, ge=1)
     sse_total: int = Field(default=500, ge=1)
+    packs_dir: str = "~/.armature/packs"
 
     @field_validator("base_path")
     @classmethod

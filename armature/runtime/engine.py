@@ -226,6 +226,23 @@ class Harness:
             env["ARMATURE_EVENTS_TOKEN"] = self._events.token
         return env
 
+    def _script_inputs(self, stage, adapter, context: dict[str, Any]) -> tuple[dict[str, str], dict[str, Any]]:
+        """The child env and context for a script stage, with its rendered with: and $PACK_DIR."""
+        env = self._script_env(stage.id)
+        if adapter.pack_dir is not None:
+            env["PACK_DIR"] = adapter.pack_dir
+        if stage.with_ is None and adapter.params is None:
+            return env, context
+        from armature.packs.params import render_with, with_errors
+        values = render_with(stage.with_ or {}, context)
+        if adapter.params is not None:
+            problems = with_errors(adapter.params, values, allow_templates=False)
+            if problems:
+                raise ValueError(f"Stage '{stage.id}' with: does not match adapter '{adapter.name}': "
+                                 + "; ".join(problems))
+        env["ARMATURE_WITH"] = json.dumps(values, default=str)
+        return env, {**context, "with": values}
+
     def __init__(
         self,
         spec: HarnessSpec,
@@ -615,7 +632,8 @@ class Harness:
                         adapter = self._spec.adapters.get(stage.adapter)
                         if adapter is None:
                             raise ValueError(f"Adapter '{stage.adapter}' not defined in spec")
-                        node = ScriptNode(adapter=adapter, env=self._script_env(stage.id))
+                        script_env, script_context = self._script_inputs(stage, adapter, context)
+                        node = ScriptNode(adapter=adapter, env=script_env)
                         tool_args = {"cmd": adapter.cmd or ""}
                         decision = await self._hooks.run_pre_tool(stage.adapter, tool_args, context)
                         if decision == HookDecision.BLOCK:
@@ -623,7 +641,7 @@ class Harness:
                             # SafetyHookBuilder hooks raise ToolBlocked directly (carrying rule.message).
                             from armature.hooks.lifecycle import ToolBlocked
                             raise ToolBlocked(stage.adapter, adapter.cmd or "", "blocked by safety rule")
-                        result = await node.execute(context)
+                        result = await node.execute(script_context)
                         await self._hooks.run_post_tool(stage.adapter, result, context)
                         script_latency = (time.monotonic() - t0) * 1000
                         self._get_provenance().update({k: f"stage:{stage.id}" for k in result})

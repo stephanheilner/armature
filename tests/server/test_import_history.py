@@ -528,3 +528,25 @@ def test_cli_refuses_a_bad_since(tmp_path, monkeypatch):
     result = CliRunner().invoke(app, ["server", "import-history", str(tmp_path), "--config", str(config),
                                       "--since", "last tuesday"])
     assert result.exit_code == 1 and "--since" in result.output
+
+
+def test_a_run_uses_its_projects_fork_then_its_teams_workflow_then_the_instances(engine, target):
+    with engine.begin() as conn:
+        team_wf, project_wf = new_id(), new_id()
+        conn.execute(insert(workflows).values(id=team_wf, team_id=target["mobile"], scope=target["mobile"],
+                                              name="pr-role-review", current_version=1, created_at=T0,
+                                              updated_at=T0))
+        conn.execute(insert(workflows).values(id=project_wf, team_id=target["mobile"],
+                                              project_id=target["fs-eng/mobile-ios"],
+                                              scope=target["fs-eng/mobile-ios"], name="pr-role-review",
+                                              current_version=1, created_at=T0, updated_at=T0))
+    run_import(engine, MemorySource([
+        bare("r-ios", "pr-role-review", target="fs-eng/mobile-ios#5"),
+        bare("r-android", "pr-role-review", target="fs-eng/android-tree#6"),
+        bare("r-ios-again", "pr-role-review", target="fs-eng/mobile-ios#7"),
+        bare("r-tsh", "pr-role-review", repo="MountainRiverPartners/talentstorehouse"),
+    ]))
+    assert the_run(engine, "r-ios")["workflow_id"] == project_wf
+    assert the_run(engine, "r-ios-again")["workflow_id"] == project_wf
+    assert the_run(engine, "r-android")["workflow_id"] == team_wf
+    assert the_run(engine, "r-tsh")["workflow_id"] == target["pr-role-review"]

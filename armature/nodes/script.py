@@ -19,7 +19,8 @@ class ScriptNode(BaseNode):
 
     async def execute(self, context: dict[str, Any]) -> Any:
         cmd = self._adapter.cmd or ""
-        if "{{" in cmd:
+        # A pack's cmd is fixed at install, so nothing a workflow carries is rendered into it.
+        if "{{" in cmd and self._adapter.pack_dir is None:
             cmd = text_env().from_string(cmd).render(**context)
 
         permission = classify_shell_command(cmd)

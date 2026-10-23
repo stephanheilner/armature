@@ -129,6 +129,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   and findings of one that changed. It takes `--dry-run`, `--since`,
   `--limit`, and `--no-traces`, commits and audits every 100 runs, and
   prints counts only.
+- **Editing definitions on the server.** Workflows, roles, prompts, and
+  missions can belong to the instance, a team, or a project, and a run
+  resolves a name project first, then team, then instance. Admins edit
+  anything, team leads edit their teams' and those teams' projects'
+  definitions, and project leads edit their projects'. Each can fork what
+  they can read into a scope they can write, roll back to any version, and
+  delete. Every save is validated with YAML line numbers (schema, spec
+  checks, template lint, and pack adapter references and `with:` parameters
+  against the installed packs), appends a version, is audited, and is
+  refused with 409 when its `base_version` is stale. A non-admin may change
+  only the description, the mission, and each stage's wiring to pack
+  adapters, and may not save a workflow whose adapter commands are
+  templates or widen a role's `tools` and `mcp_servers` past the packs'
+  allowlists. Template markers outside values, a `{{ }}` that refers to no
+  input or step, YAML anchors and aliases, and more than 20,000 nodes are
+  refused. Team leads manage their team's model providers, with config
+  checked per kind, a credential read only from the team's own secrets, and
+  `api_base` held to public https unless an admin saves it. Admins manage
+  settings, which refuse secret-looking keys. Everything but a body edit
+  needs step-up. `POST /api/workflows/parse` and `render` back the form
+  editor, keep comments and unknown keys, and rename a stage in place.
 - **`reasoning_effort` on model tiers and roles.** A tier can set
   `reasoning_effort: low | medium | high | xhigh | max`, and a role can
   override it, resolved role → tier → omitted like `temperature` and
@@ -147,6 +168,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `armature validate` warns with `REASONING_EFFORT_WITH_TEMPERATURE` when a
   stage resolves both a `reasoning_effort` and a `temperature` other than 1,
   which Claude rejects while thinking is on.
+- **Workflow packs.** A step can name an installed pack's script as
+  `adapter: <pack>/<adapter>` with parameters under `with:`. A pack is a
+  directory with a `pack.yaml` that declares each adapter's `cmd`, a JSON
+  Schema for its parameters, outputs, timeout, whether it writes, and the
+  secrets it needs. Packs load from `ARMATURE_PACKS_PATH` and then
+  `~/.armature/packs`, and the first pack under a name wins. A `cmd` with
+  `{{` or `{%` is refused, and `$PACK_DIR` reaches the script through its
+  environment. `with:` is checked against the schema when the workflow is
+  validated (`INVALID_WITH`, with the field path) and again after it renders,
+  may hold only lint-safe references, and reaches the script as
+  `ARMATURE_WITH` and `ARMATURE_CONTEXT["with"]`, never in the command. An
+  unknown pack adapter is `UNKNOWN_PACK_ADAPTER`. `armature pack validate`
+  and `armature pack list` inspect packs, `armature server pack install` and
+  `remove` manage the server's `packs_dir` with an audit row, refusing a git
+  install not pinned to a full commit sha and a downgrade without `--force`,
+  and `GET /api/packs` lists every adapter with its parameter schema.
+  `jsonschema` is now a core dependency. See `examples/packs/hello/`.
 
 ### Changed
 

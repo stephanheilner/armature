@@ -1,4 +1,4 @@
-"""`armature server` commands: init, migrate, create-admin, run, import-ops, and import-history."""
+"""`armature server` commands: init, migrate, create-admin, run, import-ops, import-history, and pack."""
 from __future__ import annotations
 
 import getpass
@@ -8,6 +8,9 @@ import typer
 
 server_app = typer.Typer(name="server", help="Run and administer the Armature server (needs armature\\[server])",
                          no_args_is_help=True)
+
+pack_app = typer.Typer(name="pack", help="Install and remove workflow packs on this host", no_args_is_help=True)
+server_app.add_typer(pack_app, name="pack")
 
 ConfigOption = typer.Option(None, "--config", help="Server config file (default $ARMATURE_SERVER_CONFIG "
                                                    "or ~/.armature/server.yaml)")
@@ -323,3 +326,46 @@ def import_history_cmd(
         typer.echo(line)
     typer.echo(f"{'Dry run: nothing was written' if dry_run else 'Import committed'} "
                f"in {time.monotonic() - started:.1f}s.")
+
+
+@pack_app.command("install")
+def pack_install(
+    source: str = typer.Argument(..., help="A pack directory, or <git-url-or-repo-path>@<40-character commit sha>"),
+    config: Path | None = ConfigOption,
+    force: bool = typer.Option(False, "--force", help="Install over a newer installed version"),
+):
+    """Copy a pack into packs_dir, record it in the database, and audit it."""
+    from armature.server.db import make_engine, utcnow
+    from armature.server.packs import InstallError, install
+
+    cfg = _load(config)
+    engine = make_engine(cfg.database_url)
+    try:
+        installed = install(engine, Path(cfg.packs_dir), source, now=utcnow(), force=force)
+    except InstallError as exc:
+        _fail(f"Install refused, nothing changed: {exc}")
+    finally:
+        engine.dispose()
+    was = f" (was {installed.previous_version})" if installed.previous_version else ""
+    typer.echo(f"Installed {installed.name} {installed.version}{was} at {installed.path}, "
+               f"pinned to {installed.pinned_ref}.")
+
+
+@pack_app.command("remove")
+def pack_remove(
+    name: str = typer.Argument(..., help="The installed pack's name"),
+    config: Path | None = ConfigOption,
+):
+    """Delete an installed pack's files and its database row, and audit it."""
+    from armature.server.db import make_engine
+    from armature.server.packs import InstallError, remove
+
+    cfg = _load(config)
+    engine = make_engine(cfg.database_url)
+    try:
+        version = remove(engine, Path(cfg.packs_dir), name)
+    except InstallError as exc:
+        _fail(f"Remove refused: {exc}")
+    finally:
+        engine.dispose()
+    typer.echo(f"Removed {name}{f' {version}' if version else ''}.")

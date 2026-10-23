@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
+from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -29,15 +30,18 @@ REAL_IP = re.compile(r"^[0-9a-fA-F:.]{2,45}$")
 
 
 class ApiError(Exception):
-    def __init__(self, status: int, message: str, headers: dict[str, str] | None = None):
+    def __init__(self, status: int, message: str, headers: dict[str, str] | None = None,
+                 extra: dict[str, Any] | None = None):
         super().__init__(message)
         self.status = status
         self.message = message
         self.headers = headers or {}
+        self.extra = extra or {}
 
 
-def error_response(status: int, message: str, headers: dict[str, str] | None = None) -> JSONResponse:
-    return JSONResponse({"error": message}, status_code=status, headers=headers)
+def error_response(status: int, message: str, headers: dict[str, str] | None = None,
+                   extra: dict[str, Any] | None = None) -> JSONResponse:
+    return JSONResponse({**(extra or {}), "error": message}, status_code=status, headers=headers)
 
 
 HSTS = (b"strict-transport-security", b"max-age=31536000")
@@ -70,10 +74,17 @@ class BodyLimit:
         self.limit = limit
         self.overrides = overrides or {}
 
+    # An override ending in "/" covers every path under it.
+    def _limit(self, path: str) -> int:
+        if path in self.overrides:
+            return self.overrides[path]
+        return next((limit for prefix, limit in self.overrides.items()
+                     if prefix.endswith("/") and path.startswith(prefix)), self.limit)
+
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
-        limit = self.overrides.get(scope.get("path", ""), self.limit)
+        limit = self._limit(scope.get("path", ""))
         for name, value in scope.get("headers", []):
             if name == b"content-length" and value.isdigit() and int(value) > limit:
                 return await error_response(413, "Request body too large.")(scope, receive, send)
@@ -108,7 +119,7 @@ def client_ip(request: Request) -> str:
 def install_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(ApiError)
     async def _api_error(_request: Request, exc: ApiError):
-        return error_response(exc.status, exc.message, exc.headers)
+        return error_response(exc.status, exc.message, exc.headers, exc.extra)
 
     @app.exception_handler(StarletteHTTPException)
     async def _http_error(_request: Request, exc: StarletteHTTPException):

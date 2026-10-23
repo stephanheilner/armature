@@ -37,6 +37,7 @@ from armature.server.db.schema import (
     users,
     workflows,
 )
+from armature.server.defs import resolve_workflow
 from armature.server.ingest import redact, team_secret_values
 from armature.server.writer import step_key
 
@@ -127,14 +128,13 @@ class _Target:
     now: datetime
     by_slug: dict[str, str]
     projects: dict[str, tuple[str, str]]
-    workflows: dict[str, str]
-    team_workflows: dict[str, dict[str, str]]
     users: dict[str, str]
     platform_repos: dict[str, str]
     tracker_repos: dict[str, str]
     jira_projects: set[str]
     intake_repos: list[str]
     secret_values: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    resolved: dict[tuple[str, str, str | None], str | None] = field(default_factory=dict)
 
     @classmethod
     def load(cls, conn: Connection, keyring: Keyring, now: datetime) -> _Target:
@@ -143,11 +143,6 @@ class _Target:
         for row in conn.execute(select(projects.c.id, projects.c.team_id, projects.c.repo)).all():
             if row.repo:
                 project_map.setdefault(row.repo.lower(), (row.team_id, row.id))
-        workflow_rows = conn.execute(select(workflows.c.id, workflows.c.name, workflows.c.team_id)).all()
-        team_workflows: dict[str, dict[str, str]] = {}
-        for row in workflow_rows:
-            if row.team_id:
-                team_workflows.setdefault(row.name, {})[row.team_id] = row.id
         stored = {row.key: row.value for row in conn.execute(select(settings.c.key, settings.c.value).where(
             settings.c.key.in_(("ops.jira-work", "ops.linear-intake", "env.JIRA_PROJECT")))).all()}
         platforms = _mapping(_mapping(stored.get("ops.jira-work")).get("platforms"))
@@ -155,8 +150,6 @@ class _Target:
         jira_project = stored.get("env.JIRA_PROJECT")
         return cls(conn=conn, keyring=keyring, now=now, by_slug={row.slug: row.id for row in team_rows if row.slug},
                    projects=project_map,
-                   workflows={row.name: row.id for row in workflow_rows if row.team_id is None},
-                   team_workflows=team_workflows,
                    users={row.username.lower(): row.id
                           for row in conn.execute(select(users.c.id, users.c.username)).all() if row.username},
                    platform_repos={name: entry["repo"] for name, entry in platforms.items()
@@ -174,6 +167,13 @@ class _Target:
         if not named or len({team for team, _ in named}) != 1:
             return None
         return named[0][0], named[0][1] if len({project for _, project in named}) == 1 else None
+
+    def workflow_id(self, name: str, team_id: str, project_id: str | None) -> str | None:
+        key = (name, team_id, project_id)
+        if key not in self.resolved:
+            row = resolve_workflow(self.conn, name, team_id, project_id)
+            self.resolved[key] = row.id if row is not None else None
+        return self.resolved[key]
 
     def team_for(self, src: SourceRun) -> tuple[str, str | None, str]:
         """The run's team and project, and the rule that chose them. With no evidence, the admin-only team."""
@@ -570,7 +570,7 @@ def plan_run(src: SourceRun, target: _Target, report: Report) -> Plan | None:
     steps = build_steps(src)
     found = build_findings(src, report)
     workflow_name = str(run.get("workflow") or "unknown")[:191]
-    workflow_id = target.team_workflows.get(workflow_name, {}).get(team_id) or target.workflows.get(workflow_name)
+    workflow_id = target.workflow_id(workflow_name, team_id, project_id)
     actor = actor_of(src)
     stage_ends = [s.finished_at for s in steps if s.finished_at]
     last_seen = max([t for t in (_aware(run.get("last_event_at")), *stage_ends) if t], default=started)

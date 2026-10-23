@@ -81,6 +81,16 @@ def _scope_from_team(context) -> str:
     return scope_of(context.get_current_parameters().get("team_id"))
 
 
+# A project-scoped definition keeps its project's team_id too, so team visibility covers it.
+SCOPE_MATCHES_DEFINITION = (f"(project_id IS NULL AND ({SCOPE_MATCHES_TEAM})) "
+                            "OR (project_id IS NOT NULL AND team_id IS NOT NULL AND scope = project_id)")
+
+
+def _scope_from_definition(context) -> str:
+    params = context.get_current_parameters()
+    return params.get("project_id") or scope_of(params.get("team_id"))
+
+
 # MySQL TEXT stops at 64 KB, too small for a long prompt or workflow body.
 LongText = Text().with_variant(MEDIUMTEXT(), "mysql")
 
@@ -210,20 +220,22 @@ workflows = Table(
     "workflows", metadata,
     _id(),
     Column("team_id", String(36), ForeignKey("teams.id"), index=True),
-    Column("scope", String(36), nullable=False, default=_scope_from_team),
+    Column("project_id", String(36), ForeignKey("projects.id")),
+    Column("scope", String(36), nullable=False, default=_scope_from_definition),
     Column("name", name_type(191), nullable=False),
     Column("current_version", Integer, nullable=False, default=0),
     _ts("created_at"),
     _ts("updated_at"),
     UniqueConstraint("scope", "name"),
-    CheckConstraint(SCOPE_MATCHES_TEAM, name="scope"),
+    CheckConstraint(SCOPE_MATCHES_DEFINITION, name="scope"),
 )
 
 documents = Table(
     "documents", metadata,
     _id(),
     Column("team_id", String(36), ForeignKey("teams.id")),
-    Column("scope", String(36), nullable=False),
+    Column("project_id", String(36), ForeignKey("projects.id")),
+    Column("scope", String(36), nullable=False, default=_scope_from_definition),
     Column("kind", String(16), nullable=False),
     Column("key", name_type(191), nullable=False),
     Column("current_version", Integer, nullable=False, default=0),
@@ -231,7 +243,7 @@ documents = Table(
     _ts("updated_at"),
     CheckConstraint(_in("kind", DOCUMENT_KINDS), name="kind"),
     UniqueConstraint("scope", "kind", "key"),
-    CheckConstraint(SCOPE_MATCHES_TEAM, name="scope"),
+    CheckConstraint(SCOPE_MATCHES_DEFINITION, name="scope"),
 )
 
 versions = Table(

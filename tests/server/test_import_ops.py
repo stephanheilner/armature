@@ -174,7 +174,8 @@ def test_import_maps_every_part_of_the_tree(engine, keyring):
 
         bedrock = conn.execute(select(providers).where(providers.c.team_id == mobile)).one()
         assert bedrock.kind == "bedrock"
-        assert bedrock.config == {"region": "us-east-1", "credential_secret": "AWS_BEARER_TOKEN_BEDROCK"}
+        assert bedrock.config == {"region": "us-east-1", "credential_secret": "AWS_BEARER_TOKEN_BEDROCK",
+                                  "credential_scope": "instance"}
         assert bedrock.aliases == {"review": "us.anthropic.claude-opus-5-5", "fix": "us.anthropic.claude-opus-5-5",
                                    "jira_work": "us.anthropic.claude-opus-5-5", "lead": "us.anthropic.claude-opus-5-5",
                                    "fast": "us.anthropic.claude-haiku-5-5"}

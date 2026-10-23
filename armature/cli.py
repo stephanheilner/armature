@@ -18,6 +18,9 @@ app.add_typer(package_app, name="package")
 from armature.server.cli import server_app  # noqa: E402
 app.add_typer(server_app, name="server")
 
+from armature.packs.cli import pack_app  # noqa: E402
+app.add_typer(pack_app, name="pack")
+
 
 @app.command()
 def new(
