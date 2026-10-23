@@ -19,13 +19,19 @@ puts the data in a database.
 
 - One runtime. The server is FastAPI, already Armature's `service` extra. The
   frontend stays build-free ES modules, as the existing dashboard is.
-- Any SQL database. SQLAlchemy 2 Core with Alembic migrations, tested on
+- Any SQL database. SQLAlchemy 2 Core, with no ORM, and Alembic migrations, tested on
   SQLite, MySQL 8, and Postgres 16+. No backend-specific SQL. JSON columns use
   `sqlalchemy.JSON`, and aggregation such as percentiles happens in Python.
 - Workflow definitions never carry shell commands a browser user typed.
   `ScriptNode` runs `cmd:` with `shell=True`, so an editable `cmd:` would be
   remote code execution for anyone with an editor role. Commands come only from
   installed packs (see "Workflow packs").
+- Templates can't run code. Every Jinja environment in Armature today is the
+  unsandboxed `jinja2.Environment`, so an editor who writes
+  `skip_if: "{{ ''.__class__.__mro__ ... }}"` reaches code execution without
+  touching `cmd:`. All rendering moves to `ImmutableSandboxedEnvironment`, and
+  a stored workflow's `{{ }}` may hold only a dotted or indexed reference to an
+  input or step output, with no calls, filters, or `{% %}`.
 - The armature-ops instance keeps running through the migration. Each phase
   ends in a state the live instance can run on, with a named rollback.
 
@@ -60,61 +66,64 @@ must read well.
 - **Roles and prompts are Markdown with YAML front matter**, the format Claude
   Code uses for agents and skills. One document replaces a `roles.json` entry
   plus its prompt file.
-- **Steps reference adapters from the catalog by name.** In the UI, adding a
-  step means picking a step type, filling in its declared parameters, and
-  wiring its inputs. Raw `cmd:` strings never appear in a stored workflow.
+- **Steps reference adapters from the catalog by name.** `adapter:
+  github-review/team-lead` resolves to an installed pack's adapter. In the UI,
+  adding a step means picking a step type, filling in its declared parameters,
+  and wiring its inputs. Raw `cmd:` strings never appear in a stored workflow.
 
 Markdown alone was considered and rejected for structure. It can't express a
 dependency graph, fan-out, or limits without inventing a grammar that has no
 schema to validate against. JSON was rejected for prose because long prompts in
 JSON strings are unreadable.
 
-A stored workflow looks like this. Every adapter comes from the installed
-`github-review` pack, and `{{ }}` values come from run inputs, never from
-webhook text:
+A stored workflow keeps Armature's own field names. Every adapter comes from
+the installed `github-review` pack, and `{{ }}` values come from run inputs
+and step outputs, never from webhook text:
 
 ```yaml
 name: pr-role-review
 description: Review one pull request with specialist roles, then a team lead.
-mission_ref: missions/mobile-team      # a Markdown document
-inputs:
-  - name: job_file
-steps:
+mission: mission/mobile-team          # a document id
+contracts:
+  inputs:
+    - name: job_file
+stages:
   - id: resolve
-    uses: github-review/resolve-pr
+    adapter: github-review/resolve-pr
   - id: incremental
-    uses: github-review/incremental-check
-    after: [resolve]
-    on_error: continue
+    adapter: github-review/incremental-check
+    depends_on: [resolve]
+    fail_as_value: true
   - id: assignments
-    uses: github-review/assign-roles
-    after: [resolve, incremental]
-    with:
-      roles: { select: by_platform }
+    adapter: github-review/assign-roles
+    depends_on: [resolve, incremental]
   - id: reviews
-    uses: github-review/role-review
-    after: [assignments]
-    for_each: assignments.jobs
-    parallel: 9
+    adapter: github-review/role-review
+    depends_on: [assignments]
+    partition_source: "{{ assignments.jobs }}"
+    partition_key: assignment
+    fan_out: 9
+    fan_in: list
   - id: verify
-    uses: github-review/build
-    after: [assignments]
-    on_error: continue
+    adapter: github-review/build
+    depends_on: [assignments]
+    fail_as_value: true
   - id: team_lead
-    uses: github-review/team-lead
-    after: [reviews, verify]
+    adapter: github-review/team-lead
+    depends_on: [reviews, verify]
     with:
-      prompt: prompts/team-lead-pr
+      prompt: prompt/team-lead-pr
       model: lead
   - id: post
-    uses: github-review/post-review
-    after: [team_lead]
+    adapter: github-review/post-review
+    depends_on: [team_lead]
 ```
 
-`uses`, `after`, `for_each`, `parallel`, and `on_error` are friendlier names
-for `adapter`, `depends_on`, `partition_source`, `fan_out`, and
-`fail_as_value`. The loader compiles this form to a `HarnessSpec`, and plain
-Armature specs keep loading too, so the friendly form is optional sugar.
+A friendlier second spelling (`uses`, `after`, `for_each`) was considered and
+dropped. It needs a compiler whose errors map back to lines, and two formats to
+document, for a gain the form editor already gives. `with:` is the one
+addition: parameters validated against the adapter's schema and passed to it
+through `ARMATURE_CONTEXT`, never rendered into a command.
 
 A role looks like this:
 
@@ -131,7 +140,10 @@ mcp_servers: []
 You are the security reviewer. ...
 ```
 
-Adding a role is a new document. A role runs in every workflow that selects
+Front matter is code too: `tools` can grant `Bash(*)` and an `mcp_servers`
+entry names a command. A project lead may choose only tools and servers the
+installed pack allowlists, and anything wider needs an admin. Adding a role is
+a new document. A role runs in every workflow that selects
 roles by platform, with no workflow edit. This matches how armature-ops already
 treats `roles.json`.
 
@@ -156,7 +168,9 @@ packs/github-review/
 ```
 
 `pack.yaml` declares each adapter's `cmd`, parameters (a JSON Schema),
-outputs, timeout, and which secrets it needs. The UI builds the step form from
+outputs, timeout, and which secrets it needs. Install refuses a `cmd` that
+contains `{{`, and an install or upgrade needs an admin with a fresh step-up,
+is pinned to a commit or wheel hash, and is audited. The UI builds the step form from
 that schema. Only admins install or upgrade packs, because a pack is code.
 Project leads compose workflows from installed adapters and edit prompts and
 roles.
@@ -169,19 +183,22 @@ Its scripts move with little change, because packs still run through
 ## Data model
 
 Every table except `users` and `settings` belongs to a team. Ids are UUIDs
-stored as strings, which keeps them portable across backends.
+stored as strings, which keeps them portable across backends. Tables are
+SQLAlchemy Core definitions with one module of query functions per area.
 
 | Area | Tables |
 | --- | --- |
-| Tenancy | `teams`, `projects` (a repository, its platform, enabled workflows, and branch filters), `team_projects` |
-| People | `users`, `identities` (password+TOTP or OIDC subject), `memberships` (user, team or project, role), `sessions`, `audit` |
-| Definitions | `workflows`, `workflow_versions`, `documents` (roles, prompts, missions), `document_versions`, `packs`, `adapters` |
+| Tenancy | `teams`, `projects` (a repository with its `team_id`, platform, enabled workflows, and branch filters) |
+| People | `users` (with OIDC `iss` and `sub` columns), `memberships` (user, team or project, role), `sessions`, `audit` |
+| Definitions | `workflows`, `documents` (roles, prompts, missions), `versions` (append-only history of both), `packs` |
 | Config | `providers` (per team: kind, region, model aliases), `secrets` (per team or instance), `settings`, `triggers` |
-| History | `runs`, `run_steps`, `run_events` (structured, retained), `findings`, `costs`, `actions` (trigger, cancel, re-run, by whom) |
+| Execution | `jobs` (queued, claimed, heartbeat) |
+| History | `runs` (with trigger, cancel, and re-run actors, cost, and duration), `run_steps`, `run_events`, `findings` |
 
-Each edit of a workflow or document writes a new version row with author and
-time, which gives an audit trail and one-click rollback. Export and import as
-a directory keeps a git copy possible for anyone who wants one.
+Adapters are read from each installed `pack.yaml`, not stored. Each edit of a
+workflow or document appends a `versions` row with author and time, which
+gives an audit trail and one-click rollback. Export and import as a directory
+keeps a git copy possible for anyone who wants one.
 
 ## Users, roles, and sign-in
 
@@ -200,20 +217,40 @@ Sign-in supports two methods, and an instance enables either or both:
 - **Password and TOTP**, ported from the dashboard: scrypt, RFC 6238 with
   replay protection, step-up for sensitive changes, and rate limits.
 
-Sessions are server-side rows keyed by an HMAC of the token. Mutations need a
-CSRF token and a same-origin check.
+OIDC uses the authorization code flow with PKCE, and checks `state`,
+`nonce`, issuer, audience, and the JWKS algorithm. Accounts link on (`iss`,
+`sub`) only, never on email. Roles are recomputed from groups on every login,
+so a group removed in Okta revokes the role, and only groups named in config
+grant anything. Admin comes from a claim only through an explicit
+`admin_groups` setting.
+
+Sessions are server-side rows keyed by an HMAC of the token, ported from the
+dashboard: 30-minute idle and 12-hour absolute limits, a `__Secure-` cookie,
+an origin check plus a CSRF token on every mutation, and per-IP and per-user
+throttles. One FastAPI dependency per route enforces the role and loads the
+object to check its team or project, never trusting an id in the body. The
+same check covers live streams, exports, re-runs, cancels, and the assistant.
+Changes to packs, providers, secrets, users, and sign-in settings need
+step-up.
 
 ## Secrets
 
-Secrets are encrypted in the database with an envelope key: Fernet
-(AES-128-CBC with HMAC) under a master key that never enters the database. The
-key comes from `ARMATURE_MASTER_KEY`, a key file, or AWS KMS. Encryption at
+Secrets are encrypted in the database with AES-256-GCM, as the dashboard
+already encrypts TOTP secrets, under a master key that never enters the
+database. The key comes from `ARMATURE_MASTER_KEY`, a key file, or AWS KMS.
+HKDF derives separate sub-keys for secrets, sessions, and TOTP, and a key id
+in each value's prefix allows rotation. The team, secret id, and name are
+bound as GCM additional data, so a ciphertext copied into another team's row
+fails to decrypt. Encryption at
 rest is worth it even on a trusted host, because database backups and
 replicas leave the machine. The UI never shows a secret again after it's
 saved, only that one is set and when.
 
 A run receives only the secrets its pack declares, in the stage environment.
-Sessions keep starting under `env -i`, as armature-ops does today.
+Workers start without the master key or the OIDC client secret, and sessions
+keep starting under `env -i`, as armature-ops does today. Every secret
+decrypted for a run is redacted by exact value from logs, events, and error
+bodies.
 
 ## Model providers per team
 
@@ -241,27 +278,43 @@ finishes. That is why live activity is slow and shows little.
 
 ### Design
 
-1. **An event pipe for every run.** The runner gives each run an
-   `ARMATURE_EVENTS` endpoint, a Unix socket or loopback URL with a per-run
-   token. The engine's `on_event` hook, the runner, and scripts all write JSON
-   events to it: step started, finished, failed, cost, finding, and log line.
-2. **Claude Code streams.** Session wrappers switch to `--output-format
-   stream-json --verbose` and tee each message as an event: tool call, tool
-   result summary, assistant text, and token usage. The final result is
-   still the last message, so the wrappers' outputs don't change.
-3. **The server fans out and batches.** Events go to an in-process broker
-   that pushes them over Server-Sent Events (SSE) to viewers of that run or
-   team. A writer flushes them to `run_events` in batches every second. With
-   several server processes, a Redis or Postgres `LISTEN` broker replaces the
-   in-process one behind the same interface.
-4. **Completion writes the summary.** When a run ends, the server writes
-   `runs`, `run_steps`, `findings`, and `costs` in one transaction. Console
-   output stays in log files and is linked, not stored.
+1. **Wrappers emit events, sessions don't.** Each run gets an
+   `ARMATURE_EVENTS` endpoint: a mode 0600 Unix datagram socket, or a
+   loopback HTTP URL for remote workers, with a per-run token sent in a
+   header. Only an HMAC of the token is stored, and it expires when the run
+   ends. The server takes the run and team from the token, never from the
+   payload. The engine's `on_event`, the runner, and an `armature emit`
+   command write to it with a 50 ms send timeout, so a down server never
+   stalls a run. Session wrappers emit on a session's behalf, so a session
+   under `env -i` never holds the token.
+2. **Claude Code streams.** Wrappers switch to `--output-format stream-json
+   --verbose` and emit each tool call, a tool-result summary capped at 2 KB,
+   assistant text, and token usage. The final result is still the last
+   message, so wrapper outputs don't change.
+3. **Some events must be kept and some can be dropped.** Step changes, cost,
+   findings, tool calls, and results are never dropped. Assistant text is
+   coalesced to four updates a second. A full per-run queue drops text first
+   and records a `dropped` marker, so the UI shows the gap.
+4. **Broadcast first, store second.** The server assigns each event a per-run
+   `seq`, pushes it over Server-Sent Events (SSE) to subscribers of that run
+   or team, then a single writer flushes every second or 500 events in one
+   transaction for all runs together. A slow subscriber's bounded queue
+   overflows, the subscriber is dropped, and it resumes with `Last-Event-ID`.
+   With several server processes, a Postgres `NOTIFY` of (`run_id`, `seq`) or
+   Redis wakes the others.
+5. **Completion writes the summary.** When a run ends, the server writes
+   `runs`, `run_steps`, and `findings` in one transaction. Console output
+   stays in log files and is linked, not stored. Events for finished runs are
+   deleted after a retention period, and summaries are kept.
+
+Event text is redacted before storage, because stream-json carries tool
+results from hostile diffs, and the UI renders it as text, never HTML.
 
 Latency drops from 5 to 10 seconds to under one second, and the database
-receives one batched insert per second per active run. Reads use indexes on
-(team, started_at) and (run_id, seq). This scales with the number of
-concurrent projects, because no work depends on polling the filesystem.
+receives one batched insert per second in total. `run_events` has only its
+primary key (`run_id`, `seq`), and `runs` is indexed on (`team_id`,
+`started_at`). A load harness proves it: 20 concurrent runs at 200 events a
+second with 100 viewers, p99 under one second, on all three databases.
 
 ## Authoring with an LLM
 
@@ -284,10 +337,10 @@ The workflow editor has an assistant panel that uses the team's `lead` alias:
 
 `armature server` runs the API, the UI, the event broker, and the scheduler
 in one process. Runs execute in worker processes (`armature worker`) that
-take jobs from a `jobs` table with row locks, so a long run survives a server
-restart, as armature-ops's detached runners do today. SQLite gets one worker
-with a file lock, and MySQL and Postgres get `SELECT ... FOR UPDATE SKIP
-LOCKED`.
+take jobs from a `jobs` table, so a long run survives a server restart, as
+armature-ops's detached runners do today. A worker claims a job with one
+compare-and-set `UPDATE ... WHERE status = 'queued'` and checks the row count,
+which works the same on all three databases.
 
 The webhook gateway stays a thin, separate process that verifies signatures
 and inserts jobs. An instance doesn't need to expose the API port, and
