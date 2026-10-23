@@ -426,8 +426,8 @@ def validate_spec(spec: HarnessSpec, *, strict: bool = True) -> list[SpecError]:
             ))
         if lc.until is not None:
             try:
-                from jinja2 import Environment, BaseLoader
-                Environment(loader=BaseLoader()).parse(lc.until)
+                from armature.runtime.templating import text_env
+                text_env().parse(lc.until)
             except Exception as exc:
                 errors.append(SpecError(
                     code="LOOP_INVALID_UNTIL_EXPR",

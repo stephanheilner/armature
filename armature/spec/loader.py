@@ -2,9 +2,10 @@ import logging
 from pathlib import Path
 from typing import Any
 import jinja2
-from jinja2 import Environment, BaseLoader
+from jinja2.sandbox import ImmutableSandboxedEnvironment
 from pydantic import ValidationError
 from ruamel.yaml import YAML, YAMLError
+from armature.runtime.templating import text_env
 from armature.spec.models import CompiledAgent, HarnessSpec, SkillDef, ToolSafetyRule
 
 _log = logging.getLogger(__name__)
@@ -42,15 +43,10 @@ class _KeepUndefined(jinja2.Undefined):
         return 0
 
 
-def _template_env() -> Environment:
+def _template_env() -> ImmutableSandboxedEnvironment:
     """The shared load-time Jinja2 environment: preserves {{ expr }} for any
     variable not in vars (_KeepUndefined) so runtime placeholders survive."""
-    return Environment(
-        loader=BaseLoader(),
-        variable_start_string="{{",
-        variable_end_string="}}",
-        undefined=_KeepUndefined,
-    )
+    return text_env(_KeepUndefined)
 
 
 def load_spec(path: Path | str, vars: dict | None = None) -> HarnessSpec:
@@ -75,7 +71,7 @@ def load_spec(path: Path | str, vars: dict | None = None) -> HarnessSpec:
     return spec
 
 
-def _render_string_scalars(data: Any, env: Environment, vars: dict) -> None:
+def _render_string_scalars(data: Any, env: ImmutableSandboxedEnvironment, vars: dict) -> None:
     """Render carried context into string scalars of an already-parsed spec tree.
 
     Values only — dict keys and YAML structure are untouched, so a multiline or

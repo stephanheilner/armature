@@ -4,9 +4,9 @@ import json
 import os
 import signal
 import subprocess
-from jinja2 import Environment, BaseLoader
 from typing import Any
 from armature.nodes.base import BaseNode
+from armature.runtime.templating import text_env
 from armature.spec.models import Adapter
 from armature.permissions.permissions import classify_shell_command, requires_approval
 
@@ -18,8 +18,7 @@ class ScriptNode(BaseNode):
     async def execute(self, context: dict[str, Any]) -> Any:
         cmd = self._adapter.cmd or ""
         if "{{" in cmd:
-            env = Environment(loader=BaseLoader(), variable_start_string="{{", variable_end_string="}}")
-            cmd = env.from_string(cmd).render(**context)
+            cmd = text_env().from_string(cmd).render(**context)
 
         permission = classify_shell_command(cmd)
         if requires_approval(permission):

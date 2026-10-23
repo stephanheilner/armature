@@ -41,6 +41,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   running one at a time. A script that times out or is cancelled has its whole
   process group killed.
 
+### Security
+
+- **Templates render in Jinja2's immutable sandbox.** Every `skip_if`,
+  `condition`, `partition_source`, loop `until`, gate message, tool argument,
+  role description, adapter `cmd`, and load-time spec variable now renders
+  through `armature.runtime.templating`. A template can no longer reach
+  Python internals: an unsafe attribute such as `''.__class__` renders as
+  undefined, and calling one, or a method that mutates a value, raises
+  `SecurityError`. The new `armature.spec.template_lint` (`lint_template`,
+  `lint_tree`, `lint_spec`, and `armature validate --strict-templates`)
+  limits every string in a spec further to references, comparisons, and a
+  few formatting filters.
+
 ## [0.7.0] - 2026-10-05
 
 ### Added

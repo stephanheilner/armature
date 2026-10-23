@@ -750,11 +750,10 @@ class Harness:
         """
         import asyncio
         from pathlib import Path as _Path
-        from jinja2.nativetypes import NativeEnvironment
         from jinja2 import ChainableUndefined
+        from armature.runtime.templating import native_env
 
-        env = NativeEnvironment(undefined=ChainableUndefined)
-        items = env.from_string(stage.partition_source).render(**context)
+        items = native_env(ChainableUndefined).from_string(stage.partition_source).render(**context)
 
         if not isinstance(items, (list, tuple)):
             hint = ""
@@ -823,8 +822,9 @@ class Harness:
         The result's keys (if it's a dict) are merged into the template context
         so authors can write `until: "{{ status == 'done' }}"` directly.
         """
-        from jinja2 import Environment, BaseLoader, ChainableUndefined
-        env = Environment(loader=BaseLoader(), undefined=ChainableUndefined)
+        from jinja2 import ChainableUndefined
+        from armature.runtime.templating import text_env
+        env = text_env(ChainableUndefined)
         eval_ctx = {**context}
         if isinstance(result, dict):
             eval_ctx.update(result)
@@ -1012,8 +1012,9 @@ class Harness:
         # Evaluate skip_if (negative gate) and condition (positive gate).
         # condition is the inverse: stage runs only when truthy, skips when falsy.
         # Both are evaluated; if either triggers a skip, the stage is skipped.
-        from jinja2 import ChainableUndefined, Environment, BaseLoader
-        _jinja_env = Environment(loader=BaseLoader(), undefined=ChainableUndefined)
+        from jinja2 import ChainableUndefined
+        from armature.runtime.templating import text_env
+        _jinja_env = text_env(ChainableUndefined)
 
         if stage.skip_if is not None:
             rendered = _jinja_env.from_string(stage.skip_if).render(**context).strip().lower()
