@@ -1,6 +1,7 @@
 """Request dependencies: the signed-in session, mutation checks, and ``require``."""
 from __future__ import annotations
 
+import ipaddress
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -25,6 +26,17 @@ LOCAL_PRE_COOKIE = "armature-pre-local"
 STATE_COOKIE = "__Secure-armature-oidc"
 LOCAL_STATE_COOKIE = "armature-oidc-local"
 LOCAL_ORIGIN = re.compile(r"^http://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$")
+PRIVATE_HTTP_ORIGIN = re.compile(r"^http://(\d{1,3}(?:\.\d{1,3}){3})(:\d+)?$")
+
+
+def _private_http_origin(origin: str) -> bool:
+    match = PRIVATE_HTTP_ORIGIN.fullmatch(origin)
+    if not match:
+        return False
+    try:
+        return ipaddress.ip_address(match.group(1)).is_private
+    except ValueError:
+        return False
 STEP_UP_REQUIRED = "step_up_required"
 
 
@@ -42,7 +54,9 @@ class Server:
     # Plain-http localhost drops Secure, which the __Secure- prefix would then forbid.
     @property
     def insecure_localhost(self) -> bool:
-        return bool(LOCAL_ORIGIN.fullmatch(self.cfg.public_origin))
+        if LOCAL_ORIGIN.fullmatch(self.cfg.public_origin):
+            return True
+        return self.cfg.allow_private_http and _private_http_origin(self.cfg.public_origin)
 
     @property
     def cookie_name(self) -> str:

@@ -52,6 +52,8 @@ class ServerConfig(BaseModel):
     host: str = "127.0.0.1"
     port: int = Field(default=8098, ge=1, le=65535)
     allow_public_bind: bool = False
+    # Plain-http sign-in on a private IPv4 origin, for a home or office network without TLS.
+    allow_private_http: bool = False
     trust_real_ip: bool = False
     master_key: str = Field(default_factory=lambda: f"file:{Path('~/.armature/master.key').expanduser()}")
     oidc: OIDCConfig | None = None
