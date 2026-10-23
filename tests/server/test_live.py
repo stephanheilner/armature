@@ -5,11 +5,24 @@ import threading
 import time
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, insert, select, update
 
 from armature.events.emitter import Emitter
+from armature.server import runners
 from armature.server import secrets as secret_store
-from armature.server.db.schema import findings, run_events, run_steps, run_tokens, runs
+from armature.server.db import new_id
+from armature.server.db.schema import (
+    audit,
+    findings,
+    memberships,
+    projects,
+    run_events,
+    run_steps,
+    run_tokens,
+    runs,
+    teams,
+    workflows,
+)
 from tests.server.app_support import Clock, add_membership, add_user
 from tests.server.live_support import (
     SSE,
@@ -114,6 +127,83 @@ def test_registration_shape_and_validation(live, world):
     assert rerun.status_code == 200
 
 
+def test_instance_runner_key_routes(live, world):
+    admin = live.client(world["users"]["admin"])
+    created = admin.post("/api/runner-keys", json={"name": "m1 host"}, headers=live.csrf(admin))
+    assert created.status_code == 200
+    key, record = created.json()["key"], created.json()["runner_key"]
+    assert key.startswith("ark_") and set(record) == {"id", "name", "created_at", "created_by", "last_used_at"}
+    assert [k["id"] for k in admin.get("/api/runner-keys").json()["runner_keys"]] == [record["id"]]
+    team_url = f"/api/teams/{world['team']}/runner-keys"
+    assert record["id"] not in str(admin.get(team_url).json())
+
+    lead = live.client(world["users"]["lead"])
+    assert lead.get("/api/runner-keys").status_code == 403
+    assert lead.post("/api/runner-keys", json={"name": "x"}, headers=live.csrf(lead)).status_code == 403
+    assert lead.post(f"/api/runner-keys/{record['id']}/delete", headers=live.csrf(lead)).status_code == 403
+    assert lead.post(f"{team_url}/{record['id']}/delete", headers=live.csrf(lead)).status_code == 404
+    no_step_up = live.client(world["users"]["admin"], step_up=False)
+    assert no_step_up.post("/api/runner-keys", json={"name": "x"}, headers=live.csrf(no_step_up)).status_code == 403
+    assert no_step_up.post(f"/api/runner-keys/{record['id']}/delete",
+                           headers=live.csrf(no_step_up)).status_code == 403
+
+    http = live.client()
+    run = register(http, key)
+    assert post(http, run["token"], line("log", None, text="before"))["accepted"] == 1
+    assert admin.post(f"/api/runner-keys/{record['id']}/delete", headers=live.csrf(admin)).json() == {"ok": True}
+    assert post(http, run["token"], line("log", None, text="after"))["rejected"] == 1
+    assert _count(live.engine, select(func.count()).select_from(run_tokens)
+                  .where(run_tokens.c.run_id == run["run_id"])) == 0
+    assert http.post("/api/runner/runs", json={"workflow": "w"},
+                     headers={"Authorization": f"Bearer {key}"}).status_code == 401
+    assert admin.get("/api/runner-keys").json()["runner_keys"] == []
+    assert admin.post(f"/api/runner-keys/{record['id']}/delete", headers=live.csrf(admin)).status_code == 404
+
+
+def test_instance_key_registers_into_the_repositorys_team(live, world, keyring, clock):
+    with live.engine.begin() as conn:
+        conn.execute(update(projects).where(projects.c.id == world["project"]).values(repo="fs-eng/android-tree"))
+        conn.execute(update(projects).where(projects.c.id == world["other_project"]).values(repo="fs-eng/web"))
+        conn.execute(update(teams).where(teams.c.id == world["other"]).values(slug="web"))
+        workflow_id = new_id()
+        conn.execute(insert(workflows).values(id=workflow_id, team_id=world["team"], name="pr-review",
+                                              current_version=1, created_at=clock(), updated_at=clock()))
+        _, key = runners.create_key(conn, keyring, team_id=None, name="host", actor_id=None, now=clock(), ip=None)
+    http = live.client()
+
+    def landed(run):
+        with live.engine.connect() as conn:
+            row = conn.execute(select(runs).where(runs.c.id == run["run_id"])).one()
+        return row.team_id, row.project_id, row.workflow_id
+
+    assert landed(register(http, key, project="FS-Eng/Android-Tree")) == \
+        (world["team"], world["project"], workflow_id)
+    assert landed(register(http, key, project="fs-eng/web")) == (world["other"], world["other_project"], None)
+    assert landed(register(http, key, project="web/web-app")) == (world["other"], world["other_project"], None)
+
+    unknown = landed(register(http, key, project="fs-eng/nowhere"))
+    with live.engine.connect() as conn:
+        ops = conn.execute(select(teams).where(teams.c.slug == "operations")).one()
+    assert ops.name == "Operations (unassigned runs)"
+    assert unknown == (ops.id, None, None)
+    assert landed(register(http, key)) == (ops.id, None, None)
+    assert landed(register(http, key, project="mobile/mobile-app")) == (ops.id, None, None)
+    assert _count(live.engine, select(func.count()).select_from(teams).where(teams.c.slug == "operations")) == 1
+    assert _count(live.engine, select(func.count()).select_from(audit)
+                  .where(audit.c.action == "team.create", audit.c.team_id == ops.id)) == 1
+    assert _count(live.engine, select(func.count()).select_from(memberships)
+                  .where(memberships.c.scope_id == ops.id)) == 0
+
+    admin = live.client(world["users"]["admin"])
+    assert ops.id in {t["id"] for t in admin.get("/api/teams").json()["teams"]}
+    lead = live.client(world["users"]["lead"])
+    assert ops.id not in {t["id"] for t in lead.get("/api/teams").json()["teams"]}
+
+    auth = {"Authorization": f"Bearer {world['key']}"}
+    assert http.post("/api/runner/runs", json={"workflow": "w", "project": "fs-eng/web"},
+                     headers=auth).status_code == 404
+
+
 def test_ingest_writes_summary_on_run_end(live, world, keyring):
     http = live.client()
     run = register(http, world["key"])
@@ -134,7 +224,8 @@ def test_ingest_writes_summary_on_run_end(live, world, keyring):
     summary = detail["run"]
     assert set(summary) == {"id", "team_id", "project_id", "workflow", "status", "triggered_by", "trigger_kind",
                             "started_at", "finished_at", "cost_usd", "input_tokens", "output_tokens", "rerun_of",
-                            "cancelled_by", "error", "last_seq"}
+                            "cancelled_by", "error", "last_seq", "dry_run"}
+    assert summary["dry_run"] is False
     assert (summary["status"], summary["error"], summary["workflow"], summary["triggered_by"]) == \
         ("failed", "build broke", "pr-review", "octocat")
     assert summary["cost_usd"] == pytest.approx(0.75) and summary["input_tokens"] == 105
@@ -412,3 +503,30 @@ def test_ingest_off_without_lifespan(engine, keyring, clock):
     response = make_client(engine, keyring, clock).post("/api/events", content=b"{}")
     assert response.status_code == 503
 
+
+
+def test_step_end_outputs_are_stored_with_fan_out_branches_as_a_list(live, world, engine):
+    http = live.client()
+    run = register(http, world["key"])
+    result = post(http, run["token"],
+                  line("step_start", "resolve"),
+                  line("step_end", "resolve", output={"files": ["a.py", "b.py"]}),
+                  line("step_start", "review", branch=0, branches=2),
+                  line("step_start", "review", branch=1, branches=2),
+                  line("step_end", "review", branch=1, branches=2, output={"finding": "b"}),
+                  line("step_end", "review", branch=0, branches=2, output={"finding": "a"}),
+                  line("step_start", "post"),
+                  line("step_end", "post", output={"body": "cut"}, truncated=True),
+                  line("step_start", "plain"),
+                  line("step_end", "plain"))
+    assert result["accepted"] == 10
+    live.flush()
+    with engine.connect() as conn:
+        outputs = dict(conn.execute(select(run_steps.c.step_id, run_steps.c.output)
+                                    .where(run_steps.c.run_id == run["run_id"])).all())
+        without = conn.execute(select(run_steps.c.step_id).where(
+            run_steps.c.run_id == run["run_id"], run_steps.c.output.is_(None))).scalars().all()
+    assert outputs["resolve"] == {"files": ["a.py", "b.py"]}
+    assert outputs["review"] == [{"finding": "a"}, {"finding": "b"}]
+    assert outputs["post"] == {"body": "cut", "_truncated": True}
+    assert without == ["plain"]

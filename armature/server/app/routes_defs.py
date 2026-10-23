@@ -35,7 +35,6 @@ from armature.server.db.schema import (
     users,
     versions,
 )
-from armature.server.import_ops import lint_ok
 
 router = APIRouter()
 
@@ -131,7 +130,7 @@ def _history(conn, object_kind: str, object_id: str, current: int) -> tuple[dict
 def _item(conn: Connection, kind: defs.Kind, row: Any, access: rbac.Access) -> dict[str, Any]:
     item = defs.summary(kind, row, access, defs.scope_names(conn))
     if kind is defs.WORKFLOW:
-        item["lint_ok"] = lint_ok(conn.execute(select(versions.c.note).where(and_(
+        item["lint_ok"] = defs.lint_ok(conn.execute(select(versions.c.note).where(and_(
             versions.c.object_kind == "workflow", versions.c.object_id == row.id,
             versions.c.version == row.current_version))).scalar())
     return item

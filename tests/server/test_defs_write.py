@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import ClassVar
 
 import pytest
@@ -764,8 +765,7 @@ def test_each_output_must_refer_to_a_name(world, expr, ok):
 
 
 def test_imported_ops_skip_if_expressions_still_pass(world):
-    from tests.server.test_import_ops import FIXTURE
-    body = (FIXTURE / "specs" / "pr-role-review.yml").read_text()
+    body = (Path(__file__).resolve().parent / "fixtures" / "specs" / "pr-role-review.yml").read_text()
     assert "UNSAFE_TEMPLATE" not in {e["code"] for e in _errors(world, body)}
 
 

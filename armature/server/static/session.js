@@ -19,7 +19,7 @@ export const canManageTeam = (teamId) => isAdmin() || ledTeamIds().includes(team
 // The server is the real gate. This only hides what a role cannot use.
 export function navFor(sessionPayload) {
   if (!sessionPayload?.user) return [];
-  if (sessionPayload.user.is_admin) return ['runs', 'teams', 'workflows', 'roles', 'packs', 'users', 'secrets', 'settings', 'account'];
+  if (sessionPayload.user.is_admin) return ['runs', 'teams', 'workflows', 'roles', 'packs', 'users', 'secrets', 'runner-keys', 'settings', 'account'];
   if (ledTeamIds(sessionPayload).length) return ['runs', 'teams', 'workflows', 'roles', 'packs', 'users', 'secrets', 'account'];
   return ['runs', 'teams', 'workflows', 'roles', 'packs', 'account'];
 }

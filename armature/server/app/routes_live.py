@@ -15,7 +15,7 @@ from armature.server import rbac
 from armature.server.app.deps import Granted, by_run, require, server, signed_in
 from armature.server.app.http import ApiError
 from armature.server.auth import Session, load_session
-from armature.server.db.schema import findings, run_steps
+from armature.server.db.schema import findings, run_steps, runs
 from armature.server.ingest import list_row, load_summary
 from armature.server.live import (
     Message,
@@ -53,16 +53,19 @@ def _step(row: Any) -> dict[str, Any]:
 @router.get("/api/runs/{run_id}")
 async def get_run(run_id: str, request: Request,
                   granted: Granted = Depends(require("viewer", by_run()))) -> dict[str, Any]:
-    def read() -> tuple[dict[str, Any] | None, list[Any]]:
+    def read() -> tuple[dict[str, Any] | None, list[Any], Any]:
         with server(request).engine.connect() as conn:
             steps = conn.execute(select(run_steps).where(run_steps.c.run_id == run_id)
                                  .order_by(run_steps.c.started_at, run_steps.c.step_key)).all()
-            return load_summary(conn, run_id), steps
+            trigger_ref = conn.execute(select(runs.c.trigger_ref).where(runs.c.id == run_id)).scalar()
+            return load_summary(conn, run_id), steps, trigger_ref
 
-    stored, steps = await asyncio.to_thread(read)
+    stored, steps, trigger_ref = await asyncio.to_thread(read)
     hub = _live(request)
     summary = hub.summary(run_id) or stored
-    return {"run": {**summary, "last_seq": await hub.last_seq(run_id)}, "steps": [_step(r) for r in steps]}
+    dry_run = isinstance(trigger_ref, dict) and trigger_ref.get("dry_run") is True
+    return {"run": {**summary, "last_seq": await hub.last_seq(run_id), "dry_run": dry_run},
+            "steps": [_step(r) for r in steps]}
 
 
 @router.get("/api/runs/{run_id}/events")

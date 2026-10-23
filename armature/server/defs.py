@@ -62,7 +62,6 @@ from armature.server.db.schema import (
     versions,
     workflows,
 )
-from armature.server.import_ops import is_secret_name, lint_note, lint_ok
 from armature.spec.models import HarnessSpec
 from armature.spec.template_lint import lint_tree
 from armature.spec.validator import validate_spec
@@ -110,6 +109,30 @@ REQUIRED_CONFIG = {"bedrock": ("region",), "claude-subscription": ("credential_s
                    "openai-compatible": ("api_base",)}
 
 PATH_PART = re.compile(r"\[([^\]]*)\]|([^.\[\]]+)")
+SECRET_MARKERS = ("TOKEN", "SECRET", "KEY", "PASSWORD")
+LINT_OK = "lint: ok"
+
+
+def is_secret_name(name: str) -> bool:
+    return any(marker in name for marker in SECRET_MARKERS) or name.endswith("_PEM")
+
+
+def lint_note(data: Any) -> str:
+    """The template lint of a parsed workflow, as the first line of a version note and any issues after it."""
+    if data is None:
+        return "lint: not parsed"
+    issues = lint_tree(data)
+    if not issues:
+        return LINT_OK
+    return "\n".join([f"lint: {len(issues)} issue(s)", *(f"- {issue.message}" for issue in issues)])
+
+
+def lint_ok(note: str | None) -> bool | None:
+    """Whether a version note records a clean lint, or None when it records no lint."""
+    for line in (note or "").splitlines():
+        if line.startswith("lint:"):
+            return line == LINT_OK
+    return None
 
 
 class DefError(Exception):

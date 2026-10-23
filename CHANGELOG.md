@@ -87,48 +87,41 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `python -m tests.server.live_load` (20 runs at 200 events a second, 100
   viewers): p99 from emit to viewer about 320 ms on SQLite, Postgres, and
   MySQL, with nothing dropped.
-- **`armature server import-ops <ops-dir>`** copies an armature-ops tree into
-  the database: teams (with their slug) and projects from `teams.json`,
-  each `specs/*.yml` as an instance-level workflow with its template lint
-  in the version note, each `roles.json` entry as a role document in
-  Markdown with YAML front matter, the other prompts as prompt documents,
-  the behavior JSON files and non-secret `ops.env` keys as settings,
-  secret-like keys and the GitHub App key file as sealed secrets, Bedrock
-  and Claude subscription providers with model aliases, and the
-  dashboard's users with their scrypt hashes and their TOTP secrets
-  resealed under the new master key. `MRP_*` and `LINEAR_API_KEY` belong to
-  the `talentstorehouse` team. A re-run updates in place and adds a version
-  only when a body changed, every write is audited as `import-ops`, and
-  `--dry-run` prints the report, which names what changed and never a
-  value, then rolls back. Migration 0003 adds `teams.slug`,
-  `projects.repo`, instance-level workflows (`team_id` NULL, scope `*`),
-  and team-scoped settings keyed by scope and key. `GET /api/workflows`, `/api/workflows/{id}`,
-  `/api/documents`, `/api/documents/{id}`, `/api/teams/{id}/providers`,
-  and the admin-only `/api/settings` read them, and the UI shows
-  workflows, roles and prompts, and each team's providers.
-- **`armature server import-history <ops-dir>`** copies every past run from
-  the armature-ops dashboard's Postgres, read in a read-only transaction,
-  into `runs`, `run_steps`, `findings`, and a synthesized `run_events`
-  timeline marked `imported`, so the runs list and run page show the steps,
-  costs, findings, and who triggered each run. A run keeps its dashboard id,
-  or gets a stable UUID with the original in `trigger_ref.source_run_id`. Its
-  team and project come from its repository, then the repositories its
-  target names, then its Jira work platform's repository, then its issue
-  key through the Linear intake channels or `JIRA_PROJECT`, then the Slack
-  intake channel's repository. A run with no such evidence goes to an
-  `unassigned` team with no members, which only admins see. A run the
-  dashboard never saw end imports as lost. Every text written is redacted
-  with the team's secret values and the patterns live ingest uses, and the
-  import refuses to run when a team's secrets don't open. Role reviews
-  become child steps of `reviews` with their text cut at 8 KB, and the team
-  lead's comments, decisions, and changes become findings. Jira work, fixes, and
-  merges add `trigger_ref` details and a text event. Runs only `traces.db`
-  holds are imported from their trace rows when their workflow exists on
-  the server. A rerun skips a run whose content hash in
-  `trigger_ref.import_hash` still matches and replaces the steps, events,
-  and findings of one that changed. It takes `--dry-run`, `--since`,
-  `--limit`, and `--no-traces`, commits and audits every 100 runs, and
-  prints counts only.
+- **Instance runner keys.** Migration 0005 lets a runner key belong to the
+  instance (`team_id` NULL, scope `*`). Admins manage them under
+  `/api/runner-keys` and on the new Runner keys page, with step-up to create
+  or delete, and team leads manage their team's keys on its card on the
+  Teams page. An instance key's run lands in the team whose project's
+  repository matches its `project` without regard to case, then by
+  `team-slug/project-name`, else in an admin-only `operations` team created
+  on first use. A registering engine sends `ARMATURE_PROJECT`, else the
+  run's `project` input, else its `repo` input. DEPLOY.md lists the
+  environment variables under "Streaming runs from a host".
+- **Instance-level and team-scoped definitions.** Migration 0003 adds
+  `teams.slug`, `projects.repo`, instance-level workflows (`team_id` NULL,
+  scope `*`), and team-scoped settings keyed by scope and key. `GET
+  /api/workflows`, `/api/workflows/{id}`, `/api/documents`,
+  `/api/documents/{id}`, `/api/teams/{id}/providers`, and the admin-only
+  `/api/settings` read them, and the UI shows workflows, roles and prompts,
+  and each team's providers.
+- **`armature server export <dir> [--team SLUG]`** writes the instance's
+  definitions to files: `workflows/<scope>/<name>.yml` with a first line of
+  `# armature: stored-workflow`, `roles/`, `prompts/`, and `missions/`
+  Markdown verbatim, `teams.json`, `settings.json`, `providers.json` with
+  credential names only, and `manifest.json` with each object's version and
+  each file's sha256. A scope is `instance`, `team-<slug>`, or
+  `project-<team-slug>-<project>`. Secrets, users, and history are never
+  exported. The export is built beside `<dir>` and swapped in whole, and a
+  non-empty `<dir>` with no `manifest.json` is refused.
+- **`export_on_change`** in the server config (`dir`, `command`,
+  `debounce_seconds`) re-exports after every committed workflow, document,
+  provider, setting, team, or project write, debounced and one at a time on
+  a background thread, then runs `command` as argv in `dir` with only
+  `PATH`, `HOME`, `LANG`, and `ARMATURE_EXPORT_DIR` and a 120-second
+  timeout. Each run is audited as `export.run`, and the admin-only `GET
+  /api/export/status` reports the last run. Only the config file can set a
+  command. The armature-ops importers moved to that repository's
+  `tools/platform/`.
 - **Editing definitions on the server.** Workflows, roles, prompts, and
   missions can belong to the instance, a team, or a project, and a run
   resolves a name project first, then team, then instance. Admins edit
@@ -185,6 +178,33 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   install not pinned to a full commit sha and a downgrade without `--force`,
   and `GET /api/packs` lists every adapter with its parameter schema.
   `jsonschema` is now a core dependency. See `examples/packs/hello/`.
+- **Authoring assistant and test runs.** The workflow and document edit
+  pages have an "Ask the assistant" panel. Asking about a new object is
+  API-only, through `POST /api/assist` with a `team_id`. The request sends
+  the current body and the instruction, fenced as data, with the workflow
+  schema or the role rules, the installed packs, and a non-admin's field
+  allowlist, to the team's provider through an alias (`lead` by default). The
+  answer is validated with the user's own permissions, retried once with its
+  errors, and returned with a diff and its cost. Nothing is saved until the
+  user accepts it into the editor and saves. Only an editor of the object, or
+  a creator in its team, may ask: 30 times an hour, two at a time, and at
+  most `assist.team_daily_limit` (300) times a day per team. Every request is
+  audited, failures included. Calls cap output at 8192 tokens. A keyless
+  OpenAI-compatible or Ollama provider gets a placeholder key, and one a
+  non-admin saved has its `api_base` checked again before each call. A
+  `claude-subscription` provider runs `claude -p` with an empty environment,
+  its own home, no tools, no MCP servers, and at most two turns. A workflow's
+  page starts a test run (`POST /api/workflows/{id}/test`, contributor and
+  up, two at a time per user and `dry_run.max_active` (8) per server) that
+  replays a past run's step outputs, plus any you give, through the new
+  engine stub mode. With `ARMATURE_STUB_OUTPUTS` set, every step returns its
+  recorded output and no subprocess, tool module, file read, or model call
+  happens. A step with none fails with `STUB_MISSING` unless
+  `ARMATURE_STUB_DEFAULT=empty`, and gates approve. The run streams live and
+  shows a "Dry run" badge. A step's `step_end` event now carries its output,
+  and the server stores it in `run_steps.output`, as a list of branch outputs
+  for a fan-out step and marked `_truncated` when the event was cut to fit.
+  `GET /api/runs` takes `workflow=<name>` and `with_outputs=1`.
 
 ### Changed
 

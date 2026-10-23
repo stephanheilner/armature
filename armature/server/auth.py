@@ -225,17 +225,17 @@ def begin_attempt(engine: Engine, *, ip: str, username: str, now: datetime) -> s
     return attempt_id
 
 
-def count_call(engine: Engine, *, key: str, limit: int, now: datetime) -> None:
-    """Allow ``limit`` calls per key in the failure window. Recorded first, like a sign-in attempt."""
+def count_call(engine: Engine, *, key: str, limit: int, now: datetime, window: timedelta = FAILURE_WINDOW) -> None:
+    """Allow ``limit`` calls per key in ``window``. Recorded first, like a sign-in attempt."""
     call_id = new_id()
     with engine.begin() as conn:
         conn.execute(insert(login_attempts).values(id=call_id, username=key, ip=None, succeeded=True, at=now))
         calls = conn.execute(select(func.count()).select_from(login_attempts).where(
-            login_attempts.c.username == key, login_attempts.c.at > now - FAILURE_WINDOW)).scalar_one()
+            login_attempts.c.username == key, login_attempts.c.at > now - window)).scalar_one()
     if calls > limit:
         with engine.begin() as conn:
             conn.execute(delete(login_attempts).where(login_attempts.c.id == call_id))
-        raise AuthError(429, THROTTLED, {"Retry-After": str(int(FAILURE_WINDOW.total_seconds()))})
+        raise AuthError(429, THROTTLED, {"Retry-After": str(int(window.total_seconds()))})
 
 
 def finish_attempt(conn: Connection, attempt_id: str, ok: bool, now: datetime) -> None:

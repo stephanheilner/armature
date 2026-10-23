@@ -415,13 +415,15 @@ findings = Table(
 runner_keys = Table(
     "runner_keys", metadata,
     _id(),
-    Column("team_id", String(36), ForeignKey("teams.id"), nullable=False, index=True),
+    Column("team_id", String(36), ForeignKey("teams.id"), index=True),
+    Column("scope", String(36), nullable=False, default=_scope_from_team),
     Column("name", name_type(191), nullable=False),
     Column("key_hmac", String(64), nullable=False, unique=True),
     Column("created_by", String(36)),
     _ts("created_at"),
     _ts("last_used_at", nullable=True),
     _ts("revoked_at", nullable=True),
+    CheckConstraint(SCOPE_MATCHES_TEAM, name="scope"),
 )
 
 run_tokens = Table(

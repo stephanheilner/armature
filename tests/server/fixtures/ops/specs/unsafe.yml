@@ -1,5 +1,0 @@
-name: unsafe
-stages:
-  - id: one
-    adapter: one
-    skip_if: "{{ ''.__class__ | length }}"

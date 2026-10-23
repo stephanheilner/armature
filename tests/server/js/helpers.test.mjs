@@ -6,6 +6,7 @@ const { parseHash, hashFor } = await import(new URL('router.js', STATIC));
 const { api, ApiError, basePath, configure, errorMessage, listOf, outcome, setCsrf } = await import(new URL('api.js', STATIC));
 const { navFor, signInNotice, ssoStepUpPath } = await import(new URL('session.js', STATIC));
 const { secretFromOtpauth, tokenFromHash } = await import(new URL('otpauth.js', STATIC));
+const { deleteKeyPath, keyCells, keysPath } = await import(new URL('views/runnerkeys.js', STATIC));
 
 const realFetch = globalThis.fetch;
 afterEach(() => {
@@ -164,10 +165,25 @@ test('a network failure reads as unreachable', async () => {
 test('navFor hides what a role cannot use', () => {
   const lead = { user: { id: 1 }, memberships: [{ scope_kind: 'team', scope_id: 't', role: 'team_lead' }] };
   const viewer = { user: { id: 2 }, memberships: [{ scope_kind: 'project', scope_id: 'p', role: 'viewer' }] };
-  assert.deepEqual(navFor({ user: { is_admin: true } }), ['runs', 'teams', 'workflows', 'roles', 'packs', 'users', 'secrets', 'settings', 'account']);
+  assert.deepEqual(navFor({ user: { is_admin: true } }), ['runs', 'teams', 'workflows', 'roles', 'packs', 'users', 'secrets', 'runner-keys', 'settings', 'account']);
   assert.deepEqual(navFor(lead), ['runs', 'teams', 'workflows', 'roles', 'packs', 'users', 'secrets', 'account']);
   assert.deepEqual(navFor(viewer), ['runs', 'teams', 'workflows', 'roles', 'packs', 'account']);
   assert.deepEqual(navFor({ user: null }), []);
+});
+
+test('runner key paths pick the team or the instance', () => {
+  assert.equal(keysPath('team 1'), '/api/teams/team%201/runner-keys');
+  assert.equal(keysPath(null), '/api/runner-keys');
+  assert.equal(deleteKeyPath('t', 'k/1'), '/api/teams/t/runner-keys/k%2F1/delete');
+  assert.equal(deleteKeyPath(null, 'k'), '/api/runner-keys/k/delete');
+});
+
+test('runner key cells say when a key was never used', () => {
+  const cells = keyCells({ name: 'host', created_at: '2026-10-23T12:00:00Z', created_by: null, last_used_at: null });
+  assert.equal(cells[0], 'host');
+  assert.match(cells[1], /^2026-10-2\d \d\d:\d\d$/);
+  assert.deepEqual(cells.slice(2), ['—', 'Never']);
+  assert.notEqual(keyCells({ name: 'h', created_at: null, last_used_at: '2026-10-23T12:00:00Z' })[3], 'Never');
 });
 
 test('secretFromOtpauth reads the secret parameter', () => {

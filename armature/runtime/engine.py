@@ -20,6 +20,7 @@ from armature.runtime.prompt import PromptAssembler
 from armature.nodes.llm import LLMNode
 from armature.nodes.script import ScriptNode
 from armature.nodes.gate import HumanGateNode
+from armature.nodes.stub import StubNode, StubOutputs
 from armature.nodes.provider_errors import classify_provider_error
 from armature.registry.registry import ToolRegistry
 from armature.registry.builtins import register_builtins
@@ -261,6 +262,7 @@ class Harness:
             validate_spec(spec)
 
         self._spec = spec
+        self._stubs = StubOutputs.from_env()
         self._total_cost_usd = 0.0
         self._spec_version = hashlib.sha256(
             self._spec.model_dump_json().encode()
@@ -281,7 +283,7 @@ class Harness:
             Path(self._spec.sandbox.host_workspace).expanduser().resolve(),
         )
         self._sandbox_image_digest: str | None = None
-        if self._spec.sandbox.mode == SandboxMode.DOCKER:
+        if self._spec.sandbox.mode == SandboxMode.DOCKER and self._stubs is None:
             try:
                 import subprocess as _sp
                 _proc = _sp.run(
@@ -430,6 +432,8 @@ class Harness:
         self._mcp_sessions: list[Any] = []
 
     def _load_tool_modules(self) -> None:
+        if self._stubs is not None:
+            return
         import importlib
         for tool_mod in self._spec.tools:
             mod = importlib.import_module(tool_mod.module)
@@ -441,7 +445,7 @@ class Harness:
             mod.register(self._registry)
 
     async def _attach_mcp_servers(self) -> None:
-        if not self._spec.mcp_servers:
+        if not self._spec.mcp_servers or self._stubs is not None:
             return
         from armature.mcp.client import MCPRegistrar
         self._mcp_sessions = await MCPRegistrar.register_all(
@@ -586,7 +590,12 @@ class Harness:
                 attributes={"stage": stage.id, "workflow": self._spec.name},
             ) as span:
                 try:
-                    if stage.gate == "human":
+                    if self._stubs is not None:
+                        _stage_type = "stub"
+                        branch = _FAN_OUT_BRANCH.get()
+                        index = branch[2] if branch is not None and branch[:2] == (id(self), stage.id) else None
+                        result = await StubNode(stage, self._stubs, index).execute(context)
+                    elif stage.gate == "human":
                         _stage_type = "gate"
                         node = HumanGateNode(stage=stage)
                         result = await node.execute(context)
@@ -839,7 +848,7 @@ class Harness:
 
         if self._on_event:
             elapsed = round(time.monotonic() - t0, 1)
-            self._on_event("stage_complete", {"stage": stage.id, "elapsed_s": elapsed})
+            self._on_event("stage_complete", {"stage": stage.id, "elapsed_s": elapsed, "output": result})
 
         return result
 
@@ -898,7 +907,7 @@ class Harness:
                     # machinery's _iteration) letting SubagentNode give each
                     # engine-fanned child a distinct session directory.
                     per_ctx["_fan_out_item_index"] = item_index
-                if stage.inject_file_as is not None:
+                if stage.inject_file_as is not None and self._stubs is None:
                     try:
                         per_ctx[stage.inject_file_as] = _Path(str(item)).read_text(errors="replace")
                     except Exception:
@@ -1460,7 +1469,7 @@ class Harness:
                 })
 
             # Post-run knowledge extraction (non-blocking)
-            if self._knowledge_extractor is not None and self._memory_store is not None:
+            if self._knowledge_extractor is not None and self._memory_store is not None and self._stubs is None:
                 try:
                     updated_memories, _ = await self._memory_store.load(self._memory_workflow_name)
                     await self._knowledge_extractor.extract(

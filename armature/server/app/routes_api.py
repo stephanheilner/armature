@@ -7,7 +7,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel
-from sqlalchemy import and_, delete, func, insert, or_, select, update
+from sqlalchemy import and_, delete, exists, func, insert, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from armature.server import audit, invites, rbac
@@ -31,6 +31,7 @@ from armature.server.db.schema import audit as audit_table
 from armature.server.db.schema import (
     memberships,
     projects,
+    run_steps,
     runs,
     sessions,
     teams,
@@ -509,7 +510,9 @@ def delete_instance_secret(name: str, request: Request,
 
 @router.get("/api/runs")
 def list_runs(request: Request, team: str | None = None, project: str | None = None, status: str | None = None,
-              before: str | None = None, limit: int = Query(LIMIT_DEFAULT, ge=1, le=LIMIT_MAX),
+              workflow: str | None = Query(None, max_length=191), with_outputs: bool = False,
+              before: str | None = None,
+              limit: int = Query(LIMIT_DEFAULT, ge=1, le=LIMIT_MAX),
               session: Session = Depends(signed_in)) -> dict[str, Any]:
     scope = rbac.visible_scope(_access(request, session))
     query = (select(runs.c.id, runs.c.team_id, runs.c.project_id,
@@ -522,6 +525,11 @@ def list_runs(request: Request, team: str | None = None, project: str | None = N
         query = query.where(runs.c.team_id == team)
     if project:
         query = query.where(runs.c.project_id == project)
+    if workflow:
+        query = query.where(func.coalesce(workflows.c.name, runs.c.workflow_name) == workflow)
+    if with_outputs:
+        query = query.where(exists().where(run_steps.c.run_id == runs.c.id, run_steps.c.parent_step.is_(None),
+                                           run_steps.c.output.is_not(None)))
     if status:
         if status not in RUN_STATUSES:
             raise ApiError(400, f"status must be one of {', '.join(RUN_STATUSES)}.")

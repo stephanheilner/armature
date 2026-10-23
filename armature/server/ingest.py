@@ -71,6 +71,8 @@ STEP_STATUS = {"step_start": "running", "step_end": "succeeded", "step_failed": 
 SUCCEEDED = frozenset({"succeeded", "success", "ok", "completed", "complete", "done", "passed"})
 CANCELED = frozenset({"canceled", "cancelled"})
 
+TRUNCATED = "_truncated"
+
 ACCEPTED, REJECTED, DUPLICATE = "accepted", "rejected", "duplicate"
 
 
@@ -160,6 +162,7 @@ class Branches:
     expected: int = 0
     ended: set[str] = field(default_factory=set)
     failed: bool = False
+    outputs: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -203,6 +206,14 @@ class RunState:
         self.eids.move_to_end(eid[0])
         while len(self.eids) > MAX_NONCES:
             self.eids.popitem(last=False)
+
+
+def step_output(payload: dict[str, Any]) -> Any:
+    """A step_end's output for run_steps, marked when the emitter cut it to fit an event."""
+    output = payload.get("output")
+    if not payload.get("truncated"):
+        return output
+    return {**output, TRUNCATED: True} if isinstance(output, dict) else {TRUNCATED: True, "value": output}
 
 
 def parse_eid(value: Any) -> tuple[str, int] | None:
@@ -590,13 +601,19 @@ class LiveHub:
         if tracked is not None and branch is not None:
             tracked.ended.add(str(branch))
             tracked.failed = tracked.failed or failed
+            if "output" in payload:
+                tracked.outputs[str(branch)] = step_output(payload)
             if len(tracked.ended) < tracked.expected:
                 return
             del state.branches[key]
             step.status, step.finished_at = ("failed" if tracked.failed else "succeeded"), ts
+            step.output = [tracked.outputs.get(str(index)) for index in range(tracked.expected)]
+            step.has_output = True
             return
         step.status = STEP_STATUS[kind]
         step.finished_at = ts
+        if "output" in payload:
+            step.output, step.has_output = step_output(payload), True
 
     def _finding(self, state: RunState, step_id: str | None, now: datetime, payload: dict[str, Any]) -> dict[str, Any]:
         path = _text(payload.get("path"), 4096)

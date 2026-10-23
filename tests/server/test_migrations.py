@@ -3,12 +3,12 @@ from datetime import UTC, datetime, timedelta, timezone
 import pytest
 from alembic.autogenerate import compare_metadata
 from alembic.migration import MigrationContext
-from sqlalchemy import insert, inspect, select, update
+from sqlalchemy import insert, inspect, select, text, update
 from sqlalchemy.exc import IntegrityError, OperationalError, StatementError
 
 from armature.server import secrets
 from armature.server.db import make_engine, migrate, new_id, utcnow
-from armature.server.db.schema import documents, metadata, run_events, runs, teams
+from armature.server.db.schema import documents, metadata, run_events, runs, teams, workflows
 from armature.server.db.schema import secrets as secrets_table
 
 # pymysql reports a failed CHECK (MySQL error 3819) as OperationalError.
@@ -137,3 +137,57 @@ def test_membership_source_defaults_to_manual(engine):
     with pytest.raises(CHECK_FAILED), engine.begin() as conn:
         conn.execute(insert(memberships).values(id=new_id(), user_id=user_id, scope_kind="team", scope_id=new_id(),
                                                 role="viewer", source="ldap", created_at=utcnow()))
+
+
+def test_0003_upgrades_a_live_database_and_backfills_scope(db_url):
+    migrate(db_url, "0002")
+    team_id, workflow_id = new_id(), new_id()
+    engine = make_engine(db_url)
+    try:
+        with engine.begin() as conn:
+            stamp = {"at": "2026-10-23 12:00:00"}
+            conn.execute(text("INSERT INTO teams (id, name, created_at) VALUES (:t, 'live', :at)"),
+                         {"t": team_id, **stamp})
+            conn.execute(text("INSERT INTO workflows (id, team_id, name, current_version, created_at, updated_at) "
+                              "VALUES (:w, :t, 'wf', 1, :at, :at)"), {"w": workflow_id, "t": team_id, **stamp})
+            conn.execute(text("INSERT INTO runs (id, team_id, workflow_id, status, started_at) "
+                              "VALUES (:r, :t, :w, 'succeeded', :at)"),
+                         {"r": new_id(), "t": team_id, "w": workflow_id, **stamp})
+    finally:
+        engine.dispose()
+    migrate(db_url)
+    engine = make_engine(db_url)
+    try:
+        with engine.connect() as conn:
+            assert conn.execute(select(workflows.c.scope).where(workflows.c.id == workflow_id)).scalar() == team_id
+    finally:
+        engine.dispose()
+
+
+def test_0005_backfills_runner_key_scope_and_allows_instance_keys(db_url):
+    from armature.server.db.schema import runner_keys
+    migrate(db_url, "0004")
+    team_id, key_id = new_id(), new_id()
+    engine = make_engine(db_url)
+    try:
+        with engine.begin() as conn:
+            stamp = {"at": "2026-10-23 12:00:00"}
+            conn.execute(text("INSERT INTO teams (id, name, created_at) VALUES (:t, 'live', :at)"),
+                         {"t": team_id, **stamp})
+            conn.execute(text("INSERT INTO runner_keys (id, team_id, name, key_hmac, created_at) "
+                              "VALUES (:k, :t, 'ci', 'h1', :at)"), {"k": key_id, "t": team_id, **stamp})
+    finally:
+        engine.dispose()
+    migrate(db_url)
+    engine = make_engine(db_url)
+    try:
+        with engine.begin() as conn:
+            assert conn.execute(select(runner_keys.c.scope).where(runner_keys.c.id == key_id)).scalar() == team_id
+            conn.execute(insert(runner_keys).values(id=new_id(), team_id=None, name="host", key_hmac="h2",
+                                                    created_at=utcnow()))
+            assert conn.execute(select(runner_keys.c.scope).where(runner_keys.c.key_hmac == "h2")).scalar() == "*"
+        with pytest.raises(CHECK_FAILED), engine.begin() as conn:
+            conn.execute(insert(runner_keys).values(id=new_id(), team_id=None, scope=team_id, name="bad",
+                                                    key_hmac="h3", created_at=utcnow()))
+    finally:
+        engine.dispose()

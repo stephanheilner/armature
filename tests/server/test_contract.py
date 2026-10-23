@@ -39,6 +39,8 @@ READS = [
     ("views/teams.js", "projectRecord", "project", {"name", "platform", "team_id", "id"}),
     ("views/teams.js", "project", "project", {"name", "platform", "id"}),
     ("views/teams.js", "team", "team", {"id", "name"}),
+    ("views/runnerkeys.js", "key", "runner_key", {"id", "name", "created_at", "created_by", "last_used_at"}),
+    ("views/runnerkeys.js", "created", "create_runner_key", {"key"}),
 ]
 
 
@@ -63,6 +65,7 @@ def responses(sqlite_engine, keyring):
     guest = make_client(sqlite_engine, keyring, clock)
     guest_csrf = guest.get("/api/session").json()["csrf"]
     users = client.get("/api/users").json()["users"]
+    created_key = client.post("/api/runner-keys", json={"name": "host"}, headers=mutation(csrf)).json()
     return {
         "inspect": guest.post("/api/invite/inspect", json={"token": token},
                               headers={"Origin": ORIGIN, "X-CSRF-Token": guest_csrf}).json(),
@@ -77,6 +80,8 @@ def responses(sqlite_engine, keyring):
         "secret": client.get(f"/api/teams/{side.team}/secrets").json()["secrets"][0],
         "project": client.get(f"/api/projects/{side.project}").json()["project"],
         "team": client.get("/api/teams").json()["teams"][0],
+        "create_runner_key": created_key,
+        "runner_key": client.get("/api/runner-keys").json()["runner_keys"][0],
     }
 
 

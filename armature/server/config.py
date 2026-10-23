@@ -43,6 +43,35 @@ class OIDCConfig(BaseModel):
     group_roles: dict[str, list[GroupGrant]] = Field(default_factory=dict)
 
 
+class ExportConfig(BaseModel):
+    """Export definitions to ``dir`` after each change, then run ``command`` there. Only the config file sets it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    dir: str
+    command: list[str] | None = None
+    debounce_seconds: float = Field(default=5, ge=1)
+
+    @field_validator("command")
+    @classmethod
+    def _command(cls, value: list[str] | None) -> list[str] | None:
+        if value is not None and (not value or not all(value)):
+            raise ValueError("command is a non-empty list of non-empty arguments")
+        return value
+
+
+class AssistConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    team_daily_limit: int = Field(default=300, ge=0)
+
+
+class DryRunConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    max_active: int = Field(default=8, ge=0)
+
+
 class ServerConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -63,6 +92,9 @@ class ServerConfig(BaseModel):
     sse_per_user: int = Field(default=8, ge=1)
     sse_total: int = Field(default=500, ge=1)
     packs_dir: str = "~/.armature/packs"
+    export_on_change: ExportConfig | None = None
+    assist: AssistConfig = Field(default_factory=AssistConfig)
+    dry_run: DryRunConfig = Field(default_factory=DryRunConfig)
 
     @field_validator("base_path")
     @classmethod
@@ -111,7 +143,7 @@ def load_config(path: Path | str | None = None, env: Mapping[str, str] | None = 
             raise ValueError(f"{p} must hold a mapping")
         data = dict(loaded or {})
     for name in ServerConfig.model_fields:
-        if name == "oidc":
+        if name in ("oidc", "export_on_change", "assist", "dry_run"):
             continue
         value = env.get(ENV_PREFIX + name.upper())
         if value is not None:

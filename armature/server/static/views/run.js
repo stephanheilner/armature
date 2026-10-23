@@ -93,7 +93,7 @@ export async function render(root, { args, signal }) {
   const extraMeta = element('span', {});
   const errorSlot = element('div', {});
   root.append(element('p', { class: 'crumb' }, link(hashFor('runs'), 'Runs')),
-    pageHeader(run.workflow || 'Run', chipSlot, liveNote),
+    pageHeader(run.workflow || 'Run', chipSlot, run.dry_run ? element('span', { class: 'chip warn', title: 'Recorded outputs stood in for every step.' }, 'Dry run') : null, liveNote),
     element('div', { class: 'meta' },
       labelled('Project', projectText),
       labelled('Triggered by', element('span', {}, [run.triggered_by || '—', run.trigger_kind ? ` (${run.trigger_kind})` : ''].join(''))),

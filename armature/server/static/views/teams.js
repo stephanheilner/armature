@@ -3,6 +3,7 @@ import { attempt, card, clear, element, empty, errorBox, link, loading, meta, pa
 import { hashFor } from '../router.js';
 import { canManageTeam, isAdmin } from '../session.js';
 import { providersSection } from './providers.js';
+import { runnerKeysSection } from './runnerkeys.js';
 
 const PLATFORMS = ['ios', 'android', 'backend', 'dotnet'];
 
@@ -32,6 +33,7 @@ function teamCard(team, projects, providers, secretNames, reload) {
     ])) : empty('No projects yet.'),
     canManage ? addProjectForm(team, reload) : null,
     providersSection(team, providers, { canManage, secretNames, reload }),
+    canManage ? runnerKeysSection(team.id) : null,
   );
 }
 

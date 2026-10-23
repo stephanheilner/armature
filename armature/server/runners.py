@@ -1,7 +1,9 @@
 """Runner keys, run registration, and the per-run event tokens runs stream with.
 
-A runner key is a team's machine credential, ``ark_<random>``, shown once and
-stored only as an HMAC. Registering a run with it mints a per-run event token,
+A runner key is a machine credential, ``ark_<random>``, shown once and stored
+only as an HMAC. A team key registers runs in its team. An instance key
+registers each run in the team that owns its project, else in the admin-only
+``operations`` team. Registering a run with it mints a per-run event token,
 also stored only as an HMAC, which expires after 48 hours or when the run ends.
 """
 from __future__ import annotations
@@ -15,7 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import Connection, delete, insert, or_, select, update
+from sqlalchemy import Connection, delete, func, insert, or_, select, update
 
 from armature.server import audit
 from armature.server.auth import valid_token
@@ -26,6 +28,8 @@ from armature.server.db.schema import (
     run_tokens,
     runner_keys,
     runs,
+    scope_of,
+    teams,
 )
 from armature.server.defs import resolve_workflow
 
@@ -36,6 +40,8 @@ WORKFLOW = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._:/-]{0,190}$")
 TRIGGER_KIND = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,31}$")
 TRIGGER_REF_MAX = 4096
 ACTOR_MAX = 191
+OPERATIONS_SLUG = "operations"
+OPERATIONS_NAME = "Operations (unassigned runs)"
 
 
 class RegistrationError(Exception):
@@ -61,14 +67,14 @@ def public_key(row: Any) -> dict[str, Any]:
             "last_used_at": row.last_used_at}
 
 
-def list_keys(conn: Connection, team_id: str) -> list[dict[str, Any]]:
-    rows = conn.execute(select(runner_keys).where(runner_keys.c.team_id == team_id,
+def list_keys(conn: Connection, team_id: str | None) -> list[dict[str, Any]]:
+    rows = conn.execute(select(runner_keys).where(runner_keys.c.scope == scope_of(team_id),
                                                   runner_keys.c.revoked_at.is_(None))
                         .order_by(runner_keys.c.name, runner_keys.c.id)).all()
     return [public_key(r) for r in rows]
 
 
-def create_key(conn: Connection, keyring: Keyring, *, team_id: str, name: str, actor_id: str, now: datetime,
+def create_key(conn: Connection, keyring: Keyring, *, team_id: str | None, name: str, actor_id: str, now: datetime,
                ip: str | None) -> tuple[dict[str, Any], str]:
     key = KEY_PREFIX + _random.token_urlsafe(32)
     key_id = new_id()
@@ -80,9 +86,10 @@ def create_key(conn: Connection, keyring: Keyring, *, team_id: str, name: str, a
     return public_key(row), key
 
 
-def revoke_key(conn: Connection, *, team_id: str, key_id: str, actor_id: str, now: datetime,
+def revoke_key(conn: Connection, *, team_id: str | None, key_id: str, actor_id: str, now: datetime,
                ip: str | None) -> bool:
-    result = conn.execute(update(runner_keys).where(runner_keys.c.id == key_id, runner_keys.c.team_id == team_id,
+    result = conn.execute(update(runner_keys).where(runner_keys.c.id == key_id,
+                                                    runner_keys.c.scope == scope_of(team_id),
                                                     runner_keys.c.revoked_at.is_(None)).values(revoked_at=now))
     if result.rowcount != 1:
         return False
@@ -117,8 +124,7 @@ def _text(value: Any, what: str, limit: int, pattern: re.Pattern[str] | None = N
 
 def register_run(conn: Connection, keyring: Keyring, *, key: Any, body: dict[str, Any], now: datetime,
                  ip: str | None) -> tuple[dict[str, Any], str]:
-    """Create a running run for the key's team and mint its event token. Returns the run row and the token."""
-    team_id = key.team_id
+    """Create a running run and mint its event token. Returns the run row and the token."""
     workflow = _text(body.get("workflow"), "workflow", 191, WORKFLOW)
     if workflow is None:
         raise RegistrationError(400, "workflow is required.")
@@ -128,31 +134,69 @@ def register_run(conn: Connection, keyring: Keyring, *, key: Any, body: dict[str
     if trigger_ref is not None and (not isinstance(trigger_ref, dict)
                                     or len(json.dumps(trigger_ref, default=str)) > TRIGGER_REF_MAX):
         raise RegistrationError(400, f"trigger_ref must be a JSON object of at most {TRIGGER_REF_MAX} bytes.")
-    project_id = None
     project = _text(body.get("project"), "project", 191)
-    if project is not None:
-        project_id = conn.execute(select(projects.c.id).where(
-            projects.c.team_id == team_id, or_(projects.c.name == project, projects.c.repo == project))
-            .order_by(projects.c.name != project).limit(1)).scalar()
-        if project_id is None:
-            raise RegistrationError(404, "No such project in this runner key's team.")
+    if key.team_id is None:
+        team_id, project_id = _instance_target(conn, project, now, ip)
+    else:
+        team_id, project_id = key.team_id, None
+        if project is not None:
+            project_id = conn.execute(select(projects.c.id).where(
+                projects.c.team_id == team_id, or_(projects.c.name == project, projects.c.repo == project))
+                .order_by(projects.c.name != project).limit(1)).scalar()
+            if project_id is None:
+                raise RegistrationError(404, "No such project in this runner key's team.")
     rerun_of = body.get("rerun_of")
     if rerun_of is not None and (not isinstance(rerun_of, str) or conn.execute(
             select(runs.c.id).where(runs.c.id == rerun_of, runs.c.team_id == team_id)).first() is None):
         raise RegistrationError(404, "No such run to re-run in this runner key's team.")
     resolved = resolve_workflow(conn, workflow, team_id, project_id)
     workflow_id = resolved.id if resolved is not None else None
+    row, token = open_run(conn, keyring, team_id=team_id, project_id=project_id, workflow_id=workflow_id,
+                          workflow_name=workflow, now=now, actor=actor, trigger_kind=trigger_kind,
+                          trigger_ref=trigger_ref, rerun_of=rerun_of, runner_key_id=key.id)
+    audit.record(conn, action="run.register", actor_id=None, team_id=team_id, target_kind="run",
+                 target_id=row["id"], detail={"runner_key_id": key.id, "workflow": workflow, "actor": actor}, ip=ip)
+    return row, token
+
+
+def _instance_target(conn: Connection, project: str | None, now: datetime,
+                     ip: str | None) -> tuple[str, str | None]:
+    """The team and project an instance key's run lands in: by repository, then ``team-slug/name``."""
+    if project is not None:
+        order = (projects.c.created_at, projects.c.id)
+        row = conn.execute(select(projects.c.team_id, projects.c.id)
+                           .where(func.lower(projects.c.repo) == project.lower()).order_by(*order).limit(1)).first()
+        slug, _, name = project.partition("/")
+        if row is None and name:
+            row = conn.execute(select(projects.c.team_id, projects.c.id)
+                               .select_from(projects.join(teams, teams.c.id == projects.c.team_id))
+                               .where(teams.c.slug == slug, projects.c.name == name).limit(1)).first()
+        if row is not None:
+            return row.team_id, row.id
+    return _operations_team(conn, now, ip), None
+
+
+def _operations_team(conn: Connection, now: datetime, ip: str | None) -> str:
+    team_id = conn.execute(select(teams.c.id).where(teams.c.slug == OPERATIONS_SLUG)).scalar()
+    if team_id is None:
+        team_id = new_id()
+        conn.execute(insert(teams).values(id=team_id, name=OPERATIONS_NAME, slug=OPERATIONS_SLUG, created_at=now))
+        audit.record(conn, action="team.create", actor_id=None, team_id=team_id, target_kind="team",
+                     target_id=team_id, detail={"source": "runner", "slug": OPERATIONS_SLUG}, ip=ip)
+    return team_id
+
+
+def open_run(conn: Connection, keyring: Keyring, *, team_id: str, project_id: str | None, workflow_id: str | None,
+             workflow_name: str, now: datetime, **columns: Any) -> tuple[dict[str, Any], str]:
+    """Insert a running run and mint its event token. Returns the run row and the token."""
     run_id = new_id()
     row = {"id": run_id, "team_id": team_id, "project_id": project_id, "workflow_id": workflow_id,
-           "workflow_name": workflow, "status": "running", "actor": actor, "trigger_kind": trigger_kind,
-           "trigger_ref": trigger_ref, "rerun_of": rerun_of, "runner_key_id": key.id, "started_at": now,
-           "cost_usd": 0, "input_tokens": 0, "output_tokens": 0}
+           "workflow_name": workflow_name, "status": "running", "started_at": now, "cost_usd": 0, "input_tokens": 0,
+           "output_tokens": 0, **columns}
     conn.execute(insert(runs).values(**row))
     token = _random.token_urlsafe(32)
     conn.execute(insert(run_tokens).values(token_hmac=digest(keyring, token), run_id=run_id, team_id=team_id,
                                            expires_at=now + TOKEN_TTL))
-    audit.record(conn, action="run.register", actor_id=None, team_id=team_id, target_kind="run", target_id=run_id,
-                 detail={"runner_key_id": key.id, "workflow": workflow, "actor": actor}, ip=ip)
     return row, token
 
 

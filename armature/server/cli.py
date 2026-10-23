@@ -1,4 +1,4 @@
-"""`armature server` commands: init, migrate, create-admin, run, import-ops, import-history, and pack."""
+"""`armature server` commands: init, migrate, create-admin, run, export, and pack."""
 from __future__ import annotations
 
 import getpass
@@ -228,104 +228,26 @@ def run(config: Path | None = ConfigOption):
                 log_level="info", timeout_graceful_shutdown=5)
 
 
-@server_app.command("import-ops")
-def import_ops_cmd(
-    ops_dir: Path = typer.Argument(..., help="An armature-ops checkout to read. Nothing in it is written"),
+@server_app.command("export")
+def export_cmd(
+    dest: Path = typer.Argument(..., help="Directory to write. An earlier export there is replaced whole"),
     config: Path | None = ConfigOption,
-    dry_run: bool = typer.Option(False, "--dry-run", help="Print the report and roll every change back"),
-    skip_users: bool = typer.Option(False, "--skip-users", help="Leave the dashboard's users out"),
+    team: str | None = typer.Option(None, "--team", help="Only this team's definitions, by slug, and the instance's"),
 ):
-    """Copy teams, workflows, roles, prompts, settings, secrets, providers, and dashboard users into the database."""
-    from armature.server.db import make_engine, utcnow
-    from armature.server.import_ops import dashboard_source, import_ops
+    """Write workflows, roles, prompts, missions, teams, settings, and providers to files. Never secrets."""
+    from armature.server.db import make_engine
+    from armature.server.export import ExportRefused, export_definitions
 
     cfg = _load(config)
-    keyring = _keyring(cfg)
-    users_source, session_key = None, None
-    if not skip_users:
-        users_source, session_key, reason = dashboard_source(ops_dir)
-        if reason:
-            typer.echo(f"Users skipped: {reason}.", err=True)
     engine = make_engine(cfg.database_url)
     try:
         with engine.connect() as conn:
-            transaction = conn.begin()
-            try:
-                report = import_ops(conn, keyring, ops_dir, now=utcnow(), users_source=users_source,
-                                    session_key=session_key)
-            except ValueError as exc:
-                transaction.rollback()
-                _fail(f"Import failed, nothing was written: {exc}")
-            except Exception as exc:  # noqa: BLE001
-                transaction.rollback()
-                # The class alone, because SQL errors echo parameters and driver errors connection strings.
-                _fail(f"Import failed, nothing was written: {exc.__class__.__name__}")
-            if dry_run:
-                transaction.rollback()
-            else:
-                transaction.commit()
+            manifest = export_definitions(conn, dest, team=team)
+    except (ExportRefused, ValueError) as exc:
+        _fail(f"Export refused: {exc}")
     finally:
         engine.dispose()
-    for line in report.lines():
-        typer.echo(line)
-    typer.echo("Dry run: nothing was written." if dry_run else "Import committed.")
-
-
-def _since(value: str | None):
-    from datetime import UTC, datetime
-    if value is None:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
-        _fail("--since takes a date such as 2026-10-01 or an ISO time.")
-    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed
-
-
-@server_app.command("import-history")
-def import_history_cmd(
-    ops_dir: Path = typer.Argument(..., help="An armature-ops checkout whose config/dashboard.json names the "
-                                             "dashboard database. Nothing in it or the database is written"),
-    config: Path | None = ConfigOption,
-    traces: Path = typer.Option(Path("~/.armature/traces.db"), "--traces",
-                                help="traces.db to read runs the dashboard lacks from, opened read-only"),
-    no_traces: bool = typer.Option(False, "--no-traces", help="Import only the dashboard's runs"),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Print the counts and roll every change back"),
-    since: str | None = typer.Option(None, "--since", help="Only runs started on or after this date (UTC)"),
-    limit: int | None = typer.Option(None, "--limit", min=1, help="At most this many runs, oldest first"),
-):
-    """Copy past runs, their steps, findings, and a timeline from the dashboard and traces.db into the database."""
-    import time
-
-    from armature.server.db import make_engine, utcnow
-    from armature.server.import_history import import_history, ops_source
-
-    cfg = _load(config)
-    since_at = _since(since)
-    keyring = _keyring(cfg)
-    started = time.monotonic()
-    try:
-        source = ops_source(ops_dir, None if no_traces else traces.expanduser())
-    except Exception as exc:  # noqa: BLE001
-        # The class alone for a driver error, which can echo the connection string.
-        _fail(f"Dashboard unavailable: {exc if isinstance(exc, ValueError) else exc.__class__.__name__}")
-    kept = "" if dry_run else " Batches committed before it stay."
-    engine = make_engine(cfg.database_url)
-    try:
-        report = import_history(engine, keyring, source, now=utcnow(), since=since_at, limit=limit,
-                                traces=not no_traces, dry_run=dry_run,
-                                progress=lambda line: typer.echo(line, err=True))
-    except ValueError as exc:
-        _fail(f"Import stopped: {exc}.{kept}")
-    except Exception as exc:  # noqa: BLE001
-        _fail(f"Import stopped: {exc.__class__.__name__}.{kept}")
-    finally:
-        source.close()
-        engine.dispose()
-    for line in report.lines():
-        typer.echo(line)
-    typer.echo(f"{'Dry run: nothing was written' if dry_run else 'Import committed'} "
-               f"in {time.monotonic() - started:.1f}s.")
+    typer.echo(f"Exported {len(manifest['objects'])} definitions and {len(manifest['files'])} files to {dest}.")
 
 
 @pack_app.command("install")

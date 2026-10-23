@@ -7,7 +7,7 @@ import { isSso, navFor, setSession, ssoStepUpPath, user } from './session.js';
 const NAV_GROUPS = [
   ['Work', [['runs', 'Runs', 'list'], ['teams', 'Teams', 'team']]],
   ['Definitions', [['workflows', 'Workflows', 'flow'], ['roles', 'Roles and prompts', 'doc'], ['packs', 'Packs', 'box']]],
-  ['Manage', [['users', 'Users', 'people'], ['secrets', 'Secrets', 'key'], ['settings', 'Settings', 'gear']]],
+  ['Manage', [['users', 'Users', 'people'], ['secrets', 'Secrets', 'key'], ['runner-keys', 'Runner keys', 'key'], ['settings', 'Settings', 'gear']]],
   ['You', [['account', 'Account', 'person']]],
 ];
 
@@ -44,6 +44,7 @@ const VIEW_LOADERS = {
   project: () => import('./views/teams.js'),
   users: () => import('./views/users.js'),
   secrets: () => import('./views/secrets.js'),
+  'runner-keys': () => import('./views/runnerkeys.js'),
   workflows: () => import('./views/workflows.js'),
   workflow: () => import('./views/workflows.js'),
   'new-workflow': () => import('./views/workflows.js'),

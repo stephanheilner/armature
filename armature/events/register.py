@@ -27,11 +27,16 @@ def _is_socket(path: str) -> bool:
         return False
 
 
+def _string(inputs: dict[str, Any], name: str) -> str | None:
+    value = inputs.get(name)
+    return value if isinstance(value, str) and value else None
+
+
 def registration_body(workflow: str, inputs: dict[str, Any] | None) -> dict[str, Any]:
     inputs = inputs or {}
     return {
         "workflow": workflow,
-        "project": os.environ.get("ARMATURE_PROJECT") or inputs.get("project"),
+        "project": os.environ.get("ARMATURE_PROJECT") or _string(inputs, "project") or _string(inputs, "repo"),
         "actor": os.environ.get("ARMATURE_ACTOR") or os.environ.get("USER"),
         "trigger_kind": os.environ.get("ARMATURE_TRIGGER_KIND") or "cli",
         "trigger_ref": {},

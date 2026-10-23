@@ -1,4 +1,5 @@
 import { api, ApiError, listOf } from '../api.js';
+import { assistantPanel, testRunPanel } from '../assistant.js';
 import { card, clear, confirmDialog, element, empty, errorBox, link, loading, meta, pageHeader, table, when } from '../dom.js';
 import { codeEditor, debounce } from '../editor.js';
 import { diffView } from '../diff.js';
@@ -38,7 +39,7 @@ stages:
 
 export const WORKFLOW = {
   base: '/api/workflows', route: 'workflow', idField: 'workflow_id', format: 'YAML', liveValidate: true, steps: true, lint: true,
-  record: (payload) => payload?.workflow, title: (record) => record.name, noun: () => 'workflow', kindLabel: () => null,
+  testRun: true, record: (payload) => payload?.workflow, title: (record) => record.name, noun: () => 'workflow', kindLabel: () => null,
   listHash: () => '#/workflows', listLabel: 'All workflows', starter: () => WORKFLOW_STARTER,
 };
 
@@ -444,9 +445,10 @@ function editPane(config, record, version, status, onSaved) {
   }
 
   saveButton.addEventListener('click', () => save());
+  const assistant = assistantPanel({ kind: config.route, record, getBody: () => editor.value(), setBody: (text) => editor.setValue(text) });
   const saveBar = element('div', { class: 'wf-actions save-bar' }, element('label', { for: noteInput.id }, 'Note'), noteInput, saveButton,
     link(hashFor(config.route, [record.id]), 'Cancel'));
-  return element('div', {}, conflictSlot, ...parts, saveBar);
+  return element('div', {}, conflictSlot, ...parts, saveBar, assistant);
 }
 
 export async function detailPage(root, config, id, mode) {
@@ -490,6 +492,7 @@ export async function detailPage(root, config, id, mode) {
   else {
     if (config.frontMatter) root.append(card(element('h2', { class: 'inline' }, 'Front matter'), frontMatterView(version.body)));
     root.append(sourceCard(config.format, version.body));
+    if (config.testRun) root.append(testRunPanel(record));
   }
   root.append(versions.root);
 }

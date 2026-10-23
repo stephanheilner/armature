@@ -1,6 +1,7 @@
 """The Armature server's FastAPI app: a signed-in JSON API and the browser UI."""
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -13,8 +14,11 @@ from sqlalchemy import Engine
 
 from armature.server.app import (
     routes_api,
+    routes_assist,
     routes_auth,
     routes_defs,
+    routes_dryrun,
+    routes_export,
     routes_live,
     routes_oidc,
     routes_packs,
@@ -27,6 +31,7 @@ from armature.server.auth import dummy_hash
 from armature.server.config import ServerConfig
 from armature.server.crypto import Keyring
 from armature.server.db import utcnow
+from armature.server.export import ExportHook
 from armature.server.ingest import LiveHub
 from armature.server.oidc import Provider
 
@@ -40,16 +45,25 @@ def create_app(cfg: ServerConfig, engine: Engine, keyring: Keyring, *, clock: Ca
                   lost_after=timedelta(minutes=cfg.lost_after_minutes), sse_per_user=cfg.sse_per_user,
                   sse_total=cfg.sse_total)
 
+    export = ExportHook(engine, cfg.export_on_change, clock=clock) if cfg.export_on_change else None
+    if export is not None:
+        export.attach()
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         await hub.start()
+        if export is not None:
+            export.schedule()
         try:
             yield
         finally:
             await hub.stop()
+            if export is not None:
+                await asyncio.to_thread(export.stop)
 
     app = FastAPI(title="Armature", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.state.live = hub
+    app.state.export = export
     app.state.server = Server(
         cfg=cfg, engine=engine, keyring=keyring, clock=clock, dummy_hash=dummy_hash(password_cost),
         static_dir=static_dir, provider=Provider(cfg.oidc, oidc_transport) if cfg.oidc else None,
@@ -65,7 +79,8 @@ def create_app(cfg: ServerConfig, engine: Engine, keyring: Keyring, *, clock: Ca
         return {"ok": True}
 
     for router in (health, routes_auth.router, routes_api.router, routes_defs.router, routes_live.router,
-                   routes_runner.router, routes_oidc.router, routes_packs.router, static.router):
+                   routes_runner.router, routes_oidc.router, routes_packs.router, routes_export.router,
+                   routes_assist.router, routes_dryrun.router, static.router):
         app.include_router(router, prefix=base)
 
     if base:
@@ -74,6 +89,7 @@ def create_app(cfg: ServerConfig, engine: Engine, keyring: Keyring, *, clock: Ca
             return RedirectResponse(f"{base}/", status_code=302)
 
     overrides = {f"{base}{path}": routes_defs.DEFS_BODY_LIMIT for path in routes_defs.DEFS_PATHS}
+    overrides[f"{base}{routes_assist.ASSIST_PATH}"] = routes_assist.ASSIST_BODY_LIMIT
     app.add_middleware(BodyLimit, overrides={**overrides, f"{base}/api/events": routes_runner.EVENTS_BODY_LIMIT})
     app.add_middleware(SecurityHeaders, hsts=not app.state.server.insecure_localhost)
     return app

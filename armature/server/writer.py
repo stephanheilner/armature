@@ -53,6 +53,8 @@ class StepChange:
     cost_usd: float = 0.0
     input_tokens: int = 0
     output_tokens: int = 0
+    output: Any = None
+    has_output: bool = False
 
 
 @dataclass
@@ -274,6 +276,8 @@ def merge_step(into: StepChange, step: StepChange) -> None:
     into.cost_usd += step.cost_usd
     into.input_tokens += step.input_tokens
     into.output_tokens += step.output_tokens
+    if step.has_output:
+        into.output, into.has_output = step.output, True
 
 
 def _money(value: float) -> Decimal:
@@ -327,7 +331,7 @@ def _upsert_step(conn: Connection, run_id: str, key: str, step: StepChange) -> N
             run_id=run_id, step_key=key, step_id=step.step_id, status=step.status or "running",
             started_at=step.started_at, finished_at=step.finished_at, error=step.error,
             parent_step=step.parent_step, cost_usd=_money(step.cost_usd), input_tokens=step.input_tokens,
-            output_tokens=step.output_tokens))
+            output_tokens=step.output_tokens, **({"output": step.output} if step.has_output else {})))
         return
     values: dict[str, Any] = {}
     for name in ("status", "started_at", "finished_at", "error", "parent_step"):
@@ -339,6 +343,8 @@ def _upsert_step(conn: Connection, run_id: str, key: str, step: StepChange) -> N
         values["input_tokens"] = func.coalesce(run_steps.c.input_tokens, 0) + step.input_tokens
     if step.output_tokens:
         values["output_tokens"] = func.coalesce(run_steps.c.output_tokens, 0) + step.output_tokens
+    if step.has_output:
+        values["output"] = step.output
     if values:
         conn.execute(update(run_steps).where(*where).values(**values))
 

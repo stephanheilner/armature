@@ -45,36 +45,65 @@ def live(request: Request):
     return request.app.state.live
 
 
-@router.get("/api/teams/{team_id}/runner-keys")
-def list_runner_keys(request: Request, granted: Granted = Depends(require("team_lead", by_team()))) -> dict[str, Any]:
+def _list_keys(request: Request, team_id: str | None) -> dict[str, Any]:
     with server(request).engine.connect() as conn:
-        return {"runner_keys": runners.list_keys(conn, granted.target.team_id)}
+        return {"runner_keys": runners.list_keys(conn, team_id)}
 
 
-@router.post("/api/teams/{team_id}/runner-keys")
-def create_runner_key(body: KeyBody, request: Request,
-                      granted: Granted = Depends(require("team_lead", by_team(), step_up=True))) -> dict[str, Any]:
+def _create_key(request: Request, granted: Granted, team_id: str | None, body: KeyBody) -> dict[str, Any]:
     name = _check_name(body.name, "runner key")
     srv = server(request)
     try:
         with srv.engine.begin() as conn:
-            record, key = runners.create_key(conn, srv.keyring, team_id=granted.target.team_id, name=name,
+            record, key = runners.create_key(conn, srv.keyring, team_id=team_id, name=name,
                                              actor_id=granted.user_id, now=srv.now(), ip=client_ip(request))
     except IntegrityError as exc:
         raise ApiError(409, "Try again.") from exc
     return {"runner_key": record, "key": key}
 
 
-@router.post("/api/teams/{team_id}/runner-keys/{key_id}/delete")
-def delete_runner_key(key_id: str, request: Request,
-                      granted: Granted = Depends(require("team_lead", by_team(), step_up=True))) -> dict[str, Any]:
+def _delete_key(request: Request, granted: Granted, team_id: str | None, key_id: str) -> dict[str, Any]:
     srv = server(request)
     with srv.engine.begin() as conn:
-        if not runners.revoke_key(conn, team_id=granted.target.team_id, key_id=key_id, actor_id=granted.user_id,
+        if not runners.revoke_key(conn, team_id=team_id, key_id=key_id, actor_id=granted.user_id,
                                   now=srv.now(), ip=client_ip(request)):
             raise ApiError(404, "No such runner key.")
     live(request).forget_tokens()
     return {"ok": True}
+
+
+@router.get("/api/teams/{team_id}/runner-keys")
+def list_runner_keys(request: Request, granted: Granted = Depends(require("team_lead", by_team()))) -> dict[str, Any]:
+    return _list_keys(request, granted.target.team_id)
+
+
+@router.post("/api/teams/{team_id}/runner-keys")
+def create_runner_key(body: KeyBody, request: Request,
+                      granted: Granted = Depends(require("team_lead", by_team(), step_up=True))) -> dict[str, Any]:
+    return _create_key(request, granted, granted.target.team_id, body)
+
+
+@router.post("/api/teams/{team_id}/runner-keys/{key_id}/delete")
+def delete_runner_key(key_id: str, request: Request,
+                      granted: Granted = Depends(require("team_lead", by_team(), step_up=True))) -> dict[str, Any]:
+    return _delete_key(request, granted, granted.target.team_id, key_id)
+
+
+@router.get("/api/runner-keys")
+def list_instance_runner_keys(request: Request, granted: Granted = Depends(require("admin"))) -> dict[str, Any]:
+    return _list_keys(request, None)
+
+
+@router.post("/api/runner-keys")
+def create_instance_runner_key(body: KeyBody, request: Request,
+                               granted: Granted = Depends(require("admin", step_up=True))) -> dict[str, Any]:
+    return _create_key(request, granted, None, body)
+
+
+@router.post("/api/runner-keys/{key_id}/delete")
+def delete_instance_runner_key(key_id: str, request: Request,
+                               granted: Granted = Depends(require("admin", step_up=True))) -> dict[str, Any]:
+    return _delete_key(request, granted, None, key_id)
 
 
 @router.post("/api/runner/runs")
@@ -107,9 +136,15 @@ async def register_run(request: Request) -> dict[str, Any]:
             return load_summary(conn, row["id"]), token
 
     try:
-        summary, token = await asyncio.to_thread(register)
+        try:
+            summary, token = await asyncio.to_thread(register)
+        except IntegrityError:
+            # Two first runs of an instance key can race to create the operations team.
+            summary, token = await asyncio.to_thread(register)
     except runners.RegistrationError as exc:
         raise ApiError(exc.status, exc.message) from exc
+    except IntegrityError as exc:
+        raise ApiError(409, "Try again.") from exc
     hub = live(request)
     hub.run_started(summary)
     cfg = srv.cfg

@@ -349,6 +349,19 @@ def test_registration_refuses_plain_http_to_a_remote_server(monkeypatch):
     assert called == []
 
 
+def test_registration_project_precedence(monkeypatch):
+    monkeypatch.delenv("ARMATURE_PROJECT", raising=False)
+    both = {"project": "mobile-app", "repo": "fs-eng/android-tree"}
+    assert register.registration_body("w", both)["project"] == "mobile-app"
+    assert register.registration_body("w", {"repo": "fs-eng/android-tree"})["project"] == "fs-eng/android-tree"
+    assert register.registration_body("w", {"project": 7, "repo": "fs-eng/android-tree"})["project"] == \
+        "fs-eng/android-tree"
+    assert register.registration_body("w", {"project": "", "repo": ["x"]})["project"] is None
+    assert register.registration_body("w", None)["project"] is None
+    monkeypatch.setenv("ARMATURE_PROJECT", "mobile/ios")
+    assert register.registration_body("w", both)["project"] == "mobile/ios"
+
+
 def test_unix_endpoint_only_for_a_loopback_server(tmp_path):
     r = DatagramReader()
     try:
