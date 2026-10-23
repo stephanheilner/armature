@@ -1,3 +1,5 @@
+import base64
+import json
 import re
 import sqlite3
 from datetime import UTC, datetime, timedelta
@@ -9,6 +11,8 @@ from sqlalchemy import func, insert, select
 from typer.testing import CliRunner
 
 from armature.cli import app
+from armature.server import secrets as secret_store
+from armature.server.crypto import Keyring
 from armature.server.db import new_id
 from armature.server.db.schema import (
     audit,
@@ -17,6 +21,8 @@ from armature.server.db.schema import (
     run_events,
     run_steps,
     runs,
+    secrets,
+    settings,
     teams,
     users,
     workflows,
@@ -34,6 +40,9 @@ NOW = datetime(2026, 10, 23, 12, 0, tzinfo=UTC)
 T0 = datetime(2026, 10, 20, 9, 0, tzinfo=UTC)
 FEED_JS = Path(__file__).resolve().parents[2] / "armature" / "server" / "static" / "feed.js"
 REVIEW_SECRET_LOOKALIKE = "ghp_" + "a" * 36
+KEY = b"k" * 32
+KEYRING = Keyring(KEY)
+TEAM_SECRET = "plain-team-secret-value-9271"
 
 
 class MemorySource:
@@ -112,9 +121,9 @@ def pr_run(run_id="a1b2c3d4e5f6", *, state="done", started=T0, **run):
 
 
 @pytest.fixture
-def target(sqlite_engine):
+def target(engine):
     ids = {}
-    with sqlite_engine.begin() as conn:
+    with engine.begin() as conn:
         for slug in ("mobile", "talentstorehouse", "product-prototype"):
             ids[slug] = new_id()
             conn.execute(insert(teams).values(id=ids[slug], name=slug.title(), slug=slug, created_at=T0))
@@ -132,12 +141,19 @@ def target(sqlite_engine):
         ids["user"] = new_id()
         conn.execute(insert(users).values(id=ids["user"], username="stephanheilner", created_at=T0,
                                           last_totp_step=0, is_admin=False, disabled=False))
+        conn.execute(insert(settings), [
+            {"key": "ops.jira-work", "scope": "*", "updated_at": T0,
+             "value": {"platforms": {"android": {"repo": "fs-eng/android-tree"},
+                                     "dotnet": {"repo": "MountainRiverPartners/talentstorehouse"}}}},
+            {"key": "ops.linear-intake", "scope": "*", "updated_at": T0,
+             "value": {"channels": {"C0TEST": {"repo": "MountainRiverPartners/talentstorehouse", "team": "TAL"}}}},
+            {"key": "env.JIRA_PROJECT", "scope": "*", "updated_at": T0, "value": "MEMTEMDIS"}])
     return ids
 
 
 def run_import(engine, source, **kw):
     kw.setdefault("now", NOW)
-    return import_history(engine, source, **kw)
+    return import_history(engine, KEYRING, source, **kw)
 
 
 def rows(engine, table, run_id):
@@ -161,9 +177,9 @@ def feed_kinds() -> set[str]:
     return set(re.findall(r"^\s+([a-z_]+): \(\) =>", body, re.MULTILINE))
 
 
-def test_a_pull_request_review_maps_onto_run_steps_and_findings(sqlite_engine, target):
-    report = run_import(sqlite_engine, MemorySource([pr_run()]))
-    run = the_run(sqlite_engine, "a1b2c3d4e5f6")
+def test_a_pull_request_review_maps_onto_run_steps_and_findings(engine, target):
+    report = run_import(engine, MemorySource([pr_run()]))
+    run = the_run(engine, "a1b2c3d4e5f6")
     assert run["team_id"] == target["mobile"] and run["project_id"] == target["fs-eng/android-tree"]
     assert run["workflow_id"] == target["pr-role-review"] and run["workflow_name"] == "pr-role-review"
     assert run["status"] == "succeeded" and run["trigger_kind"] == "pr"
@@ -177,7 +193,7 @@ def test_a_pull_request_review_maps_onto_run_steps_and_findings(sqlite_engine, t
     assert len(ref["import_hash"]) == 64 and "source_run_id" not in ref
     assert run["summary"]["verdict"] == "request_changes"
 
-    steps = {s["step_key"]: s for s in rows(sqlite_engine, run_steps, "a1b2c3d4e5f6")}
+    steps = {s["step_key"]: s for s in rows(engine, run_steps, "a1b2c3d4e5f6")}
     assert set(steps) == {"resolve", "reviews", "reviews/correctness", "reviews/correctness-2", "verify",
                           "team_lead", "post"}
     assert steps["reviews"]["cost_usd"] is None
@@ -188,7 +204,7 @@ def test_a_pull_request_review_maps_onto_run_steps_and_findings(sqlite_engine, t
     assert steps["verify"]["status"] == "failed" and steps["verify"]["error"] == "TimeoutExpired"
     assert steps["team_lead"]["input_tokens"] == 1200
 
-    found = sorted(rows(sqlite_engine, findings, "a1b2c3d4e5f6"), key=lambda f: f["finding_key"])
+    found = sorted(rows(engine, findings, "a1b2c3d4e5f6"), key=lambda f: f["finding_key"])
     assert [(f["finding_key"], f["disposition"], f["path"], f["line"], f["severity"]) for f in found] == sorted([
         ("0123456789ab", "keep", "app/Header.kt", 42, "high"),
         (finding_key("app/List.kt", "Nit: spacing."), None, "app/List.kt", 7, "low"),
@@ -199,9 +215,9 @@ def test_a_pull_request_review_maps_onto_run_steps_and_findings(sqlite_engine, t
     assert report.counts["findings"]["decisions set aside, not imported"] == 1
 
 
-def test_the_timeline_is_contiguous_and_renders_with_the_feed(sqlite_engine, target):
-    run_import(sqlite_engine, MemorySource([pr_run()]))
-    events = rows(sqlite_engine, run_events, "a1b2c3d4e5f6")
+def test_the_timeline_is_contiguous_and_renders_with_the_feed(engine, target):
+    run_import(engine, MemorySource([pr_run()]))
+    events = rows(engine, run_events, "a1b2c3d4e5f6")
     assert [e["seq"] for e in events] == list(range(1, len(events) + 1))
     assert events[0]["kind"] == "run_start" and events[-1]["kind"] == "run_end"
     assert events[-1]["payload"]["status"] == "succeeded"
@@ -218,76 +234,77 @@ def test_the_timeline_is_contiguous_and_renders_with_the_feed(sqlite_engine, tar
     assert [e["kind"] for e in lead] == ["step_start", "cost", "text", "finding", "finding", "finding", "step_end"]
     assert lead[2]["payload"]["text"] == "Verdict: request_changes\n\nTwo problems, one blocks."
     assert {e["payload"]["title"] for e in lead if e["kind"] == "finding"} == {
-        f["title"] for f in rows(sqlite_engine, findings, "a1b2c3d4e5f6")}
+        f["title"] for f in rows(engine, findings, "a1b2c3d4e5f6")}
     starts = [e for e in events if e["kind"] == "step_start" and e["step_id"] == "reviews"]
     assert events.index(starts[0]) < events.index(child[0])
 
 
-def test_review_text_is_redacted(sqlite_engine, target):
+def test_review_text_is_redacted(engine, target):
     src = pr_run()
     src.reviews[0]["review_text"] = f"token {REVIEW_SECRET_LOOKALIKE} leaked"
-    run_import(sqlite_engine, MemorySource([src]))
-    texts = [e["payload"]["text"] for e in rows(sqlite_engine, run_events, "a1b2c3d4e5f6") if e["kind"] == "text"]
+    run_import(engine, MemorySource([src]))
+    texts = [e["payload"]["text"] for e in rows(engine, run_events, "a1b2c3d4e5f6") if e["kind"] == "text"]
     assert not any(REVIEW_SECRET_LOOKALIKE in t for t in texts)
 
 
-def test_a_rerun_skips_unchanged_runs_and_replaces_changed_ones(sqlite_engine, target):
-    first = run_import(sqlite_engine, MemorySource([pr_run()]))
+def test_a_rerun_skips_unchanged_runs_and_replaces_changed_ones(engine, target):
+    first = run_import(engine, MemorySource([pr_run()]))
     assert first.counts["dashboard runs"]["created"] == 1
-    counts = {t.name: len(rows(sqlite_engine, t, "a1b2c3d4e5f6")) for t in (run_steps, run_events, findings)}
+    counts = {t.name: len(rows(engine, t, "a1b2c3d4e5f6")) for t in (run_steps, run_events, findings)}
 
-    again = run_import(sqlite_engine, MemorySource([pr_run()]))
+    again = run_import(engine, MemorySource([pr_run()]))
     assert again.counts["dashboard runs"]["unchanged"] == 1 and again.counts["dashboard runs"]["created"] == 0
     assert "rows written" not in again.counts
 
     changed = pr_run(verdict="approve")
     changed.comments.pop()
-    third = run_import(sqlite_engine, MemorySource([changed]))
+    third = run_import(engine, MemorySource([changed]))
     assert third.counts["dashboard runs"]["updated"] == 1
-    assert len(rows(sqlite_engine, run_steps, "a1b2c3d4e5f6")) == counts["run_steps"]
-    assert len(rows(sqlite_engine, findings, "a1b2c3d4e5f6")) == counts["findings"] - 1
-    events = rows(sqlite_engine, run_events, "a1b2c3d4e5f6")
+    assert len(rows(engine, run_steps, "a1b2c3d4e5f6")) == counts["run_steps"]
+    assert len(rows(engine, findings, "a1b2c3d4e5f6")) == counts["findings"] - 1
+    events = rows(engine, run_events, "a1b2c3d4e5f6")
     assert [e["seq"] for e in events] == list(range(1, len(events) + 1))
-    assert the_run(sqlite_engine, "a1b2c3d4e5f6")["summary"]["verdict"] == "approve"
+    assert the_run(engine, "a1b2c3d4e5f6")["summary"]["verdict"] == "approve"
 
 
-def test_a_dry_run_writes_nothing(sqlite_engine, target):
-    report = run_import(sqlite_engine, MemorySource([pr_run()]), dry_run=True)
+def test_a_dry_run_writes_nothing(engine, target):
+    report = run_import(engine, MemorySource([pr_run()]), dry_run=True)
     assert report.counts["dashboard runs"]["created"] == 1
-    with sqlite_engine.connect() as conn:
+    with engine.connect() as conn:
         assert conn.execute(select(func.count()).select_from(runs)).scalar() == 0
         assert conn.execute(select(func.count()).select_from(audit)
                             .where(audit.c.action == "history.import")).scalar() == 0
 
 
-def test_a_committed_import_is_audited_with_counts(sqlite_engine, target):
-    run_import(sqlite_engine, MemorySource([pr_run()]))
-    with sqlite_engine.connect() as conn:
-        entry = conn.execute(select(audit).where(audit.c.action == "history.import")).mappings().one()
-    assert entry["detail"]["dashboard runs"] == {"created": 1, "updated": 0}
+def test_each_committed_batch_is_audited_with_its_counts(engine, target, monkeypatch):
+    monkeypatch.setattr("armature.server.import_history.RUNS_PER_TRANSACTION", 2)
+    run_import(engine, MemorySource([pr_run(f"run{i:09d}", started=T0 + timedelta(days=i)) for i in range(3)]))
+    with engine.connect() as conn:
+        entries = conn.execute(select(audit.c.detail).where(audit.c.action == "history.import")).scalars().all()
+    batches = sorted(entries, key=lambda d: d["batch"])
+    assert [(d["section"], d["batch"], d["runs"], d["created"]) for d in batches] == [
+        ("dashboard runs", 1, 2, 2), ("dashboard runs", 2, 1, 1)]
 
 
-@pytest.mark.parametrize(("state", "ended", "last_seen", "cancel", "status", "error"), [
-    ("done", True, 0, None, "succeeded", None),
-    ("done_with_errors", True, 0, None, "failed", "1 step(s) failed: verify"),
-    ("died", False, 0, None, "lost", "Stopped without finishing"),
-    ("running", False, 3, None, "running", None),
-    ("running", False, 30, None, "lost", "Stopped without finishing"),
-    ("unknown", False, 30, None, "lost", "Stopped without finishing"),
-    ("done", True, 0, {"requested_by": "stephanheilner", "ended_at": T0 + timedelta(minutes=3)}, "canceled", None),
+@pytest.mark.parametrize(("state", "ended", "cancel", "status", "error"), [
+    ("done", True, None, "succeeded", None),
+    ("done_with_errors", True, None, "failed", "1 step(s) failed: verify"),
+    ("died", False, None, "lost", "Stopped without finishing"),
+    ("running", False, None, "lost", "Imported while still running"),
+    ("unknown", False, None, "lost", "Imported while still running"),
+    ("done", False, None, "lost", "Imported while still running"),
+    ("done", True, {"requested_by": "stephanheilner", "ended_at": T0 + timedelta(minutes=3)}, "canceled", None),
 ])
-def test_status_mapping(sqlite_engine, target, state, ended, last_seen, cancel, status, error):
-    seen = NOW - timedelta(hours=last_seen) if last_seen else T0 + timedelta(minutes=10)
-    src = pr_run(state=state, ended_at=T0 + timedelta(minutes=10) if ended else None, last_event_at=seen)
+def test_status_mapping(engine, target, state, ended, cancel, status, error):
+    src = pr_run(state=state, ended_at=T0 + timedelta(minutes=10) if ended else None,
+                 last_event_at=NOW - timedelta(minutes=1))
     src.cancel = cancel
-    run_import(sqlite_engine, MemorySource([src]))
-    run = the_run(sqlite_engine, "a1b2c3d4e5f6")
+    run_import(engine, MemorySource([src]))
+    run = the_run(engine, "a1b2c3d4e5f6")
     assert (run["status"], run["error"]) == (status, error)
-    events = rows(sqlite_engine, run_events, "a1b2c3d4e5f6")
-    if status == "running":
-        assert run["finished_at"] is None and events[-1]["kind"] != "run_end"
-    else:
-        assert run["finished_at"] is not None and events[-1]["payload"]["status"] == status
+    events = rows(engine, run_events, "a1b2c3d4e5f6")
+    assert run["finished_at"] is not None and events[-1]["kind"] == "run_end"
+    assert events[-1]["payload"]["status"] == status
     if cancel:
         assert run["cancelled_by"] == target["user"]
         assert run["finished_at"] == T0 + timedelta(minutes=3)
@@ -298,33 +315,85 @@ def bare(run_id, workflow, **run):
                           **run})
 
 
-def test_team_and_project_resolution_rules(sqlite_engine, target):
-    with sqlite_engine.begin() as conn:
-        team_workflow = new_id()
-        conn.execute(insert(workflows).values(id=team_workflow, team_id=target["talentstorehouse"],
-                                              scope=target["talentstorehouse"], name="ts-only", current_version=1,
-                                              created_at=T0, updated_at=T0))
-    report = run_import(sqlite_engine, MemorySource([
+def test_team_and_project_resolution_rules(engine, target):
+    no_platform = bare("r-jira2", "jira-work", target="MEMTEMDIS-4", jira_key="MEMTEMDIS-4")
+    no_platform.jira = {"issue": "MEMTEMDIS-4", "platform": None, "outcome": None}
+    with_platform = bare("r-jira1", "jira-work")
+    with_platform.jira = {"issue": "XYZ-1", "platform": "android"}
+    report = run_import(engine, MemorySource([
         bare("r-repo", "pr-fix", repo="MountainRiverPartners/TalentStorehouse"),
         bare("r-target1", "repo-review", target="fs-eng/android-tree, fs-eng/mobile-ios"),
         bare("r-target2", "pr-role-review", target="fs-eng/mobile-ios#5"),
-        bare("r-workflow", "ts-only"),
-        bare("r-pipeline", "pr-role-review", mode="discuss"),
-        bare("r-default", "slack-intake"),
+        with_platform, no_platform,
+        bare("r-tracker", "jira-work", target="TAL-12"),
+        bare("r-intake", "slack-intake"),
+        bare("r-none", "pr-role-review", mode="discuss"),
+        bare("r-mixed", "repo-review", target="fs-eng/android-tree, MountainRiverPartners/talentstorehouse"),
     ]))
-    team = {rid: (the_run(sqlite_engine, rid)["team_id"], the_run(sqlite_engine, rid)["project_id"])
-            for rid in ("r-repo", "r-target1", "r-target2", "r-workflow", "r-pipeline", "r-default")}
+    with engine.connect() as conn:
+        unassigned = conn.execute(select(teams).where(teams.c.slug == "unassigned")).mappings().one()
+    assert unassigned["name"] == "Unassigned (imported)"
+    team = {rid: (the_run(engine, rid)["team_id"], the_run(engine, rid)["project_id"])
+            for rid in ("r-repo", "r-target1", "r-target2", "r-jira1", "r-jira2", "r-tracker", "r-intake", "r-none",
+                        "r-mixed")}
     assert team["r-repo"] == (target["talentstorehouse"], target["MountainRiverPartners/talentstorehouse"])
     assert team["r-target1"] == (target["mobile"], None)
     assert team["r-target2"] == (target["mobile"], target["fs-eng/mobile-ios"])
-    assert team["r-workflow"] == (target["talentstorehouse"], None)
-    assert team["r-pipeline"] == (target["talentstorehouse"], None)
-    assert team["r-default"] == (target["mobile"], None)
-    assert report.counts["team rule"] == {"repo": 1, "target": 2, "workflow": 1, "pipeline": 1, "default": 1}
-    assert the_run(sqlite_engine, "r-pipeline")["trigger_kind"] == "discuss"
+    assert team["r-jira1"] == (target["mobile"], target["fs-eng/android-tree"])
+    assert team["r-jira2"] == (target["mobile"], None)
+    assert team["r-tracker"] == (target["talentstorehouse"], None)
+    assert team["r-intake"] == (target["talentstorehouse"], None)
+    assert team["r-none"] == (unassigned["id"], None)
+    assert team["r-mixed"] == (unassigned["id"], None)
+    assert report.counts["team rule"] == {"repo": 1, "target repos": 2, "jira-work platform": 1, "jira project": 1,
+                                          "tracker team key": 1, "intake channel": 1, "unassigned": 2}
+
+    run_import(engine, MemorySource([bare("r-none2", "pr-review")]))
+    with engine.connect() as conn:
+        assert conn.execute(select(func.count()).select_from(teams).where(teams.c.slug == "unassigned")).scalar() == 1
+    assert the_run(engine, "r-none2")["team_id"] == unassigned["id"]
 
 
-def test_side_tables_become_trigger_details_and_text(sqlite_engine, target):
+def plant_team_secret(engine, team_id):
+    with engine.begin() as conn:
+        secret_store.set_secret(conn, KEYRING, team_id=team_id, name="PLANTED_TOKEN", value=TEAM_SECRET, actor_id=None)
+
+
+def test_team_secrets_are_redacted_from_every_text_written(engine, target):
+    plant_team_secret(engine, target["mobile"])
+    src = pr_run(title=f"Fix {TEAM_SECRET} header")
+    src.reviews[1]["fan_out_error"] = f"crashed with {TEAM_SECRET}"
+    src.comments[0]["body"] = f"Body leaks {TEAM_SECRET}.\nMore."
+    src.comments[1]["path"] = f"app/{TEAM_SECRET}.kt"
+    src.decisions[0]["claim"] = f"Claim {TEAM_SECRET}"
+    src.reviews[0]["review_text"] = f"ark_{'z' * 44} and {TEAM_SECRET}"
+    run_import(engine, MemorySource([src]))
+    run = the_run(engine, "a1b2c3d4e5f6")
+    written = json.dumps([dict(run), [dict(r) for r in rows(engine, run_steps, "a1b2c3d4e5f6")],
+                          [dict(r) for r in rows(engine, run_events, "a1b2c3d4e5f6")],
+                          [dict(r) for r in rows(engine, findings, "a1b2c3d4e5f6")]], default=str)
+    assert TEAM_SECRET not in written and "ark_zzzz" not in written
+    assert "[redacted]" in run["summary"]["title"]
+    child = next(r for r in rows(engine, run_steps, "a1b2c3d4e5f6") if r["step_key"] == "reviews/correctness-2")
+    assert child["error"] == "crashed with [redacted]"
+    failed = next(e for e in rows(engine, run_events, "a1b2c3d4e5f6")
+                  if e["kind"] == "step_failed" and e["step_id"] == "correctness-2")
+    assert failed["payload"]["error"] == "crashed with [redacted]"
+    header = next(f for f in rows(engine, findings, "a1b2c3d4e5f6") if f["finding_key"] == "0123456789ab")
+    assert header["body"].startswith("Body leaks [redacted].") and header["title"] == "Claim [redacted]"
+
+
+def test_an_unopenable_team_secret_refuses_the_import(engine, target):
+    plant_team_secret(engine, target["mobile"])
+    with engine.begin() as conn:
+        conn.execute(secrets.update().values(ciphertext="v1.broken"))
+    with pytest.raises(ValueError, match="could not be opened"):
+        run_import(engine, MemorySource([pr_run()]))
+    with engine.connect() as conn:
+        assert conn.execute(select(func.count()).select_from(runs)).scalar() == 0
+
+
+def test_side_tables_become_trigger_details_and_text(engine, target):
     fix = bare("fix1", "pr-fix", repo="fs-eng/android-tree", number=9, author="author-login")
     fix.fix = {"requester": "StephanHeilner", "scope": "thread", "applied": 2, "skipped": 1, "outcome": "pushed",
                "commit": "deadbeef", "detail": "applied=2/3"}
@@ -334,16 +403,16 @@ def test_side_tables_become_trigger_details_and_text(sqlite_engine, target):
     jira = bare("jira1", "jira-work", repo="fs-eng/mobile-ios", jira_key="MEMTEMDIS-3")
     jira.jira = {"issue": "MEMTEMDIS-3", "platform": "ios", "outcome": "opened",
                  "pr_url": "https://github.com/fs-eng/mobile-ios/pull/1", "detail": "Opened."}
-    report = run_import(sqlite_engine, MemorySource([fix, merge, jira], unlinked={"pr_fixes": 2}))
-    fixed = the_run(sqlite_engine, "fix1")
+    report = run_import(engine, MemorySource([fix, merge, jira], unlinked={"pr_fixes": 2}))
+    fixed = the_run(engine, "fix1")
     assert fixed["actor"] == "StephanHeilner" and fixed["triggered_by"] == target["user"]
     assert fixed["trigger_kind"] == "fix" and fixed["trigger_ref"]["fix"]["commit"] == "deadbeef"
     assert fixed["trigger_ref"]["mode"] == "thread"
-    merged = the_run(sqlite_engine, "merge1")
+    merged = the_run(engine, "merge1")
     assert merged["actor"] == "miles" and merged["triggered_by"] is None and merged["trigger_kind"] == "merged"
     assert merged["trigger_ref"]["merge"]["merged_at"] == T0.isoformat()
-    assert the_run(sqlite_engine, "jira1")["trigger_ref"]["jira"]["outcome"] == "opened"
-    texts = {rid: [e["payload"]["text"] for e in rows(sqlite_engine, run_events, rid) if e["kind"] == "text"]
+    assert the_run(engine, "jira1")["trigger_ref"]["jira"]["outcome"] == "opened"
+    texts = {rid: [e["payload"]["text"] for e in rows(engine, run_events, rid) if e["kind"] == "text"]
              for rid in ("fix1", "merge1", "jira1")}
     assert texts["merge1"] == ["Merged by miles and moved MEMTEMDIS-9 to Done"]
     assert texts["fix1"][0].startswith("Fix requested by StephanHeilner (thread) outcome pushed")
@@ -351,24 +420,24 @@ def test_side_tables_become_trigger_details_and_text(sqlite_engine, target):
     assert report.counts["linked rows"]["pr_fixes skipped, no run"] == 2
 
 
-def test_lead_items_become_findings(sqlite_engine, target):
+def test_lead_items_become_findings(engine, target):
     src = bare("daily1", "repo-review", target="fs-eng/android-tree")
     src.stages = [stage("team_lead", 3, role_type="judge", content='```json\n{"summary": "Two changes."}\n```')]
     src.items = [{"kind": "change", "idx": 0, "repo": "fs-eng/android-tree", "file": "a.kt", "action": "Fix it\nnow",
                   "severity": "medium"},
                  {"kind": "conflict", "idx": 0, "topic": "Retry policy", "resolution": "Keep it", "file": None},
                  {"kind": "no_action", "idx": 0, "action": "Fine"}]
-    report = run_import(sqlite_engine, MemorySource([src]))
-    found = {f["disposition"]: f for f in rows(sqlite_engine, findings, "daily1")}
+    report = run_import(engine, MemorySource([src]))
+    found = {f["disposition"]: f for f in rows(engine, findings, "daily1")}
     assert set(found) == {"change", "conflict"}
     assert found["change"]["title"] == "Fix it" and found["change"]["path"] == "a.kt"
     assert found["conflict"]["body"] == "Keep it"
     assert report.counts["findings"]["no-action items, not imported"] == 1
-    lead_text = [e for e in rows(sqlite_engine, run_events, "daily1") if e["kind"] == "text"]
+    lead_text = [e for e in rows(engine, run_events, "daily1") if e["kind"] == "text"]
     assert lead_text[0]["payload"]["text"] == "Two changes."
 
 
-def test_trace_only_runs_import_when_their_workflow_exists(sqlite_engine, target, tmp_path):
+def test_trace_only_runs_import_when_their_workflow_exists(engine, target, tmp_path):
     path = tmp_path / "traces.db"
     db = sqlite3.connect(path)
     db.execute("CREATE TABLE traces (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT, workflow_name TEXT, "
@@ -395,33 +464,33 @@ def test_trace_only_runs_import_when_their_workflow_exists(sqlite_engine, target
     traced = {s.run["run_id"]: s for s in source.load_traces([r for r, _ in listed])}
     source._traces.close()
 
-    report = run_import(sqlite_engine, MemorySource([bare("dup000000001", "pr-role-review")], traces=list(
+    report = run_import(engine, MemorySource([bare("dup000000001", "pr-role-review")], traces=list(
         traced.values())))
     assert report.counts["trace-only runs"] == {"found": 2, "skipped, not a server workflow": 1, "created": 1,
                                                 "updated": 0}
-    run = the_run(sqlite_engine, "trace0000001")
+    run = the_run(engine, "trace0000001")
     assert run["status"] == "failed" and run["trigger_ref"]["source"] == "traces"
     assert (run["input_tokens"], run["output_tokens"]) == (50, 10)
     assert run["started_at"] == T0 - timedelta(seconds=2)
-    steps = {s["step_id"]: s for s in rows(sqlite_engine, run_steps, "trace0000001")}
+    steps = {s["step_id"]: s for s in rows(engine, run_steps, "trace0000001")}
     assert steps["transition"]["status"] == "failed" and steps["transition"]["input_tokens"] == 50
 
 
-def test_since_and_limit_choose_the_oldest_runs_first(sqlite_engine, target):
+def test_since_and_limit_choose_the_oldest_runs_first(engine, target):
     source = MemorySource([pr_run(f"run{i:09d}", started=T0 + timedelta(days=i)) for i in range(4)])
-    report = run_import(sqlite_engine, source, since=T0 + timedelta(days=1), limit=2)
+    report = run_import(engine, source, since=T0 + timedelta(days=1), limit=2)
     assert report.counts["dashboard runs"]["created"] == 2
-    with sqlite_engine.connect() as conn:
+    with engine.connect() as conn:
         assert sorted(conn.execute(select(runs.c.id)).scalars()) == ["run000000001", "run000000002"]
 
 
-def test_a_live_run_with_the_same_id_is_kept(sqlite_engine, target):
-    with sqlite_engine.begin() as conn:
+def test_a_live_run_with_the_same_id_is_kept(engine, target):
+    with engine.begin() as conn:
         conn.execute(insert(runs).values(id="a1b2c3d4e5f6", team_id=target["mobile"], status="running",
                                          started_at=NOW, trigger_ref={}))
-    report = run_import(sqlite_engine, MemorySource([pr_run()]))
+    report = run_import(engine, MemorySource([pr_run()]))
     assert report.counts["dashboard runs"]["kept, a live run has this id"] == 1
-    assert the_run(sqlite_engine, "a1b2c3d4e5f6")["status"] == "running"
+    assert the_run(engine, "a1b2c3d4e5f6")["status"] == "running"
 
 
 def test_a_long_source_id_gets_a_stable_uuid():
@@ -431,15 +500,17 @@ def test_a_long_source_id_gets_a_stable_uuid():
     assert server_run_id("a1b2c3d4e5f6") == "a1b2c3d4e5f6"
 
 
-def test_long_source_ids_keep_the_original(sqlite_engine, target):
-    run_import(sqlite_engine, MemorySource([pr_run("y" * 40)]))
-    run = the_run(sqlite_engine, server_run_id("y" * 40))
+def test_long_source_ids_keep_the_original(engine, target):
+    run_import(engine, MemorySource([pr_run("y" * 40)]))
+    run = the_run(engine, server_run_id("y" * 40))
     assert run["trigger_ref"]["source_run_id"] == "y" * 40
 
 
-def test_cli_prints_counts_and_never_a_payload(sqlite_engine, target, tmp_path, monkeypatch):
+def test_cli_prints_counts_and_never_a_payload(engine, target, tmp_path, monkeypatch):
     config = tmp_path / "server.yaml"
-    config.write_text(f"database_url: {sqlite_engine.url}\nmaster_key: env:UNUSED_KEY\n")
+    config.write_text(f"database_url: {engine.url.render_as_string(hide_password=False)}\n"
+                      "master_key: env:HISTORY_TEST_KEY\n")
+    monkeypatch.setenv("HISTORY_TEST_KEY", base64.b64encode(KEY).decode())
     source = MemorySource([pr_run()])
     monkeypatch.setattr("armature.server.import_history.ops_source", lambda ops_dir, traces: source)
     result = CliRunner().invoke(app, ["server", "import-history", str(tmp_path), "--config", str(config),
@@ -457,12 +528,3 @@ def test_cli_refuses_a_bad_since(tmp_path, monkeypatch):
     result = CliRunner().invoke(app, ["server", "import-history", str(tmp_path), "--config", str(config),
                                       "--since", "last tuesday"])
     assert result.exit_code == 1 and "--since" in result.output
-
-
-def test_status_change_with_time_updates_the_run(sqlite_engine, target):
-    src = pr_run(state="running", ended_at=None, last_event_at=NOW - timedelta(hours=1))
-    run_import(sqlite_engine, MemorySource([src]))
-    assert the_run(sqlite_engine, "a1b2c3d4e5f6")["status"] == "running"
-    later = run_import(sqlite_engine, MemorySource([src]), now=NOW + timedelta(days=2))
-    assert later.counts["dashboard runs"]["updated"] == 1
-    assert the_run(sqlite_engine, "a1b2c3d4e5f6")["status"] == "lost"

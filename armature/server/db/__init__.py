@@ -7,7 +7,6 @@ from pathlib import Path
 
 from sqlalchemy import Engine, create_engine, event
 
-from armature.server.db import defs_schema  # noqa: F401  registers migration 0003's columns
 from armature.server.db.schema import metadata
 
 MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"

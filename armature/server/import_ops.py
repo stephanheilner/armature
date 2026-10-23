@@ -135,6 +135,25 @@ def lint_ok(note: str | None) -> bool | None:
     return None
 
 
+# As in sh, '#' starts a comment only at the start of a word and outside quotes, so foo#bar is one value.
+def _without_comment(value: str) -> str:
+    quote, escaped, word_start = None, False, True
+    for i, char in enumerate(value):
+        if escaped:
+            escaped, word_start = False, False
+            continue
+        if char == "#" and word_start and not quote:
+            return value[:i]
+        if char == "\\" and quote != "'":
+            escaped = True
+        elif quote:
+            quote = None if char == quote else quote
+        elif char in "'\"":
+            quote = char
+        word_start = not quote and not escaped and char.isspace()
+    return value
+
+
 def parse_env(text: str) -> dict[str, str]:
     """``KEY=value`` lines as ``sh`` reads them: quotes removed, comments dropped, nothing expanded."""
     values = {}
@@ -143,7 +162,7 @@ def parse_env(text: str) -> dict[str, str]:
         if not match:
             continue
         try:
-            words = shlex.split(match.group(2), comments=True, posix=True)
+            words = shlex.split(_without_comment(match.group(2)), comments=False, posix=True)
         except ValueError:
             continue
         values[match.group(1)] = " ".join(words)
@@ -278,8 +297,14 @@ def _import_project(ctx: _Context, team_id: str, repo: Any, claimed: set[str], s
         if isinstance(raw_branches, list) else []
     values = {"repo": slug, "platform": platform, "enabled_workflows": enabled, "branch_filters": branches}
     name = slug.split("/", 1)[1]
-    row = ctx.conn.execute(select(projects).where(projects.c.team_id == team_id, projects.c.name == name)).first()
-    if row is None:
+    row = ctx.conn.execute(select(projects).where(projects.c.repo == slug)).first() or \
+        ctx.conn.execute(select(projects).where(projects.c.team_id == team_id, projects.c.name == name)).first()
+    if row is not None and row.team_id != team_id:
+        ctx.conn.execute(update(projects).where(projects.c.id == row.id).values(team_id=team_id, **values))
+        _audit(ctx, "project.move", "project", row.id, team_id, repo=slug, from_team=row.team_id)
+        ctx.report.add("projects", slug, "moved to this team")
+        ctx.report.warn(f"projects: {slug} moved from another team to the team teams.json names")
+    elif row is None:
         project_id = new_id()
         ctx.conn.execute(insert(projects).values(id=project_id, team_id=team_id, name=name, created_at=ctx.now,
                                                  **values))
@@ -390,15 +415,16 @@ def _import_documents(ctx: _Context, ops: Path) -> None:
 
 def _put_setting(ctx: _Context, key: str, value: Any, team_id: str | None) -> None:
     scope = scope_of(team_id)
-    row = ctx.conn.execute(select(settings).where(settings.c.key == key)).first()
-    if row is not None and row.value == value and row.scope == scope:
+    where = (settings.c.scope == scope, settings.c.key == key)
+    row = ctx.conn.execute(select(settings).where(*where)).first()
+    if row is not None and row.value == value:
         ctx.report.add("settings", key, "unchanged")
         return
     values = {"value": value, "team_id": team_id, "scope": scope, "updated_at": ctx.now, "updated_by": ACTOR}
     if row is None:
         ctx.conn.execute(insert(settings).values(key=key, **values))
     else:
-        ctx.conn.execute(update(settings).where(settings.c.key == key).values(**values))
+        ctx.conn.execute(update(settings).where(*where).values(**values))
     _audit(ctx, "setting.set", "setting", key, team_id, key=key)
     ctx.report.add("settings", key, "created" if row is None else "updated")
 
@@ -536,7 +562,11 @@ def _import_user(ctx: _Context, user: DashboardUser, key: bytes | None) -> None:
         return
     password_hash = user.password_hash if isinstance(user.password_hash, str) and \
         user.password_hash.startswith("scrypt$") and len(user.password_hash.split("$")) == 6 else None
-    if password_hash is None:
+    if user.must_change_password:
+        password_hash = None
+        ctx.report.warn(f"users: {username} still had a generated password in the dashboard, "
+                        "imported without one, needs an invite")
+    elif password_hash is None:
         ctx.report.warn(f"users: {username} has no usable password hash, needs an invite")
     totp = _dashboard_totp(ctx, user, key)
     is_admin = user.role == "admin"
@@ -558,25 +588,28 @@ def _import_user(ctx: _Context, user: DashboardUser, key: bytes | None) -> None:
             changes["display_name"] = display
         if is_admin and not row.is_admin:
             changes["is_admin"] = True
+        demotion = row.is_admin and not is_admin
         if bool(row.disabled) != user.disabled:
             changes["disabled"] = user.disabled
         # Once someone signs in here, this server owns their password and authenticator.
         if row.last_login_at is None:
-            if password_hash and row.password_hash != password_hash:
+            if row.password_hash != password_hash and (password_hash or user.must_change_password):
                 changes["password_hash"] = password_hash
             if totp and _stored_totp(ctx, row) != totp:
                 changes.update(totp_secret_enc=ctx.keyring.seal(totp, totp_aad(user_id), label="totp"),
-                               totp_confirmed_at=ctx.now, last_totp_step=user.last_totp_step)
+                               totp_confirmed_at=ctx.now)
+            # Never lower the replay floor, so a code already used on either side stays used.
+            if totp and user.last_totp_step > row.last_totp_step:
+                changes["last_totp_step"] = user.last_totp_step
         elif password_hash != row.password_hash or (totp and _stored_totp(ctx, row) != totp):
             ctx.report.warn(f"users: {username} has signed in here, kept this server's password and TOTP")
         if changes:
             ctx.conn.execute(update(users).where(users.c.id == user_id).values(**changes))
             _audit(ctx, "user.update", "user", user_id, username=username, fields=sorted(changes))
-        ctx.report.add("users", username, "updated" if changes else "unchanged")
+        outcome = "updated" if changes else "unchanged"
+        ctx.report.add("users", username, "admin kept; demote in the UI" if demotion else outcome)
     if not ctx.conn.execute(select(users.c.totp_confirmed_at).where(users.c.id == user_id)).scalar():
         ctx.report.warn(f"users: {username} has no confirmed authenticator here, so needs an invite to sign in")
-    if user.must_change_password:
-        ctx.report.warn(f"users: {username} still had to change a generated password in the dashboard")
     for slug in user.teams:
         _import_membership(ctx, user_id, username, slug)
 

@@ -15,7 +15,7 @@ import sqlite3
 import uuid
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -23,8 +23,8 @@ from typing import Any, Protocol
 
 from sqlalchemy import Connection, Engine, delete, insert, select, update
 
-from armature.events.redact import redact_text
 from armature.server import audit
+from armature.server.crypto import Keyring
 from armature.server.db import new_id
 from armature.server.db.schema import (
     findings,
@@ -32,10 +32,12 @@ from armature.server.db.schema import (
     run_events,
     run_steps,
     runs,
+    settings,
     teams,
     users,
     workflows,
 )
+from armature.server.ingest import redact, team_secret_values
 from armature.server.writer import step_key
 
 ACTOR = "import-history"
@@ -49,8 +51,10 @@ ERROR_CAP = 4000
 TITLE_CAP = 500
 RUNS_PER_TRANSACTION = 100
 ROWS_PER_INSERT = 1000
-STALE = timedelta(days=1)
-DEFAULT_TEAM = "mobile"
+JIRA_TEAM = "mobile"
+UNASSIGNED_SLUG = "unassigned"
+UNASSIGNED_NAME = "Unassigned (imported)"
+ISSUE_KEY = re.compile(r"^([A-Za-z][A-Za-z0-9]+)-[0-9]+")
 REVIEW_STAGES = ("reviews", "consults")
 LEAD_STAGES = ("decide", "team_lead")
 
@@ -58,8 +62,6 @@ STATUS = {"done": "succeeded", "done_with_errors": "failed", "died": "lost"}
 TRIGGER_KINDS = {"pr-role-review": "pr", "pr-review": "pr", "pr-fix": "fix", "repo-review": "daily",
                  "resynthesize": "manual", "jira-work": "jira", "jira-work-resume": "jira", "ios-port": "port",
                  "pr-merged": "merged", "slack-intake": "intake", "build-announce": "ci"}
-PIPELINES = {"pr-role-review": "pr_review", "pr-review": "pr_review", "pr-fix": "fix", "repo-review": "daily_review",
-             "resynthesize": "daily_review"}
 KEPT_DECISIONS = frozenset({"block", "suggest", "act", "defer"})
 DISPOSITIONS = frozenset({"keep", "drop_rebutted", "resolved"})
 
@@ -120,61 +122,116 @@ class Plan:
 class _Target:
     """What the server already holds that a run maps onto."""
 
-    teams: list[Any]
+    conn: Connection
+    keyring: Keyring
+    now: datetime
     by_slug: dict[str, str]
     projects: dict[str, tuple[str, str]]
-    pipeline_teams: dict[str, list[str]]
     workflows: dict[str, str]
     team_workflows: dict[str, dict[str, str]]
     users: dict[str, str]
+    platform_repos: dict[str, str]
+    tracker_repos: dict[str, str]
+    jira_projects: set[str]
+    intake_repos: list[str]
+    secret_values: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
     @classmethod
-    def load(cls, conn: Connection) -> _Target:
-        team_rows = conn.execute(select(teams.c.id, teams.c.slug).order_by(teams.c.created_at, teams.c.slug)).all()
-        order = [row.id for row in team_rows]
-        project_rows = conn.execute(select(projects.c.id, projects.c.team_id, projects.c.repo,
-                                           projects.c.enabled_workflows)).all()
-        project_map, pipeline_teams = {}, {}
-        for row in project_rows:
+    def load(cls, conn: Connection, keyring: Keyring, now: datetime) -> _Target:
+        team_rows = conn.execute(select(teams.c.id, teams.c.slug)).all()
+        project_map = {}
+        for row in conn.execute(select(projects.c.id, projects.c.team_id, projects.c.repo)).all():
             if row.repo:
                 project_map.setdefault(row.repo.lower(), (row.team_id, row.id))
-            for pipeline in row.enabled_workflows or []:
-                pipeline_teams.setdefault(pipeline, set()).add(row.team_id)
         workflow_rows = conn.execute(select(workflows.c.id, workflows.c.name, workflows.c.team_id)).all()
         team_workflows: dict[str, dict[str, str]] = {}
         for row in workflow_rows:
             if row.team_id:
                 team_workflows.setdefault(row.name, {})[row.team_id] = row.id
-        return cls(teams=team_rows, by_slug={row.slug: row.id for row in team_rows if row.slug},
+        stored = {row.key: row.value for row in conn.execute(select(settings.c.key, settings.c.value).where(
+            settings.c.key.in_(("ops.jira-work", "ops.linear-intake", "env.JIRA_PROJECT")))).all()}
+        platforms = _mapping(_mapping(stored.get("ops.jira-work")).get("platforms"))
+        channels = _mapping(_mapping(stored.get("ops.linear-intake")).get("channels"))
+        jira_project = stored.get("env.JIRA_PROJECT")
+        return cls(conn=conn, keyring=keyring, now=now, by_slug={row.slug: row.id for row in team_rows if row.slug},
                    projects=project_map,
-                   pipeline_teams={name: [t for t in order if t in held] for name, held in pipeline_teams.items()},
                    workflows={row.name: row.id for row in workflow_rows if row.team_id is None},
                    team_workflows=team_workflows,
                    users={row.username.lower(): row.id
-                          for row in conn.execute(select(users.c.id, users.c.username)).all() if row.username})
+                          for row in conn.execute(select(users.c.id, users.c.username)).all() if row.username},
+                   platform_repos={name: entry["repo"] for name, entry in platforms.items()
+                                   if isinstance(entry, dict) and isinstance(entry.get("repo"), str)},
+                   tracker_repos={str(entry["team"]).upper(): entry["repo"] for entry in channels.values()
+                                  if isinstance(entry, dict) and isinstance(entry.get("repo"), str)
+                                  and isinstance(entry.get("team"), str)},
+                   jira_projects={key.upper() for key in re.split(r"[\s,]+", jira_project)
+                                  if key} if isinstance(jira_project, str) else set(),
+                   intake_repos=[entry["repo"] for entry in channels.values()
+                                 if isinstance(entry, dict) and isinstance(entry.get("repo"), str)])
+
+    def _team_of_repos(self, repos: Iterable[Any]) -> tuple[str, str | None] | None:
+        named = [self.projects[r.lower()] for r in repos if isinstance(r, str) and r.lower() in self.projects]
+        if not named or len({team for team, _ in named}) != 1:
+            return None
+        return named[0][0], named[0][1] if len({project for _, project in named}) == 1 else None
 
     def team_for(self, src: SourceRun) -> tuple[str, str | None, str]:
-        """The run's team and project, and the rule that chose them."""
+        """The run's team and project, and the rule that chose them. With no evidence, the admin-only team."""
         run = src.run
-        repo = run.get("repo")
-        if isinstance(repo, str) and repo.lower() in self.projects:
-            team_id, project_id = self.projects[repo.lower()]
-            return team_id, project_id, "repo"
-        named = [self.projects[r.lower()] for r in REPO.findall(str(run.get("target") or ""))
-                 if r.lower() in self.projects]
-        if named and len({team for team, _ in named}) == 1:
-            return named[0][0], named[0][1] if len(named) == 1 else None, "target"
-        owners = self.team_workflows.get(run.get("workflow"), {})
-        if len(owners) == 1:
-            return next(iter(owners)), None, "workflow"
-        pipeline = "discuss" if run.get("mode") == "discuss" else PIPELINES.get(run.get("workflow"))
-        if pipeline and self.pipeline_teams.get(pipeline):
-            return self.pipeline_teams[pipeline][0], None, "pipeline"
-        if DEFAULT_TEAM in self.by_slug:
-            return self.by_slug[DEFAULT_TEAM], None, "default"
-        if not self.teams:
-            raise ValueError("the server has no teams, so run `armature server import-ops` first")
-        return self.teams[0].id, None, "first team"
+        jira = src.jira or {}
+        rules = (
+            ("repo", [run.get("repo")]),
+            ("target repos", REPO.findall(str(run.get("target") or ""))),
+            ("jira-work platform", [self.platform_repos.get(str(jira.get("platform") or ""))]),
+        )
+        for rule, repos in rules:
+            found = self._team_of_repos(repos)
+            if found:
+                return found[0], found[1], rule
+        for key in (run.get("jira_key"), jira.get("issue"), run.get("target")):
+            prefix = ISSUE_KEY.match(str(key or ""))
+            if not prefix:
+                continue
+            project = prefix.group(1).upper()
+            found = self._team_of_repos([self.tracker_repos.get(project)])
+            if found:
+                return found[0], None, "tracker team key"
+            if project in self.jira_projects and JIRA_TEAM in self.by_slug:
+                return self.by_slug[JIRA_TEAM], None, "jira project"
+        if run.get("workflow") == "slack-intake":
+            found = self._team_of_repos(self.intake_repos)
+            if found:
+                return found[0], None, "intake channel"
+        return self._unassigned(), None, "unassigned"
+
+    def _unassigned(self) -> str:
+        if UNASSIGNED_SLUG not in self.by_slug:
+            row = self.conn.execute(select(teams.c.id).where(teams.c.slug == UNASSIGNED_SLUG)).first()
+            if row is None:
+                team_id = new_id()
+                self.conn.execute(insert(teams).values(id=team_id, name=UNASSIGNED_NAME, slug=UNASSIGNED_SLUG,
+                                                       created_at=self.now))
+                audit.record(self.conn, action="team.create", actor_id=ACTOR, team_id=team_id, target_kind="team",
+                             target_id=team_id, detail={"source": ACTOR, "slug": UNASSIGNED_SLUG})
+                self.by_slug[UNASSIGNED_SLUG] = team_id
+            else:
+                self.by_slug[UNASSIGNED_SLUG] = row.id
+        return self.by_slug[UNASSIGNED_SLUG]
+
+    def secrets_of(self, team_id: str) -> tuple[str, ...]:
+        """The values live ingest redacts for this team, longest first. Refuses when any will not open."""
+        if team_id not in self.secret_values:
+            try:
+                values = team_secret_values(self.conn, self.keyring, team_id)
+            except Exception as exc:
+                raise ValueError(f"the secrets of a team could not be opened ({exc.__class__.__name__}), "
+                                 "so no text can be redacted") from exc
+            self.secret_values[team_id] = tuple(sorted(set(values), key=len, reverse=True))
+        return self.secret_values[team_id]
+
+
+def _mapping(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
 
 
 def server_run_id(source_id: str) -> str:
@@ -230,7 +287,6 @@ def _first_line(value: str | None) -> str | None:
 
 
 def _text_payload(text: str) -> dict[str, Any]:
-    text = redact_text(text)
     payload: dict[str, Any] = {"text": text[:TEXT_CAP], "imported": True}
     if len(text) > TEXT_CAP:
         payload["truncated"] = True
@@ -261,17 +317,12 @@ def _lead_summary(stage: dict[str, Any]) -> str | None:
     return _text(parsed.get("summary")) if isinstance(parsed, dict) else None
 
 
-def map_status(src: SourceRun, now: datetime) -> str:
-    run = src.run
+def map_status(src: SourceRun) -> str:
     if src.cancel:
         return "canceled"
-    state = str(run.get("state") or "")
-    if state in STATUS:
-        return STATUS[state]
-    seen = _aware(run.get("last_event_at")) or _aware(run.get("started_at"))
-    if run.get("ended_at") is None and (seen is None or now - seen > STALE):
+    if src.run.get("ended_at") is None:
         return "lost"
-    return "running"
+    return STATUS.get(str(src.run.get("state") or ""), "lost")
 
 
 def trigger_kind(run: dict[str, Any]) -> str:
@@ -497,17 +548,27 @@ class _Timeline:
         return [(ts, kind, step_id, payload) for ts, _, kind, step_id, payload in sorted(self.events)]
 
 
-def plan_run(src: SourceRun, target: _Target, now: datetime, report: Report) -> Plan | None:
-    run = src.run
-    started = _aware(run.get("started_at"))
+def _redacted(src: SourceRun, secret_values: tuple[str, ...]) -> SourceRun:
+    """Every text the run carries, scrubbed as live ingest scrubs event text. The run id stays as it is."""
+    names = ("run", "stages", "reviews", "decisions", "comments", "items", "jira", "fix", "merge", "pr_author",
+             "cancel")
+    copy = replace(src, **{name: redact(getattr(src, name), secret_values) for name in names})
+    copy.run["run_id"] = src.run["run_id"]
+    return copy
+
+
+def plan_run(src: SourceRun, target: _Target, report: Report) -> Plan | None:
+    started = _aware(src.run.get("started_at"))
     if started is None:
         report.add("runs", "skipped, no start time")
         return None
-    run_id = server_run_id(str(run["run_id"]))
-    status = map_status(src, now)
+    run_id = server_run_id(str(src.run["run_id"]))
+    team_id, project_id, rule = target.team_for(src)
+    src = _redacted(src, target.secrets_of(team_id))
+    run = src.run
+    status = map_status(src)
     steps = build_steps(src)
     found = build_findings(src, report)
-    team_id, project_id, rule = target.team_for(src)
     workflow_name = str(run.get("workflow") or "unknown")[:191]
     workflow_id = target.team_workflows.get(workflow_name, {}).get(team_id) or target.workflows.get(workflow_name)
     actor = actor_of(src)
@@ -516,14 +577,14 @@ def plan_run(src: SourceRun, target: _Target, now: datetime, report: Report) -> 
     finished = None
     if status == "canceled":
         finished = _aware(src.cancel.get("ended_at")) or _aware(run.get("ended_at")) or last_seen
-    elif status != "running":
+    else:
         finished = _aware(run.get("ended_at")) or last_seen
     failed = [s.step_id for s in steps if s.status == "failed" and s.parent is None]
     error = None
     if status == "failed":
         error = f"{len(failed)} step(s) failed: {', '.join(failed)}" if failed else "Finished with errors"
     elif status == "lost":
-        error = "Stopped without finishing"
+        error = "Stopped without finishing" if run.get("state") == "died" else "Imported while still running"
     cost = _number(run.get("cost_usd"))
     summary = {k: run.get(k) for k in ("title", "verdict", "post_url", "post_event") if run.get(k)}
     lead_stage = next((stage for name in LEAD_STAGES for stage in src.stages if stage.get("stage_id") == name), {})
@@ -574,7 +635,7 @@ def plan_run(src: SourceRun, target: _Target, now: datetime, report: Report) -> 
     first = [(started, "run_start", None, {"workflow": workflow_name, "trigger_kind": values["trigger_kind"],
                                             "imported": True})]
     end_ts = finished or last_seen
-    last = [] if status == "running" else [(end_ts, "run_end", None, _compact(
+    last = [(end_ts, "run_end", None, _compact(
         {"status": status, "cost_usd": round(cost, 6), "error": error, "imported": True}))]
     event_rows = [{"run_id": run_id, "seq": seq, "ts": ts, "kind": kind, "step_id": step_id, "payload": payload}
                   for seq, (ts, kind, step_id, payload) in enumerate(first + timeline.ordered() + last, start=1)]
@@ -609,7 +670,9 @@ def _insert(conn: Connection, table, rows: list[dict[str, Any]]) -> None:
         conn.execute(insert(table), chunk)
 
 
-def _write(conn: Connection, plans: list[Plan], report: Report, section: str) -> None:
+def _write(conn: Connection, plans: list[Plan], report: Report) -> Counter:
+    """Write the plans and return what happened to their runs."""
+    tally: Counter = Counter()
     existing = {row.id: row.trigger_ref for row in conn.execute(
         select(runs.c.id, runs.c.trigger_ref).where(runs.c.id.in_([p.run_id for p in plans]))).all()}
     fresh, replaced = [], []
@@ -619,9 +682,9 @@ def _write(conn: Connection, plans: list[Plan], report: Report, section: str) ->
             continue
         ref = existing[plan.run_id] if isinstance(existing[plan.run_id], dict) else {}
         if "import_hash" not in ref:
-            report.add(section, "kept, a live run has this id")
+            tally["kept, a live run has this id"] += 1
         elif ref["import_hash"] == plan.run["trigger_ref"]["import_hash"]:
-            report.add(section, "unchanged")
+            tally["unchanged"] += 1
         else:
             replaced.append(plan)
     if replaced:
@@ -635,25 +698,27 @@ def _write(conn: Connection, plans: list[Plan], report: Report, section: str) ->
     _insert(conn, run_steps, [row for p in written for row in p.steps])
     _insert(conn, run_events, [row for p in written for row in p.events])
     _insert(conn, findings, [{"id": new_id(), **row} for p in written for row in p.findings])
-    report.add(section, "created", len(fresh))
-    report.add(section, "updated", len(replaced))
+    tally["created"] += len(fresh)
+    tally["updated"] += len(replaced)
     for plan in written:
         report.add("rows written", "steps", len(plan.steps))
         report.add("rows written", "events", len(plan.events))
         report.add("rows written", "findings", len(plan.findings))
+    return tally
 
 
-def _import_batches(engine: Engine, batches: Iterable[list[SourceRun]], total: int, *, section: str, now: datetime,
-                    report: Report, dry_run: bool, progress: Callable[[str], None]) -> None:
+def _import_batches(engine: Engine, keyring: Keyring, batches: Iterable[list[SourceRun]], total: int, *,
+                    section: str, now: datetime, report: Report, dry_run: bool,
+                    progress: Callable[[str], None]) -> None:
     done = 0
-    for batch in batches:
+    for number, batch in enumerate(batches, start=1):
         with engine.connect() as conn:
             transaction = conn.begin()
             try:
-                target = _Target.load(conn)
+                target = _Target.load(conn, keyring, now)
                 plans = []
                 for src in batch:
-                    plan = plan_run(src, target, now, report)
+                    plan = plan_run(src, target, report)
                     if plan is None:
                         continue
                     plans.append(plan)
@@ -666,8 +731,14 @@ def _import_batches(engine: Engine, batches: Iterable[list[SourceRun]], total: i
                         report.add("actor", "matched a user")
                     elif plan.run["actor"]:
                         report.add("actor", "kept as text")
-                if plans:
-                    _write(conn, plans, report, section)
+                tally = _write(conn, plans, report) if plans else Counter()
+                report.add(section, "created", 0)
+                for outcome, n in tally.items():
+                    report.add(section, outcome, n)
+                if not dry_run:
+                    audit.record(conn, action="history.import", actor_id=ACTOR, target_kind="runs", target_id=None,
+                                 detail={"source": ACTOR, "section": section, "batch": number, "runs": len(batch),
+                                         **dict(tally)})
             except BaseException:
                 transaction.rollback()
                 raise
@@ -679,7 +750,8 @@ def _import_batches(engine: Engine, batches: Iterable[list[SourceRun]], total: i
         progress(f"{section}: {done}/{total}")
 
 
-def import_history(engine: Engine, source: HistorySource, *, now: datetime, since: datetime | None = None,
+def import_history(engine: Engine, keyring: Keyring, source: HistorySource, *, now: datetime,
+                   since: datetime | None = None,
                    limit: int | None = None, traces: bool = True, dry_run: bool = False,
                    progress: Callable[[str], None] = lambda _: None) -> Report:
     """Import in transactions of ``RUNS_PER_TRANSACTION`` runs. A dry run rolls every one back."""
@@ -691,7 +763,7 @@ def import_history(engine: Engine, source: HistorySource, *, now: datetime, sinc
         chosen = chosen[:limit]
     for table, n in source.unlinked().items():
         report.add("linked rows", f"{table} skipped, no run", n)
-    _import_batches(engine, (source.load_dashboard(ids) for ids in _chunks(chosen, RUNS_PER_TRANSACTION)),
+    _import_batches(engine, keyring, (source.load_dashboard(ids) for ids in _chunks(chosen, RUNS_PER_TRANSACTION)),
                     len(chosen), section="dashboard runs", now=now, report=report, dry_run=dry_run,
                     progress=progress)
     if traces and (limit is None or len(chosen) < limit):
@@ -709,14 +781,9 @@ def import_history(engine: Engine, source: HistorySource, *, now: datetime, sinc
         report.add("trace-only runs", "skipped, not a server workflow", skipped)
         if limit is not None:
             trace_ids = trace_ids[:limit - len(chosen)]
-        _import_batches(engine, (source.load_traces(ids) for ids in _chunks(trace_ids, RUNS_PER_TRANSACTION)),
+        _import_batches(engine, keyring, (source.load_traces(ids) for ids in _chunks(trace_ids, RUNS_PER_TRANSACTION)),
                         len(trace_ids), section="trace-only runs", now=now, report=report, dry_run=dry_run,
                         progress=progress)
-    if not dry_run:
-        with engine.begin() as conn:
-            audit.record(conn, action="history.import", actor_id=ACTOR, target_kind="runs", target_id=None,
-                         detail={"source": ACTOR, **{s: dict(t) for s, t in report.counts.items()
-                                                     if s in ("dashboard runs", "trace-only runs")}})
     return report
 
 

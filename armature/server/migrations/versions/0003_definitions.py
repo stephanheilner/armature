@@ -48,12 +48,18 @@ def upgrade() -> None:
         batch.add_column(sa.Column('scope', sa.String(length=36), nullable=False, server_default='*'))
         batch.create_foreign_key(op.f('fk_settings_team_id_teams'), 'teams', ['team_id'], ['id'])
         batch.create_check_constraint(op.f('ck_settings_scope'), SCOPE_MATCHES_TEAM)
+        batch.drop_constraint(op.f('pk_settings'), type_='primary')
+        batch.create_primary_key(op.f('pk_settings'), ['scope', 'key'])
     _sqlite_foreign_keys(True)
 
 
 def downgrade() -> None:
     _sqlite_foreign_keys(False)
+    # Only instance settings fit the old primary key on key alone.
+    op.execute("DELETE FROM settings WHERE scope <> '*'")
     with op.batch_alter_table('settings') as batch:
+        batch.drop_constraint(op.f('pk_settings'), type_='primary')
+        batch.create_primary_key(op.f('pk_settings'), ['key'])
         batch.drop_constraint(op.f('ck_settings_scope'), type_='check')
         batch.drop_constraint(op.f('fk_settings_team_id_teams'), type_='foreignkey')
         batch.drop_column('scope')

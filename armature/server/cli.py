@@ -298,6 +298,8 @@ def import_history_cmd(
     from armature.server.import_history import import_history, ops_source
 
     cfg = _load(config)
+    since_at = _since(since)
+    keyring = _keyring(cfg)
     started = time.monotonic()
     try:
         source = ops_source(ops_dir, None if no_traces else traces.expanduser())
@@ -307,7 +309,7 @@ def import_history_cmd(
     kept = "" if dry_run else " Batches committed before it stay."
     engine = make_engine(cfg.database_url)
     try:
-        report = import_history(engine, source, now=utcnow(), since=_since(since), limit=limit,
+        report = import_history(engine, keyring, source, now=utcnow(), since=since_at, limit=limit,
                                 traces=not no_traces, dry_run=dry_run,
                                 progress=lambda line: typer.echo(line, err=True))
     except ValueError as exc:

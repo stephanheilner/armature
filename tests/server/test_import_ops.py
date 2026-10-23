@@ -111,6 +111,9 @@ def test_parse_env_reads_sh_quoting_and_drops_comments():
     assert env["JIRA_TRANSITION_QA"] == "In Test"
     assert env["SLACK_RELEASE_CHANNEL"] == ""
     assert "SLACK_SIGNING_SECRET" not in env
+    assert parse_env("X=foo#bar") == {"X": "foo#bar"}
+    assert parse_env("X=foo #c") == {"X": "foo"}
+    assert parse_env("X='a #b' #c\nY=a\\ #b\nZ=#c") == {"X": "a #b", "Y": "a #b", "Z": ""}
 
 
 def test_secret_names():
@@ -415,3 +418,58 @@ def test_0003_upgrades_a_live_database_and_backfills_scope(db_url):
             assert conn.execute(select(workflows.c.scope).where(workflows.c.id == workflow_id)).scalar() == team_id
     finally:
         engine.dispose()
+
+
+def test_settings_key_is_unique_per_scope(engine, keyring):
+    from sqlalchemy import inspect
+    assert inspect(engine).get_pk_constraint("settings")["constrained_columns"] == ["scope", "key"]
+    with engine.begin() as conn:
+        _run(conn, keyring)
+        tsh = conn.execute(select(teams.c.id).where(teams.c.slug == "talentstorehouse")).scalar()
+        conn.execute(settings.insert().values(key="env.MRP_GITHUB_APP_ID", value="instance", team_id=None))
+    with engine.connect() as conn:
+        rows = dict(conn.execute(select(settings.c.scope, settings.c.value)
+                                 .where(settings.c.key == "env.MRP_GITHUB_APP_ID")).all())
+    assert rows == {"*": "instance", tsh: "123456"}
+    with engine.begin() as conn:
+        report = _run(conn, keyring)
+    assert ("env.MRP_GITHUB_APP_ID", "unchanged") in report.entries["settings"]
+
+
+def test_a_repository_under_another_team_moves(engine, keyring):
+    clock = Clock(utcnow())
+    with engine.begin() as conn:
+        other, project_id = new_id(), new_id()
+        conn.execute(teams.insert().values(id=other, name="elsewhere", created_at=clock()))
+        conn.execute(projects.insert().values(id=project_id, team_id=other, name="ios", repo="fs-eng/mobile-ios",
+                                              created_at=clock()))
+        report = _run(conn, keyring)
+    with engine.connect() as conn:
+        moved = conn.execute(select(projects).where(projects.c.repo == "fs-eng/mobile-ios")).all()
+        mobile = conn.execute(select(teams.c.id).where(teams.c.slug == "mobile")).scalar()
+    assert [(r.id, r.team_id) for r in moved] == [(project_id, mobile)]
+    assert ("fs-eng/mobile-ios", "moved to this team") in report.entries["projects"]
+
+
+def test_generated_passwords_and_demotions_and_the_replay_floor(engine, keyring):
+    clock = Clock(utcnow())
+    user_id, _ = add_user(engine, keyring, clock, "stephan", is_admin=True)
+    with engine.begin() as conn:
+        conn.execute(users.update().where(users.c.id == user_id).values(last_totp_step=9))
+    dashboard = _dashboard_users(hash_password(PASSWORD, cost=COST))
+    dashboard[0].role = "user"
+    dashboard[2].must_change_password = True
+    with engine.begin() as conn:
+        report = _run(conn, keyring, dashboard=dashboard)
+    with engine.connect() as conn:
+        rows = {r.username: r for r in conn.execute(select(users))}
+    assert rows["stephan"].is_admin and rows["stephan"].last_totp_step == 9
+    assert ("stephan", "admin kept; demote in the UI") in report.entries["users"]
+    assert rows["newbie"].password_hash is None
+    assert any("newbie still had a generated password" in w for w in report.warnings)
+
+    dashboard[0].last_totp_step = 40
+    with engine.begin() as conn:
+        _run(conn, keyring, dashboard=dashboard)
+    with engine.connect() as conn:
+        assert conn.execute(select(users.c.last_totp_step).where(users.c.id == user_id)).scalar() == 40

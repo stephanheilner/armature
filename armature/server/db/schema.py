@@ -77,6 +77,10 @@ def scope_of(team_id: str | None) -> str:
     return INSTANCE_SCOPE if team_id is None else team_id
 
 
+def _scope_from_team(context) -> str:
+    return scope_of(context.get_current_parameters().get("team_id"))
+
+
 # MySQL TEXT stops at 64 KB, too small for a long prompt or workflow body.
 LongText = Text().with_variant(MEDIUMTEXT(), "mysql")
 
@@ -102,6 +106,7 @@ teams = Table(
     "teams", metadata,
     _id(),
     Column("name", name_type(191), nullable=False, unique=True),
+    Column("slug", String(40), unique=True),
     _ts("created_at"),
 )
 
@@ -113,6 +118,7 @@ projects = Table(
     Column("platform", String(32)),
     Column("enabled_workflows", JSON),
     Column("branch_filters", JSON),
+    Column("repo", String(191)),
     _ts("created_at"),
     UniqueConstraint("team_id", "name"),
 )
@@ -203,12 +209,14 @@ audit = Table(
 workflows = Table(
     "workflows", metadata,
     _id(),
-    Column("team_id", String(36), ForeignKey("teams.id"), nullable=False),
+    Column("team_id", String(36), ForeignKey("teams.id"), index=True),
+    Column("scope", String(36), nullable=False, default=_scope_from_team),
     Column("name", name_type(191), nullable=False),
     Column("current_version", Integer, nullable=False, default=0),
     _ts("created_at"),
     _ts("updated_at"),
-    UniqueConstraint("team_id", "name"),
+    UniqueConstraint("scope", "name"),
+    CheckConstraint(SCOPE_MATCHES_TEAM, name="scope"),
 )
 
 documents = Table(
@@ -278,10 +286,14 @@ secrets = Table(
 
 settings = Table(
     "settings", metadata,
-    Column("key", String(191), primary_key=True),
+    Column("team_id", String(36), ForeignKey("teams.id")),
+    Column("scope", String(36), nullable=False, default=_scope_from_team, server_default=INSTANCE_SCOPE),
+    Column("key", String(191), nullable=False),
     Column("value", JSON),
     _ts("updated_at", nullable=True),
     Column("updated_by", String(36)),
+    PrimaryKeyConstraint("scope", "key"),
+    CheckConstraint(SCOPE_MATCHES_TEAM, name="scope"),
 )
 
 triggers = Table(
