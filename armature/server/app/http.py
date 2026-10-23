@@ -65,15 +65,17 @@ class SecurityHeaders:
 class BodyLimit:
     """Refuses a request body over the limit, declared or streamed."""
 
-    def __init__(self, app, limit: int = BODY_LIMIT):
+    def __init__(self, app, limit: int = BODY_LIMIT, overrides: dict[str, int] | None = None):
         self.app = app
         self.limit = limit
+        self.overrides = overrides or {}
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
+        limit = self.overrides.get(scope.get("path", ""), self.limit)
         for name, value in scope.get("headers", []):
-            if name == b"content-length" and value.isdigit() and int(value) > self.limit:
+            if name == b"content-length" and value.isdigit() and int(value) > limit:
                 return await error_response(413, "Request body too large.")(scope, receive, send)
         received = 0
 
@@ -82,7 +84,7 @@ class BodyLimit:
             message = await receive()
             if message["type"] == "http.request":
                 received += len(message.get("body", b""))
-                if received > self.limit:
+                if received > limit:
                     raise StarletteHTTPException(413, "Request body too large.")
             return message
 

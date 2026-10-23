@@ -56,6 +56,10 @@ class ServerConfig(BaseModel):
     master_key: str = Field(default_factory=lambda: f"file:{Path('~/.armature/master.key').expanduser()}")
     oidc: OIDCConfig | None = None
     password_login: bool = True
+    events_socket: str = "~/.armature/server-events.sock"
+    lost_after_minutes: int = Field(default=30, ge=1)
+    sse_per_user: int = Field(default=8, ge=1)
+    sse_total: int = Field(default=500, ge=1)
 
     @field_validator("base_path")
     @classmethod

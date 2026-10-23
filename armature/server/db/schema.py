@@ -331,12 +331,21 @@ runs = Table(
     Column("input_tokens", BigInteger),
     Column("output_tokens", BigInteger),
     Column("summary", JSON),
+    Column("workflow_name", String(191)),
+    Column("actor", String(191)),
+    Column("trigger_ref", JSON),
+    Column("runner_key_id", String(36)),
+    Column("error", Text),
+    _ts("last_event_at", nullable=True),
     Index(None, "team_id", "started_at"),
+    Index(None, "status"),
 )
 
+# step_key is parent_step/step_id for a subagent's or nested run's step, so it never merges into the parent's row.
 run_steps = Table(
     "run_steps", metadata,
     Column("run_id", String(36), ForeignKey("runs.id"), nullable=False),
+    Column("step_key", String(191), nullable=False),
     Column("step_id", String(191), nullable=False),
     Column("status", String(16), nullable=False),
     _ts("started_at", nullable=True),
@@ -346,7 +355,8 @@ run_steps = Table(
     Column("output_tokens", BigInteger),
     Column("error", Text),
     Column("output", JSON),
-    PrimaryKeyConstraint("run_id", "step_id"),
+    Column("parent_step", String(191)),
+    PrimaryKeyConstraint("run_id", "step_key"),
 )
 
 # Only the primary key: the event writer does one batched insert a second.
@@ -372,5 +382,28 @@ findings = Table(
     Column("severity", String(16)),
     Column("disposition", String(32)),
     Column("body", Text),
+    Column("title", Text),
+    Column("step_id", String(191)),
+    _ts("created_at", nullable=True),
     Index(None, "project_id", "finding_key"),
+)
+
+runner_keys = Table(
+    "runner_keys", metadata,
+    _id(),
+    Column("team_id", String(36), ForeignKey("teams.id"), nullable=False, index=True),
+    Column("name", name_type(191), nullable=False),
+    Column("key_hmac", String(64), nullable=False, unique=True),
+    Column("created_by", String(36)),
+    _ts("created_at"),
+    _ts("last_used_at", nullable=True),
+    _ts("revoked_at", nullable=True),
+)
+
+run_tokens = Table(
+    "run_tokens", metadata,
+    Column("token_hmac", String(64), primary_key=True),
+    Column("run_id", String(36), ForeignKey("runs.id"), nullable=False, index=True),
+    Column("team_id", String(36), nullable=False),
+    _ts("expires_at"),
 )

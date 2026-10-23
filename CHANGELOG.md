@@ -37,6 +37,75 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   (docs/platform/DEPLOY.md). `oidc.group_roles` now maps a group to a list of
   `{scope_kind, scope, role}` grants. Names are case-sensitive and usernames
   case-insensitive on every database.
+- **Run events and `armature emit`.** A run sends `run_start`, `run_end`,
+  `step_start`, `step_end`, `step_failed`, `step_skipped`, `retry`, and
+  per-LLM-stage `cost` events, alongside any `on_event` callback. It uses the
+  emitter passed to `Harness(emitter=...)`, else `ARMATURE_EVENTS` (`unix:`
+  socket or `http(s)://` URL) and `ARMATURE_EVENTS_TOKEN`, else registers
+  itself with `ARMATURE_SERVER` using `ARMATURE_RUNNER_KEY`, and runs
+  without events if that fails. Subagent runs and runs started inside a
+  step tag their events with `parent_step` and send no `run_start` or
+  `run_end`, and fan-out branches carry `branch` and `branches`. Script steps
+  get the run's `ARMATURE_EVENTS`, `ARMATURE_EVENTS_TOKEN`,
+  `ARMATURE_RUN_ID`, and `ARMATURE_STEP_ID`, and never the runner key.
+  `armature emit <kind>`, or the faster `python -m armature.events <kind>`,
+  sends one event from a script. `--stream-claude` sits in a Claude Code
+  `stream-json` pipe, copies every line through unchanged, and emits the
+  session's tool calls, results, text, and cost. Emitting never blocks or
+  raises: a full queue drops `text`, `log`, and `progress` first and sends a
+  `dropped` count, `text` is coalesced to four a second per step, and known
+  token patterns and the values of variables named in `ARMATURE_REDACT_ENV`
+  are redacted, as are the run's own token, the runner key, and any
+  `ark_` key. Every event carries an `eid` that stays the same across
+  retries, so the server can drop repeats. HTTP batches stay under 900 KB,
+  and a 413 splits the batch instead of dropping events. A running stage
+  sends a `progress` heartbeat every 60 seconds. Registration gives up after
+  3 seconds and then waits 5 minutes before trying that server again. Event
+  endpoints and registration refuse plain `http://` to a non-loopback host,
+  and the Unix socket is used only when `ARMATURE_SERVER` is on loopback.
+  `import armature` no longer imports litellm or the engine until
+  `armature.Harness` or a subpackage is used.
+- **Live runs on the server.** A team lead creates runner keys
+  (`ark_...`, shown once, stored as an HMAC, step-up to create or delete)
+  under `/api/teams/{id}/runner-keys`. A runner registers a run with
+  `POST /api/runner/runs` and gets a per-run event token, valid 48 hours or
+  until `run_end`, and the endpoints to send to: a mode 0600 Unix datagram
+  socket (`events_socket`, default `~/.armature/server-events.sock`) or
+  `POST /api/events` with NDJSON up to 1 MB. The server takes the run and
+  team only from the token, caps each event at 64 KB and each run at 50,000
+  events and 500 a second, redacts token patterns and the exact value of
+  every secret the team can see, numbers events per run from 1, and
+  broadcasts each one before a single writer stores it, flushing every
+  second or 500 events in one transaction. Run, step, cost, finding, and
+  end rows follow from the events, and a run silent for
+  `lost_after_minutes` (60) is marked `lost` until it speaks again.
+  `GET /api/runs/{id}` and `/api/runs/{id}/events` (forward with `after`,
+  backward with `before`) read history, and `/api/runs/{id}/stream` and
+  `/api/stream/runs` stream it as Server-Sent Events with `Last-Event-ID`
+  resume, a heartbeat, and per-user (`sse_per_user`) and per-process
+  (`sse_total`) caps. SQLite now runs in WAL mode. Measured with
+  `python -m tests.server.live_load` (20 runs at 200 events a second, 100
+  viewers): p99 from emit to viewer about 320 ms on SQLite, Postgres, and
+  MySQL, with nothing dropped.
+- **`armature server import-ops <ops-dir>`** copies an armature-ops tree into
+  the database: teams (with their slug) and projects from `teams.json`,
+  each `specs/*.yml` as an instance-level workflow with its template lint
+  in the version note, each `roles.json` entry as a role document in
+  Markdown with YAML front matter, the other prompts as prompt documents,
+  the behavior JSON files and non-secret `ops.env` keys as settings,
+  secret-like keys and the GitHub App key file as sealed secrets, Bedrock
+  and Claude subscription providers with model aliases, and the
+  dashboard's users with their scrypt hashes and their TOTP secrets
+  resealed under the new master key. `MRP_*` and `LINEAR_API_KEY` belong to
+  the `talentstorehouse` team. A re-run updates in place and adds a version
+  only when a body changed, every write is audited as `import-ops`, and
+  `--dry-run` prints the report, which names what changed and never a
+  value, then rolls back. Migration 0003 adds `teams.slug`,
+  `projects.repo`, instance-level workflows (`team_id` NULL, scope `*`),
+  and scoped settings. `GET /api/workflows`, `/api/workflows/{id}`,
+  `/api/documents`, `/api/documents/{id}`, `/api/teams/{id}/providers`,
+  and the admin-only `/api/settings` read them, and the UI shows
+  workflows, roles and prompts, and each team's providers.
 - **`reasoning_effort` on model tiers and roles.** A tier can set
   `reasoning_effort: low | medium | high | xhigh | max`, and a role can
   override it, resolved role → tier → omitted like `temperature` and
@@ -58,6 +127,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- Script steps now get `ARMATURE_RUN_ID` and `ARMATURE_STEP_ID` in their
+  environment. No process Armature starts, whether a script step, the
+  `shell` tool, or a docker, pip, or patch call, inherits
+  `ARMATURE_RUNNER_KEY`, or a parent run's `ARMATURE_EVENTS` and
+  `ARMATURE_EVENTS_TOKEN` unless they belong to the current run.
 - The litellm floor is now 1.101.0, the version verified to map
   `reasoning_effort` to adaptive thinking on Claude.
 

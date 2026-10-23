@@ -110,6 +110,7 @@ testpaths = ["tests"]
 markers = [
     "docker: marks tests that require a running Docker daemon (skipped without one)",
     "db_matrix: runs against Postgres or MySQL when ARMATURE_TEST_PG_URL or ARMATURE_TEST_MYSQL_URL is set",
+    "load: live-event load test, skipped unless ARMATURE_LOAD=1",
 ]
 
 [tool.hatch.build.targets.wheel]

@@ -5,6 +5,7 @@ import os
 import signal
 import subprocess
 from typing import Any
+from armature.events.env import child_env
 from armature.nodes.base import BaseNode
 from armature.runtime.templating import text_env
 from armature.spec.models import Adapter
@@ -12,8 +13,9 @@ from armature.permissions.permissions import classify_shell_command, requires_ap
 
 
 class ScriptNode(BaseNode):
-    def __init__(self, adapter: Adapter):
+    def __init__(self, adapter: Adapter, env: dict[str, str] | None = None):
         self._adapter = adapter
+        self._env = env or {}
 
     async def execute(self, context: dict[str, Any]) -> Any:
         cmd = self._adapter.cmd or ""
@@ -27,7 +29,7 @@ class ScriptNode(BaseNode):
                 "Use a HumanGateNode before this stage or register a pre-tool hook."
             )
 
-        env = {**os.environ, "ARMATURE_CONTEXT": json.dumps(context, default=str)}
+        env = child_env({**self._env, "ARMATURE_CONTEXT": json.dumps(context, default=str)})
         proc = await asyncio.create_subprocess_shell(
             cmd,
             stdout=asyncio.subprocess.PIPE,

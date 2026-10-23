@@ -1,4 +1,4 @@
-"""`armature server` commands: init, migrate, create-admin, and run."""
+"""`armature server` commands: init, migrate, create-admin, run, and import-ops."""
 from __future__ import annotations
 
 import getpass
@@ -222,4 +222,47 @@ def run(config: Path | None = ConfigOption):
     typer.echo(f"Armature server on http://{cfg.host}:{cfg.port}{cfg.base_path}/ (public origin {cfg.public_origin})")
     # proxy_headers off: the app trusts X-Real-IP only from a loopback peer and never X-Forwarded-For.
     uvicorn.run(app, host=cfg.host, port=cfg.port, workers=1, proxy_headers=False, server_header=False,
-                log_level="info")
+                log_level="info", timeout_graceful_shutdown=5)
+
+
+@server_app.command("import-ops")
+def import_ops_cmd(
+    ops_dir: Path = typer.Argument(..., help="An armature-ops checkout to read. Nothing in it is written"),
+    config: Path | None = ConfigOption,
+    dry_run: bool = typer.Option(False, "--dry-run", help="Print the report and roll every change back"),
+    skip_users: bool = typer.Option(False, "--skip-users", help="Leave the dashboard's users out"),
+):
+    """Copy teams, workflows, roles, prompts, settings, secrets, providers, and dashboard users into the database."""
+    from armature.server.db import make_engine, utcnow
+    from armature.server.import_ops import dashboard_source, import_ops
+
+    cfg = _load(config)
+    keyring = _keyring(cfg)
+    users_source, session_key = None, None
+    if not skip_users:
+        users_source, session_key, reason = dashboard_source(ops_dir)
+        if reason:
+            typer.echo(f"Users skipped: {reason}.", err=True)
+    engine = make_engine(cfg.database_url)
+    try:
+        with engine.connect() as conn:
+            transaction = conn.begin()
+            try:
+                report = import_ops(conn, keyring, ops_dir, now=utcnow(), users_source=users_source,
+                                    session_key=session_key)
+            except ValueError as exc:
+                transaction.rollback()
+                _fail(f"Import failed, nothing was written: {exc}")
+            except Exception as exc:  # noqa: BLE001
+                transaction.rollback()
+                # The class alone, because SQL errors echo parameters and driver errors connection strings.
+                _fail(f"Import failed, nothing was written: {exc.__class__.__name__}")
+            if dry_run:
+                transaction.rollback()
+            else:
+                transaction.commit()
+    finally:
+        engine.dispose()
+    for line in report.lines():
+        typer.echo(line)
+    typer.echo("Dry run: nothing was written." if dry_run else "Import committed.")

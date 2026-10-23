@@ -68,14 +68,16 @@ export function when(timestamp) {
 
 const STATUS_TONE = {
   succeeded: 'ok', success: 'ok', done: 'ok', completed: 'ok',
-  failed: 'bad', error: 'bad', died: 'bad',
-  running: 'running', queued: 'unknown', canceled: 'unknown', cancelled: 'unknown',
+  failed: 'bad', error: 'bad', died: 'bad', lost: 'warn',
+  running: 'running', queued: 'queued', canceled: 'unknown', cancelled: 'unknown',
 };
+
+export const statusTone = (status) => STATUS_TONE[status] || 'unknown';
 
 export const statusText = (status) => (status ? status.charAt(0).toUpperCase() + status.slice(1).replace(/_/g, ' ') : 'Unknown');
 
 export function statusChip(status) {
-  return element('span', { class: `state state-${STATUS_TONE[status] || 'unknown'}` }, statusText(status));
+  return element('span', { class: `state state-${statusTone(status)}` }, statusText(status));
 }
 
 export function link(href, text, attributes = {}) {
@@ -86,6 +88,13 @@ export function pageHeader(title, ...extras) {
   return element('header', { class: 'page' }, element('h1', {}, title), ...extras);
 }
 
+export function tableRow(headers, row) {
+  return element('tr', {}, row.map((cell, columnIndex) => {
+    const [label, cellClass] = Array.isArray(headers[columnIndex]) ? headers[columnIndex] : [headers[columnIndex], null];
+    return element('td', { class: cellClass, 'data-label': typeof label === 'string' && label ? label : null }, cell);
+  }));
+}
+
 export function table(headers, rows) {
   const tableNode = element('table');
   const head = element('thead', {}, element('tr', {}, headers.map((header) => {
@@ -93,12 +102,7 @@ export function table(headers, rows) {
     return element('th', { class: cellClass, scope: 'col' }, label);
   })));
   const body = element('tbody');
-  for (const row of rows) {
-    body.append(element('tr', {}, row.map((cell, columnIndex) => {
-      const [label, cellClass] = Array.isArray(headers[columnIndex]) ? headers[columnIndex] : [headers[columnIndex], null];
-      return element('td', { class: cellClass, 'data-label': typeof label === 'string' && label ? label : null }, cell);
-    })));
-  }
+  for (const row of rows) body.append(tableRow(headers, row));
   tableNode.append(head, body);
   return tableNode;
 }

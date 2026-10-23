@@ -7,6 +7,7 @@ from pathlib import Path
 
 from sqlalchemy import Engine, create_engine, event
 
+from armature.server.db import defs_schema  # noqa: F401  registers migration 0003's columns
 from armature.server.db.schema import metadata
 
 MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"
@@ -24,9 +25,13 @@ def make_engine(url: str) -> Engine:
     engine = create_engine(url, future=True)
     if engine.dialect.name == "sqlite":
         @event.listens_for(engine, "connect")
-        def _foreign_keys(dbapi_connection, _record) -> None:
+        def _pragmas(dbapi_connection, _record) -> None:
             cursor = dbapi_connection.cursor()
             cursor.execute("PRAGMA foreign_keys=ON")
+            # WAL lets the event writer commit while request threads read.
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute("PRAGMA busy_timeout=5000")
             cursor.close()
     return engine
 

@@ -22,7 +22,25 @@ function addProjectForm(team, reload) {
   return element('div', {}, form, status);
 }
 
-function teamCard(team, projects, reload) {
+const KIND_LABEL = { bedrock: 'Bedrock', anthropic: 'Anthropic API', 'claude-subscription': 'Claude subscription', 'openai-compatible': 'OpenAI-compatible', ollama: 'Ollama' };
+
+// Config holds only names, such as the secret a provider reads. The secret's value never reaches the page.
+function providersSection(providers) {
+  if (!providers.length) return null;
+  return element('div', {},
+    element('h3', {}, 'Model providers'),
+    table(['Provider', 'Region', 'Credential', 'Aliases'], providers.map((provider) => [
+      KIND_LABEL[provider.kind] || provider.kind,
+      provider.config?.region || '—',
+      element('span', {}, provider.config?.credential_secret ? element('span', { class: 'mono' }, provider.config.credential_secret) : 'None', ' ',
+        provider.configured ? element('span', { class: 'state state-ok' }, 'Configured') : element('span', { class: 'state state-warn' }, 'Not configured')),
+      Object.keys(provider.aliases || {}).length
+        ? element('div', {}, Object.entries(provider.aliases).map(([alias, model]) => element('div', {}, element('span', { class: 'mono' }, alias), ` ${model}`)))
+        : '—',
+    ])));
+}
+
+function teamCard(team, projects, providers, reload) {
   const canManage = canManageTeam(team.id);
   return card(
     element('h2', { class: 'inline' }, team.name),
@@ -30,6 +48,7 @@ function teamCard(team, projects, reload) {
       link(hashFor('project', [project.id]), project.name), project.platform || '—',
     ])) : empty('No projects yet.'),
     canManage ? addProjectForm(team, reload) : null,
+    providersSection(providers),
   );
 }
 
@@ -61,9 +80,12 @@ async function list(root) {
     }
     const projectLists = await Promise.all(teams.map((team) => api(`/api/teams/${encodeURIComponent(team.id)}/projects`)
       .then((payload) => listOf(payload, 'projects')).catch(() => [])));
+    // Project-only members cannot read a team's providers, so a refusal just hides the section.
+    const providerLists = await Promise.all(teams.map((team) => api(`/api/teams/${encodeURIComponent(team.id)}/providers`)
+      .then((payload) => listOf(payload, 'providers')).catch(() => [])));
     clear(body);
     if (!teams.length) body.append(card(empty(isAdmin() ? 'No teams yet. Add the first one below.' : 'You are not on any team yet.')));
-    teams.forEach((team, index) => body.append(teamCard(team, projectLists[index], reload)));
+    teams.forEach((team, index) => body.append(teamCard(team, projectLists[index], providerLists[index], reload)));
     if (isAdmin()) body.append(addTeamForm(reload));
   }
 

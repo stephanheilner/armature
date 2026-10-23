@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from sqlalchemy import Connection, and_, false, or_, select, true
 from sqlalchemy.sql.elements import ColumnElement
 
-from armature.server.db.schema import memberships, projects, teams
+from armature.server.db.schema import memberships, projects, runs, teams
 
 RANK = {"viewer": 1, "contributor": 2, "project_lead": 3, "team_lead": 4, "admin": 5}
 GRANTABLE = ("team_lead", "project_lead", "contributor", "viewer")
@@ -144,3 +144,15 @@ def membership_target(conn: Connection, membership_id: str) -> Target:
     if row is None:
         raise NotFound("No such membership.")
     return scope_target(conn, row.scope_kind, row.scope_id)
+
+
+def run_target(conn: Connection, run_id: str) -> Target:
+    row = conn.execute(select(runs.c.team_id, runs.c.project_id).where(runs.c.id == run_id)).first()
+    if row is None:
+        raise NotFound("No such run.")
+    return Target(team_id=row.team_id, project_id=row.project_id)
+
+
+def in_scope(scope: Scope, team_id: str, project_id: str | None) -> bool:
+    """``scope_clause`` for one row already in memory."""
+    return scope.all or team_id in scope.team_ids or (project_id is not None and project_id in scope.project_ids)

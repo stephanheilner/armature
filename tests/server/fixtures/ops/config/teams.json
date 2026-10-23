@@ -1,0 +1,27 @@
+{
+  "teams": [
+    {
+      "id": "mobile",
+      "name": "Mobile",
+      "auto_fix": true,
+      "repos": [
+        {"slug": "fs-eng/mobile-ios", "platform": "ios",
+         "pipelines": {"pr_review": true, "daily_review": true, "fix": "yes", "discuss": false},
+         "review_branches": ["master", "bad..branch"]},
+        {"slug": "fs-eng/android-tree", "platform": "android", "pipelines": {"pr_review": true}},
+        {"slug": "fs-eng/web", "platform": "cobol", "pipelines": {"pr_review": true}}
+      ]
+    },
+    {
+      "id": "talentstorehouse",
+      "name": "TalentStorehouse",
+      "repos": [
+        {"slug": "MountainRiverPartners/talentstorehouse", "platform": "dotnet",
+         "pipelines": {"pr_review": true, "fix": true}, "review_branches": ["main"]},
+        {"slug": "fs-eng/mobile-ios", "platform": "ios", "pipelines": {"pr_review": true}}
+      ]
+    },
+    {"id": "product-prototype", "name": "Product Prototype", "repos": []},
+    {"id": "Bad Id", "name": "Refused", "repos": []}
+  ]
+}

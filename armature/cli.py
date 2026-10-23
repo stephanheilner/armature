@@ -1938,6 +1938,16 @@ def channels_start(
     typer.echo("(Live channel server not yet implemented — spec validated successfully.)")
 
 
+@app.command(
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+    add_help_option=False,
+)
+def emit(ctx: typer.Context) -> None:
+    """Send an event to ARMATURE_EVENTS (same as `python -m armature.events`)."""
+    from armature.events.cli import main
+    raise typer.Exit(main(list(ctx.args)))
+
+
 @app.command()
 def demo() -> None:
     """Run the live quality witness — test suite + capability overview for new developers."""

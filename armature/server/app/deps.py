@@ -121,6 +121,10 @@ def by_project(param: str = "project_id") -> ScopeFrom:
     return lambda conn, params: rbac.project_target(conn, params[param])
 
 
+def by_run(param: str = "run_id") -> ScopeFrom:
+    return lambda conn, params: rbac.run_target(conn, params[param])
+
+
 def by_membership(param: str = "membership_id") -> ScopeFrom:
     return lambda conn, params: rbac.membership_target(conn, params[param])
 

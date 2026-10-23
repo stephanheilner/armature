@@ -53,7 +53,7 @@ SECRET_VALUE_MAX = 32 * 1024
 LIMIT_DEFAULT = 50
 LIMIT_MAX = 200
 LOOKUP_LIMIT = 20
-RUN_STATUSES = ("queued", "running", "succeeded", "failed", "canceled")
+RUN_STATUSES = ("queued", "running", "succeeded", "failed", "canceled", "lost")
 
 
 class NameBody(BaseModel):
@@ -512,8 +512,10 @@ def list_runs(request: Request, team: str | None = None, project: str | None = N
               before: str | None = None, limit: int = Query(LIMIT_DEFAULT, ge=1, le=LIMIT_MAX),
               session: Session = Depends(signed_in)) -> dict[str, Any]:
     scope = rbac.visible_scope(_access(request, session))
-    query = (select(runs.c.id, runs.c.team_id, runs.c.project_id, workflows.c.name.label("workflow"), runs.c.status,
-                    runs.c.triggered_by, runs.c.started_at, runs.c.finished_at, runs.c.cost_usd)
+    query = (select(runs.c.id, runs.c.team_id, runs.c.project_id,
+                    func.coalesce(workflows.c.name, runs.c.workflow_name).label("workflow"), runs.c.status,
+                    func.coalesce(runs.c.triggered_by, runs.c.actor).label("triggered_by"), runs.c.started_at,
+                    runs.c.finished_at, runs.c.cost_usd)
              .select_from(runs.outerjoin(workflows, workflows.c.id == runs.c.workflow_id))
              .where(rbac.scope_clause(scope, runs.c.team_id, runs.c.project_id)))
     if team:

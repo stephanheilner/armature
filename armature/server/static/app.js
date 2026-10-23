@@ -5,6 +5,7 @@ import { isSso, navFor, setSession, ssoStepUpPath, user } from './session.js';
 
 const NAV_GROUPS = [
   ['Work', [['runs', 'Runs', 'list'], ['teams', 'Teams', 'team']]],
+  ['Definitions', [['workflows', 'Workflows', 'flow'], ['roles', 'Roles and prompts', 'doc']]],
   ['Manage', [['users', 'Users', 'people'], ['secrets', 'Secrets', 'key']]],
   ['You', [['account', 'Account', 'person']]],
 ];
@@ -14,6 +15,8 @@ const ICON_PATHS = {
   list: 'M5 4h9M5 8h9M5 12h9M2 4h.01M2 8h.01M2 12h.01',
   team: 'M2 3h12v10H2zM2 6h12M6 6v7',
   people: 'M6 7a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5zM1.5 14c0-2.5 2-4.5 4.5-4.5s4.5 2 4.5 4.5M11 2.5a2.5 2.5 0 0 1 0 4.5M12.5 9.8c1.2.6 2 2 2 4.2',
+  flow: 'M3 2.5h4v3H3zM9 10.5h4v3H9zM5 5.5v3.5h6v1.5',
+  doc: 'M4 1.5h5.5L12 4v10.5H4zM9.5 1.5V4H12M6 7.5h4M6 10h4',
   key: 'M10.5 1.5a4 4 0 1 1-3.2 6.4L2 13.2V15h2.5v-1.5H6V12h1.5l1-1A4 4 0 0 1 10.5 1.5zM11.5 4.5h.01',
   person: 'M8 7.5a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM2.5 15c0-3 2.5-5.5 5.5-5.5s5.5 2.5 5.5 5.5',
   menu: 'M2 4h12M2 8h12M2 12h12',
@@ -33,17 +36,23 @@ function icon(name) {
 
 const VIEW_LOADERS = {
   runs: () => import('./views/runs.js'),
+  run: () => import('./views/run.js'),
   teams: () => import('./views/teams.js'),
   project: () => import('./views/teams.js'),
   users: () => import('./views/users.js'),
   secrets: () => import('./views/secrets.js'),
+  workflows: () => import('./views/workflows.js'),
+  workflow: () => import('./views/workflows.js'),
+  roles: () => import('./views/roles.js'),
+  document: () => import('./views/roles.js'),
   account: () => import('./views/account.js'),
 };
 
-const NAV_PARENT = { project: 'teams' };
+const NAV_PARENT = { project: 'teams', run: 'runs', workflow: 'workflows', document: 'roles' };
 
 let allowedViews = [];
 let renderSequence = 0;
+let viewController = null;
 
 async function route() {
   const parsed = parseHash(location.hash);
@@ -55,6 +64,10 @@ async function route() {
     else navLink.removeAttribute('aria-current');
   }
   const sequence = ++renderSequence;
+  // Ends the last view's streams and timers.
+  viewController?.abort();
+  const controller = new AbortController();
+  viewController = controller;
   const isAllowed = allowedViews.includes(NAV_PARENT[name] || name);
   const loadView = VIEW_LOADERS[name];
   if (!loadView || !isAllowed) {
@@ -68,7 +81,7 @@ async function route() {
     const viewModule = await loadView();
     if (sequence !== renderSequence) return;
     const viewRoot = element('div', { class: 'wrap' });
-    await viewModule.render(viewRoot, { name, args, query });
+    await viewModule.render(viewRoot, { name, args, query, signal: controller.signal });
     if (sequence !== renderSequence) return;
     clear(main).append(viewRoot);
     document.title = `${viewRoot.querySelector('h1')?.textContent || 'Armature'} | Armature`;
