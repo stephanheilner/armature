@@ -33,7 +33,14 @@ def _read(request: Request, session: Session, team: str | None, compute) -> dict
 def get_display(request: Request, session: Session = Depends(signed_in)) -> dict[str, Any]:
     with server(request).engine.connect() as conn:
         scope = rbac.visible_scope(rbac.load_access(conn, session.user_id, bool(session.user.is_admin)))
-        return {"display": display.load(conn), "workflows": stats.workflow_names(conn, scope)}
+        names = stats.workflow_names(conn, scope)
+        shown = dict(display.load(conn))
+        # Labels are instance-wide, so a member only learns about workflows their own teams can see.
+        if not session.user.is_admin:
+            visible = set(names)
+            shown["workflow_labels"] = {name: label for name, label in (shown.get("workflow_labels") or {}).items()
+                                        if name in visible}
+        return {"display": shown, "workflows": names}
 
 
 @router.get("/api/overview")

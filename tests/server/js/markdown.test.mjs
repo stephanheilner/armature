@@ -201,3 +201,12 @@ test('outputs read as text, JSON pretty-prints, and links and sizes are vetted',
     post_url: 'https://github.com/o/r/pull/1#review' }), [{ label: 'PR', url: 'https://github.com/o/r/pull/1' }, { label: 'Posted result', url: 'https://github.com/o/r/pull/1#review' }]);
   assert.deepEqual([byteSize(10), byteSize(2048), byteSize(3 * 1024 * 1024)], ['10 B', '2.0 KB', '3.00 MB']);
 });
+
+test('hostile unterminated links stay fast', async () => {
+  const { inline } = await import('../../../armature/server/static/markdown.js');
+  for (const text of ['[a](x ('.repeat(150000), '[a](<'.repeat(200000), '['.repeat(1000000)]) {
+    const started = Date.now();
+    inline(text);
+    assert.ok(Date.now() - started < 2000);
+  }
+});

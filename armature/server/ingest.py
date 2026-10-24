@@ -80,6 +80,9 @@ CANCELED = frozenset({"canceled", "cancelled"})
 TRUNCATED = "_truncated"
 UPLOAD = re.compile(r"^[0-9a-f]{16}$")
 MAX_UPLOADS = 4
+# Per run, so a token holder cannot fill the database with distinctly named artifacts.
+MAX_ARTIFACTS_PER_RUN = 50
+MAX_ARTIFACT_BYTES_PER_RUN = 16 * 1024 * 1024
 
 ACCEPTED, REJECTED, DUPLICATE = "accepted", "rejected", "duplicate"
 
@@ -206,6 +209,7 @@ class RunState:
     branches: dict[str, Branches] = field(default_factory=dict)
     eids: OrderedDict[str, int] = field(default_factory=OrderedDict)
     uploads: OrderedDict[str, Upload] = field(default_factory=OrderedDict)
+    artifact_sizes: dict[str, int] = field(default_factory=dict)
 
     @property
     def ended(self) -> bool:
@@ -536,6 +540,12 @@ class LiveHub:
         if step_id is not None:
             step_id = utf8(_scrub(step_id, state.secrets))[:191]
         size = len(content.encode("utf-8"))
+        sizes = state.artifact_sizes
+        if name not in sizes and len(sizes) >= MAX_ARTIFACTS_PER_RUN:
+            return REJECTED
+        if sum(sizes.values()) - sizes.get(name, 0) + size > MAX_ARTIFACT_BYTES_PER_RUN:
+            return REJECTED
+        sizes[name] = size
         self._accept(state, "artifact", step_id, ts, now, {"name": name, "media_type": media_type, "size": size})
         self.writer.add_artifact(state.run_id, {"name": name, "step_id": step_id, "media_type": media_type,
                                                 "content": content, "size": size, "created_at": now})

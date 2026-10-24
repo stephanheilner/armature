@@ -177,8 +177,9 @@ def test_display_settings_need_admin_and_step_up(engine, keyring, seeded):
     assert admin.post("/api/settings", json=team_scoped, headers=mutation(csrf)).status_code == 400
     before = viewer.get("/api/display").json()
     assert before["display"]["timezone"] == "America/Denver"
-    assert before["display"]["workflow_labels"]["pr-merged"]["hidden"] is True
     assert before["workflows"] == ["code-review", "jira-work", "unused"]
+    assert "pr-merged" not in before["display"]["workflow_labels"]
+    assert admin.get("/api/display").json()["display"]["workflow_labels"]["pr-merged"]["hidden"] is True
     for key, value in (("display.timezone", "UTC"), ("display.show_cost", False), ("display.human_multiplier", 10),
                        ("display.workflow_labels", {"code-review": {"label": " Review ", "color": "s2"}})):
         response = admin.post("/api/settings", json={"scope": "instance", "key": key, "value": value},

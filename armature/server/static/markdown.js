@@ -4,6 +4,14 @@ import { element } from './dom.js';
 
 const MAX_DEPTH = 20;
 const MAX_LABEL = 2000;
+// Past this many '[' in one block, the rest read as text, which bounds a hostile report's parse time.
+const MAX_LINK_TRIES = 500;
+
+// Unbounded indexOf per '[' made unterminated links quadratic on a large report.
+function boundedIndex(text, needle, from, until) {
+  const found = text.slice(from, Math.min(text.length, until)).indexOf(needle);
+  return found === -1 ? -1 : from + found;
+}
 const PUNCTUATION = /[!-/:-@[-`{-~]/;
 const LINK_SCHEMES = new Set(['https:', 'http:', 'mailto:']);
 
@@ -313,7 +321,7 @@ function parseLink(text, open) {
   while (text[index] === ' ' || text[index] === '\n') index += 1;
   let dest = '';
   if (text[index] === '<') {
-    const close = text.indexOf('>', index);
+    const close = boundedIndex(text, '>', index, index + MAX_LABEL);
     if (close === -1 || text.slice(index, close).includes('\n')) return null;
     dest = text.slice(index + 1, close);
     index = close + 1;
@@ -340,7 +348,7 @@ function parseLink(text, open) {
   let title = null;
   const quote = { '"': '"', "'": "'", '(': ')' }[text[index]];
   if (quote) {
-    const close = text.indexOf(quote, index + 1);
+    const close = boundedIndex(text, quote, index + 1, index + 1 + MAX_LABEL);
     if (close === -1) return null;
     title = text.slice(index + 1, close);
     index = close + 1;
@@ -371,6 +379,7 @@ function trimUrl(url) {
 
 export function inline(text, depth = 0, misses = memo()) {
   const out = [];
+  let linkTries = 0;
   let buffer = '';
   const flush = () => {
     if (buffer) out.push({ type: 'text', text: buffer });
@@ -419,7 +428,7 @@ export function inline(text, depth = 0, misses = memo()) {
       index = end;
       continue;
     }
-    if (char === '!' && text[index + 1] === '[') {
+    if (char === '!' && text[index + 1] === '[' && linkTries++ < MAX_LINK_TRIES) {
       const link = parseLink(text, index + 1);
       if (link) {
         push({ type: 'image', alt: plainText(nested(link.label)), url: link.dest });
@@ -427,7 +436,7 @@ export function inline(text, depth = 0, misses = memo()) {
         continue;
       }
     }
-    if (char === '[') {
+    if (char === '[' && linkTries++ < MAX_LINK_TRIES) {
       const link = parseLink(text, index);
       if (link) {
         const children = nested(link.label);

@@ -174,6 +174,26 @@ def test_bad_and_oversize_artifacts_are_refused(live, world):
     assert Emitter(f"{live.origin}/api/events", run["token"]).artifact("big.md", "z" * (MAX_ARTIFACT_BYTES + 1)) is False
 
 
+def test_a_run_holds_a_limited_number_and_size_of_artifacts(live, world, monkeypatch):
+    from armature.server import ingest
+    monkeypatch.setattr(ingest, "MAX_ARTIFACTS_PER_RUN", 2)
+    monkeypatch.setattr(ingest, "MAX_ARTIFACT_BYTES_PER_RUN", 10)
+    http = live.client()
+    run = register(http, world["key"])
+
+    def send(name, content):
+        return post(http, run["token"], line("artifact", None, name=name, media_type="text/plain",
+                                             content=content))["accepted"]
+
+    assert send("a.txt", "12345") == 1
+    assert send("b.txt", "1234") == 1
+    assert send("c.txt", "1") == 0
+    assert send("a.txt", "1234567") == 0
+    assert send("a.txt", "123456") == 1
+    live.flush()
+    assert {r.name: r.content for r in _rows(live.engine, run["run_id"])} == {"a.txt": "123456", "b.txt": "1234"}
+
+
 def test_artifact_routes_hide_other_teams(live, world):
     http = live.client()
     run = register(http, world["key"])
