@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from sqlalchemy import and_, delete, exists, func, insert, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
-from armature.server import audit, invites, rbac
+from armature.server import audit, display, invites, rbac
 from armature.server import secrets as secret_store
 from armature.server.app.deps import (
     Granted,
@@ -38,6 +38,7 @@ from armature.server.db.schema import (
     users,
     workflows,
 )
+from armature.server.ingest import about
 from armature.server.users import (
     LastAdmin,
     create_user,
@@ -53,6 +54,7 @@ PLATFORM = re.compile(r"^[a-z0-9-]{1,32}$")
 SECRET_VALUE_MAX = 32 * 1024
 LIMIT_DEFAULT = 50
 LIMIT_MAX = 200
+MAX_WORKFLOW_FILTER = 50
 LOOKUP_LIMIT = 20
 RUN_STATUSES = ("queued", "running", "succeeded", "failed", "canceled", "lost")
 
@@ -511,22 +513,30 @@ def delete_instance_secret(name: str, request: Request,
 @router.get("/api/runs")
 def list_runs(request: Request, team: str | None = None, project: str | None = None, status: str | None = None,
               workflow: str | None = Query(None, max_length=191), with_outputs: bool = False,
-              before: str | None = None,
+              subject: str | None = Query(None, max_length=191), before: str | None = None,
+              workflow_list: str | None = Query(None, alias="workflows", max_length=4000),
+              include_hidden: bool = False,
               limit: int = Query(LIMIT_DEFAULT, ge=1, le=LIMIT_MAX),
               session: Session = Depends(signed_in)) -> dict[str, Any]:
     scope = rbac.visible_scope(_access(request, session))
     query = (select(runs.c.id, runs.c.team_id, runs.c.project_id,
                     func.coalesce(workflows.c.name, runs.c.workflow_name).label("workflow"), runs.c.status,
                     func.coalesce(runs.c.triggered_by, runs.c.actor).label("triggered_by"), runs.c.started_at,
-                    runs.c.finished_at, runs.c.cost_usd)
+                    runs.c.finished_at, runs.c.cost_usd, runs.c.subject, runs.c.summary)
              .select_from(runs.outerjoin(workflows, workflows.c.id == runs.c.workflow_id))
              .where(rbac.scope_clause(scope, runs.c.team_id, runs.c.project_id)))
     if team:
         query = query.where(runs.c.team_id == team)
     if project:
         query = query.where(runs.c.project_id == project)
+    name = func.coalesce(workflows.c.name, runs.c.workflow_name)
     if workflow:
-        query = query.where(func.coalesce(workflows.c.name, runs.c.workflow_name) == workflow)
+        query = query.where(name == workflow)
+    chosen = sorted({w.strip() for w in (workflow_list or "").split(",") if w.strip()})[:MAX_WORKFLOW_FILTER]
+    if chosen:
+        query = query.where(name.in_(chosen))
+    if subject:
+        query = query.where(runs.c.subject == subject)
     if with_outputs:
         query = query.where(exists().where(run_steps.c.run_id == runs.c.id, run_steps.c.parent_step.is_(None),
                                            run_steps.c.output.is_not(None)))
@@ -539,10 +549,15 @@ def list_runs(request: Request, team: str | None = None, project: str | None = N
         query = query.where(clause)
     query = query.order_by(runs.c.started_at.desc(), runs.c.id.desc()).limit(limit)
     with server(request).engine.connect() as conn:
+        if not include_hidden and not chosen and not workflow:
+            hidden = display.hidden(display.load(conn))
+            if hidden:
+                query = query.where(or_(name.is_(None), name.not_in(hidden)))
         rows = conn.execute(query).all()
     listed = [{"id": r.id, "team_id": r.team_id, "project_id": r.project_id, "workflow": r.workflow,
                "status": r.status, "triggered_by": r.triggered_by, "started_at": r.started_at,
-               "finished_at": r.finished_at, "cost_usd": float(r.cost_usd) if r.cost_usd is not None else None}
+               "finished_at": r.finished_at, "cost_usd": float(r.cost_usd) if r.cost_usd is not None else None,
+               **about(r.subject, r.summary)}
               for r in rows]
     return {"runs": listed, "next_before": _next(rows, limit, "started_at")}
 

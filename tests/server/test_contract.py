@@ -8,7 +8,7 @@ from sqlalchemy import insert
 
 from armature.server import secrets as secret_store
 from armature.server.db import new_id
-from armature.server.db.schema import runs
+from armature.server.db.schema import run_artifacts, runs
 from tests.server.app_support import (
     ORIGIN,
     Clock,
@@ -41,6 +41,13 @@ READS = [
     ("views/teams.js", "team", "team", {"id", "name"}),
     ("views/runnerkeys.js", "key", "runner_key", {"id", "name", "created_at", "created_by", "last_used_at"}),
     ("views/runnerkeys.js", "created", "create_runner_key", {"key"}),
+    ("views/run.js", "artifact", "artifact", {"media_type", "content", "size", "created_at", "step_id"}),
+    ("views/overview.js", "overview", "overview", {"running", "alerts", "recent", "reviews_today",
+                                                   "reevaluations_today", "timezone"}),
+    ("views/trends.js", "trend", "trends", {"workflows", "days", "runs_by_workflow", "spend_by_workflow",
+                                            "failure_rate", "verdicts_per_day",
+                                            "man_hours_per_day", "agent_hours_per_day", "slowest_steps",
+                                            "cost_by_role", "timezone"}),
 ]
 
 
@@ -54,8 +61,12 @@ def responses(sqlite_engine, keyring):
     with sqlite_engine.begin() as conn:
         side = _side(conn, "own", clock)
         secret_store.set_secret(conn, keyring, team_id=side.team, name="K", value="v", actor_id=None)
-        conn.execute(insert(runs).values(id=new_id(), team_id=side.team, status="running", started_at=clock(),
+        run_id = new_id()
+        conn.execute(insert(runs).values(id=run_id, team_id=side.team, status="running", started_at=clock(),
                                          cost_usd=Decimal(1)))
+        conn.execute(insert(run_artifacts).values(run_id=run_id, name="review.md", step_id="post",
+                                                  media_type="text/markdown", content="# Review", size=8,
+                                                  created_at=clock()))
     admin_id, _ = add_user(sqlite_engine, keyring, clock, "root", is_admin=True)
     client = make_client(sqlite_engine, keyring, clock)
     csrf = sign_in_as(client, sqlite_engine, keyring, clock, admin_id)
@@ -82,6 +93,9 @@ def responses(sqlite_engine, keyring):
         "team": client.get("/api/teams").json()["teams"][0],
         "create_runner_key": created_key,
         "runner_key": client.get("/api/runner-keys").json()["runner_keys"][0],
+        "artifact": client.get(f"/api/runs/{run_id}/artifacts/review.md").json()["artifact"],
+        "overview": client.get("/api/overview").json(),
+        "trends": client.get("/api/trends").json(),
     }
 
 

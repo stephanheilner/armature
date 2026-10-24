@@ -210,7 +210,7 @@ def test_run_shape_and_paging(sqlite_engine, keyring, clock, world):
     sign_in_as(client, sqlite_engine, keyring, clock, world.users["admin"])
     first = client.get("/api/runs?limit=3").json()
     assert set(first["runs"][0]) == {"id", "team_id", "project_id", "workflow", "status", "triggered_by",
-                                     "started_at", "finished_at", "cost_usd"}
+                                     "started_at", "finished_at", "cost_usd", "subject", "title", "verdict"}
     assert first["runs"][0]["workflow"].startswith("wf-") and first["runs"][0]["cost_usd"] == 0.5
     rest = client.get("/api/runs", params={"limit": 3, "before": first["next_before"]}).json()
     assert len(first["runs"]) == 3 and len(rest["runs"]) == 1 and rest["next_before"] is None

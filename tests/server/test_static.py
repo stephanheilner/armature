@@ -49,6 +49,9 @@ CONTRACT = [
     "GET /api/runs/{id}/events",
     "GET /api/runs/{id}/stream",
     "GET /api/runs/{id}/findings",
+    "GET /api/runs/{id}/artifacts",
+    "GET /api/runs/{id}/artifacts/{name}",
+    "GET /api/runs/{id}/outputs",
     "GET /api/stream/runs",
     "GET /api/workflows",
     "GET /api/workflows/{id}",
@@ -82,6 +85,9 @@ CONTRACT = [
     "GET /api/settings",
     "POST /api/settings",
     "POST /api/settings/delete",
+    "GET /api/display",
+    "GET /api/overview",
+    "GET /api/trends",
 ]
 CONTRACT_PATTERNS = [re.compile("^" + re.sub(r"\\\{\w+\\\}", "[^/]+", re.escape(entry.split(" ", 1)[1])) + "$") for entry in CONTRACT]
 

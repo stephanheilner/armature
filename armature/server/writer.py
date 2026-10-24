@@ -19,11 +19,18 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import Connection, Engine, func, insert, select, text, update
+from sqlalchemy import Connection, Engine, delete, func, insert, select, text, update
 
+from armature.events.summary import merge_summary
 from armature.server import runners
 from armature.server.db import new_id
-from armature.server.db.schema import findings, run_events, run_steps, runs
+from armature.server.db.schema import (
+    findings,
+    run_artifacts,
+    run_events,
+    run_steps,
+    runs,
+)
 
 log = logging.getLogger(__name__)
 
@@ -66,6 +73,8 @@ class RunChange:
     end: tuple[str, datetime, str | None] | None = None
     steps: dict[str, StepChange] = field(default_factory=dict)
     findings: list[dict[str, Any]] = field(default_factory=list)
+    artifacts: dict[str, dict[str, Any]] = field(default_factory=dict)
+    summary: dict[str, Any] | None = None
 
 
 @dataclass
@@ -133,6 +142,19 @@ class EventWriter:
         if len(self._batch.events) >= self.flush_events and self._wake is not None:
             self._wake.set()
         return self._batch.run(run_id)
+
+    def add_artifact(self, run_id: str, artifact: dict[str, Any]) -> None:
+        """Queue an artifact row, replacing any queued one of the same name."""
+        self._batch.run(run_id).artifacts[artifact["name"]] = artifact
+
+    def pending_artifacts(self, run_id: str) -> dict[str, dict[str, Any]]:
+        """This run's artifacts not stored yet, by name, the newest of each."""
+        pending: dict[str, dict[str, Any]] = {}
+        for batch in (self._inflight, self._batch):
+            change = batch.runs.get(run_id) if batch is not None else None
+            if change is not None:
+                pending.update(change.artifacts)
+        return pending
 
     def _run_lists(self, run_id: str) -> list[list[dict[str, Any]]]:
         lists = [self._inflight.by_run.get(run_id)] if self._inflight is not None else []
@@ -265,6 +287,9 @@ def _merge_run(into: RunChange, change: RunChange) -> None:
     for key, step in change.steps.items():
         merge_step(into.steps.setdefault(key, StepChange(step_id=step.step_id)), step)
     into.findings.extend(change.findings)
+    into.artifacts.update(change.artifacts)
+    if change.summary:
+        into.summary = merge_summary(into.summary, change.summary)
 
 
 def merge_step(into: StepChange, step: StepChange) -> None:
@@ -310,6 +335,9 @@ def _apply_run(conn: Connection, run_id: str, change: RunChange) -> None:
     if change.end is not None:
         status, finished_at, error = change.end
         values.update(status=status, finished_at=finished_at, error=error)
+    if change.summary:
+        current = conn.execute(select(runs.c.summary).where(runs.c.id == run_id)).scalar()
+        values["summary"] = merge_summary(current, change.summary)
     if values:
         conn.execute(update(runs).where(runs.c.id == run_id).values(**values))
     if change.end is None and change.last_event_at is not None:
@@ -320,6 +348,9 @@ def _apply_run(conn: Connection, run_id: str, change: RunChange) -> None:
         _upsert_step(conn, run_id, key, step)
     if change.findings:
         conn.execute(insert(findings), [{"id": new_id(), "run_id": run_id, **f} for f in change.findings])
+    for name, artifact in change.artifacts.items():
+        conn.execute(delete(run_artifacts).where(run_artifacts.c.run_id == run_id, run_artifacts.c.name == name))
+        conn.execute(insert(run_artifacts).values(run_id=run_id, **artifact))
     if change.end is not None:
         runners.revoke_tokens(conn, [run_id])
 

@@ -41,7 +41,7 @@ from sqlalchemy import Connection, Table, delete, insert, select, update
 
 from armature.packs.params import with_error_paths
 from armature.runtime.templating import text_env
-from armature.server import audit, packs, rbac
+from armature.server import audit, display, packs, rbac
 from armature.server import secrets as secret_store
 from armature.server.db import new_id
 from armature.server.db.schema import (
@@ -1281,6 +1281,11 @@ def check_setting_key(key: Any) -> str:
 def put_setting(conn: Connection, *, team_id: str | None, key: Any, value: Any, actor_id: str, now: datetime,
                 ip: str | None) -> dict[str, Any]:
     key = check_setting_key(key)
+    if key.startswith(display.PREFIX):
+        try:
+            value = display.check(key, value, team_id)
+        except display.Invalid as exc:
+            raise DefError(400, str(exc)) from exc
     scope = scope_of(team_id)
     where = (settings.c.scope == scope, settings.c.key == key)
     exists = conn.execute(select(settings.c.key).where(*where)).first() is not None

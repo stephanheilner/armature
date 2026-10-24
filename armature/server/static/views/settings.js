@@ -1,5 +1,6 @@
 import { api, listOf } from '../api.js';
 import { attempt, card, clear, confirmDialog, element, empty, errorBox, loading, pageHeader, table } from '../dom.js';
+import { DISPLAY_DEFAULTS, SERIES_COLORS } from '../display.js';
 import { hashFor } from '../router.js';
 import { parseJson } from '../schema.js';
 
@@ -49,6 +50,73 @@ function settingForm(scopes, setting, onSaved, onCancel) {
   return card(form);
 }
 
+const COLOR_NAMES = { s1: 'Blue', s2: 'Orange', s3: 'Aqua', s4: 'Yellow', s5: 'Pink', s6: 'Green', s7: 'Violet', s8: 'Red' };
+
+function zoneNames() {
+  try {
+    return Intl.supportedValuesOf('timeZone');
+  } catch {
+    return [];
+  }
+}
+
+function workflowRow(workflow, entry = {}) {
+  const labelInput = element('input', { type: 'text', maxlength: 32, placeholder: workflow, 'aria-label': `Label for ${workflow}` });
+  labelInput.value = entry.label || '';
+  const colorSelect = element('select', { 'aria-label': `Color for ${workflow}` }, element('option', { value: '' }, 'Default color'),
+    SERIES_COLORS.map((color) => element('option', { value: color }, COLOR_NAMES[color])));
+  colorSelect.value = entry.color || '';
+  const shownBox = element('input', { type: 'checkbox', checked: !entry.hidden, 'aria-label': `Show ${workflow} in runs by default` });
+  return {
+    cells: [element('span', { class: 'mono wrap-anywhere' }, workflow), labelInput, colorSelect, shownBox],
+    read: () => [workflow, { label: labelInput.value.trim(), color: colorSelect.value, hidden: !shownBox.checked }],
+  };
+}
+
+// Each changed value is one instance setting, written through the same route as any other setting.
+async function displayCard(onSaved) {
+  const shown = await api('/api/display');
+  const current = { ...DISPLAY_DEFAULTS, ...shown.display };
+  const showCost = element('input', { type: 'checkbox', id: 'display-show-cost', checked: current.show_cost });
+  const showHours = element('input', { type: 'checkbox', id: 'display-show-hours', checked: current.show_man_hours });
+  const multiplier = element('input', { type: 'number', id: 'display-multiplier', min: '0.1', max: '100', step: 'any', required: true, value: String(current.human_multiplier) });
+  const zones = element('datalist', { id: 'display-zones' }, zoneNames().map((zone) => element('option', { value: zone })));
+  const timezone = element('input', { type: 'text', id: 'display-timezone', list: zones.id, required: true, spellcheck: 'false', autocapitalize: 'none', value: current.timezone });
+  const names = [...new Set([...listOf(shown, 'workflows'), ...Object.keys(current.workflow_labels)])].sort();
+  const workflowRows = names.map((workflow) => workflowRow(workflow, current.workflow_labels[workflow]));
+  const saveButton = element('button', { type: 'submit', class: 'primary' }, 'Save display settings');
+  const status = element('div', { role: 'status' });
+  const form = element('form', { class: 'stacked-form display-form' },
+    element('h2', { class: 'inline' }, 'Display'),
+    element('p', { class: 'note' }, 'How the Overview and Trends pages show numbers to everyone on this instance.'),
+    element('fieldset', {}, element('legend', {}, 'Show'),
+      element('label', { for: showCost.id }, showCost, ' Cost'), ' ', element('label', { for: showHours.id }, showHours, ' Man hours')),
+    element('label', { class: 'stacked', for: multiplier.id }, 'Man hours per hour of agent time', multiplier),
+    element('label', { class: 'stacked', for: timezone.id }, 'Time zone for day boundaries', timezone, zones),
+    element('fieldset', {}, element('legend', {}, 'Workflows'),
+      element('p', { class: 'note' }, 'A label replaces the workflow name on the Overview and Trends pages. Leave it empty for the name itself. A workflow not shown by default stays out of the run lists unless someone filters for it.'),
+      workflowRows.length ? table(['Workflow', 'Label', 'Color', 'Show in runs by default'], workflowRows.map((row) => row.cells)) : element('p', { class: 'note' }, 'No workflows yet.')),
+    status, element('div', { class: 'wf-actions' }, saveButton));
+  form.addEventListener('submit', async (submitEvent) => {
+    submitEvent.preventDefault();
+    const labels = Object.fromEntries(workflowRows.map((row) => row.read()).filter(([, entry]) => entry.label || entry.color || entry.hidden));
+    const wanted = { show_cost: showCost.checked, show_man_hours: showHours.checked, human_multiplier: Number(multiplier.value), timezone: timezone.value.trim(), workflow_labels: labels };
+    const changed = Object.entries(wanted).filter(([key, value]) => JSON.stringify(value) !== JSON.stringify(current[key] ?? DISPLAY_DEFAULTS[key]));
+    if (!changed.length) {
+      clear(status).append(element('p', { class: 'note' }, 'Nothing changed.'));
+      return;
+    }
+    const saved = await attempt(status, saveButton, async () => {
+      for (const [key, value] of changed) {
+        await api('/api/settings', { method: 'POST', body: { scope: INSTANCE, key: `display.${key}`, value } });
+        current[key] = value;
+      }
+    });
+    if (saved) onSaved('Saved the display settings.');
+  });
+  return card(form);
+}
+
 export async function render(root, { query }) {
   root.append(pageHeader('Settings'));
   root.append(element('p', { class: 'note' }, 'Instance and team settings, stored as JSON. Secrets do not belong here. Keep them on the Secrets page.'));
@@ -65,7 +133,8 @@ export async function render(root, { query }) {
   const status = element('div', { role: 'status' });
   const formSlot = element('div');
   const listSlot = element('div', {}, loading());
-  root.append(element('div', { class: 'filters' }, element('label', { for: filterSelect.id }, 'Scope', filterSelect), addButton), status, formSlot, listSlot);
+  const displaySlot = element('div', {}, loading());
+  root.append(displaySlot, element('h2', {}, 'All settings'), element('div', { class: 'filters' }, element('label', { for: filterSelect.id }, 'Scope', filterSelect), addButton), status, formSlot, listSlot);
 
   const closeForm = () => clear(formSlot);
   const openForm = (setting) => {
@@ -102,5 +171,6 @@ export async function render(root, { query }) {
     })) : empty(filter ? 'No settings in this scope.' : 'No settings yet.')));
   }
 
+  displayCard((message) => reload(message)).then((displayForm) => clear(displaySlot).append(displayForm), (err) => clear(displaySlot).append(errorBox(err)));
   await reload();
 }

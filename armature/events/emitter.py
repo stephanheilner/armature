@@ -14,6 +14,7 @@ import itertools
 import json
 import logging
 import os
+import re
 import socket
 import threading
 import time
@@ -30,7 +31,7 @@ from armature.events.redact import default_redactor, redact_exact
 MUST_KEEP = frozenset({
     "run_start", "run_end", "step_start", "step_end", "step_failed",
     "step_skipped", "retry", "cost", "finding", "tool_call", "tool_result",
-    "session_start", "session_end", "error", "dropped",
+    "session_start", "session_end", "error", "dropped", "artifact", "summary",
 })
 DROPPABLE = frozenset({"text", "log", "progress"})
 
@@ -50,6 +51,13 @@ _RESERVED = ("run_id", "team_id")
 _PREFIX = b'{"v":%d,' % WIRE_VERSION
 _EID_ROOM = 64
 _MIN_SECRET = 4
+
+ARTIFACT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+ARTIFACT_TYPES = ("text/markdown", "text/plain", "application/json")
+MAX_ARTIFACT_BYTES = 1024 * 1024
+# Each part's content, JSON-escaped, so one part plus its envelope stays under MAX_EVENT_BYTES.
+ARTIFACT_PART_BYTES = 40 * 1024
+MAX_ARTIFACT_PARTS = 512
 
 log = logging.getLogger(__name__)
 _warned: set[str] = set()
@@ -98,6 +106,35 @@ def _cap(value: Any, cap: int) -> Any:
     if isinstance(value, (list, tuple)):
         return [_cap(v, cap) for v in value[: max(cap // 64, 1)]]
     return value
+
+
+def artifact_problem(name: Any, media_type: Any, content: Any) -> str | None:
+    """Why an artifact would be refused, or None."""
+    if not isinstance(name, str) or not ARTIFACT_NAME.fullmatch(name):
+        return "an artifact name is 1 to 100 letters, digits, '.', '_', or '-', starting with a letter or digit"
+    if media_type not in ARTIFACT_TYPES:
+        return f"an artifact type is one of {', '.join(ARTIFACT_TYPES)}"
+    if not isinstance(content, str):
+        return "artifact content must be text"
+    if len(content.encode("utf-8", "surrogatepass")) > MAX_ARTIFACT_BYTES:
+        return f"an artifact is at most {MAX_ARTIFACT_BYTES} bytes"
+    return None
+
+
+def _escaped_size(text: str) -> int:
+    return len(json.dumps(text, ensure_ascii=False).encode("utf-8", "surrogatepass"))
+
+
+def artifact_parts(content: str) -> list[str]:
+    """``content`` cut into pieces that each fit one event once JSON-escaped."""
+    parts, start = [], 0
+    while start < len(content):
+        piece = content[start:start + ARTIFACT_PART_BYTES]
+        while _escaped_size(piece) > ARTIFACT_PART_BYTES:
+            piece = piece[:len(piece) // 2]
+        parts.append(piece)
+        start += len(piece)
+    return parts or [""]
 
 
 def encode_event(event: dict[str, Any], limit: int = MAX_EVENT_BYTES) -> bytes:
@@ -225,6 +262,32 @@ class Emitter:
             self._emit(kind, step_id, payload)
         except Exception:
             self.errors += 1
+
+    def artifact(self, name: str, content: str, media_type: str = "text/markdown",
+                 step_id: str | None = None) -> bool:
+        """Send ``content`` as the run artifact ``name``, in as many events as it takes. False when refused."""
+        if self._closed:
+            return False
+        try:
+            problem = artifact_problem(name, media_type, content)
+            if problem is None:
+                content = self.redact({"content": content}).get("content")
+                problem = artifact_problem(name, media_type, content)
+            if problem is not None:
+                warn_once(f"artifact:{problem}", "Not sending artifact %r: %s", name, problem)
+                return False
+            parts = artifact_parts(content)
+            upload = os.urandom(8).hex()
+            with self._lock:
+                for index, part in enumerate(parts):
+                    payload = {"name": name, "media_type": media_type, "upload": upload, "part": index,
+                               "parts": len(parts), "content": part}
+                    data = encode_event(self._envelope("artifact", step_id, payload), MAX_EVENT_BYTES - _EID_ROOM)
+                    self._submit_locked(True, data)
+            return True
+        except Exception:
+            self.errors += 1
+            return False
 
     @property
     def token(self) -> str:
@@ -540,6 +603,10 @@ class NullEmitter(Emitter):
 
     def emit(self, kind: str, step_id: str | None = None, /, **payload: Any) -> None:
         return None
+
+    def artifact(self, name: str, content: str, media_type: str = "text/markdown",
+                 step_id: str | None = None) -> bool:
+        return False
 
     def redact(self, payload: dict[str, Any]) -> dict[str, Any]:
         return payload

@@ -11,7 +11,13 @@ import urllib.request
 from typing import Any
 from urllib.parse import urlsplit
 
-from armature.events.emitter import Emitter, is_loopback_host, plain_http_to_remote
+from armature.events.emitter import (
+    Emitter,
+    is_loopback_host,
+    plain_http_to_remote,
+    warn_once,
+)
+from armature.events.summary import subject_problem, trigger_ref_problem
 
 REGISTER_TIMEOUT_S = 3.0
 RETRY_AFTER_FAILURE_S = 300.0
@@ -32,6 +38,32 @@ def _string(inputs: dict[str, Any], name: str) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _trigger_ref() -> dict[str, Any]:
+    raw = os.environ.get("ARMATURE_TRIGGER_REF")
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        value = None
+    problem = trigger_ref_problem(value)
+    if problem:
+        warn_once("trigger_ref", "Ignoring ARMATURE_TRIGGER_REF: %s", problem)
+        return {}
+    return value
+
+
+def _subject() -> str | None:
+    value = os.environ.get("ARMATURE_SUBJECT")
+    if not value:
+        return None
+    problem = subject_problem(value)
+    if problem:
+        warn_once("subject", "Ignoring ARMATURE_SUBJECT: %s", problem)
+        return None
+    return value
+
+
 def registration_body(workflow: str, inputs: dict[str, Any] | None) -> dict[str, Any]:
     inputs = inputs or {}
     return {
@@ -39,7 +71,8 @@ def registration_body(workflow: str, inputs: dict[str, Any] | None) -> dict[str,
         "project": os.environ.get("ARMATURE_PROJECT") or _string(inputs, "project") or _string(inputs, "repo"),
         "actor": os.environ.get("ARMATURE_ACTOR") or os.environ.get("USER"),
         "trigger_kind": os.environ.get("ARMATURE_TRIGGER_KIND") or "cli",
-        "trigger_ref": {},
+        "trigger_ref": _trigger_ref(),
+        "subject": _subject(),
         "rerun_of": os.environ.get("ARMATURE_RERUN_OF"),
     }
 

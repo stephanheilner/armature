@@ -23,6 +23,7 @@ from armature.server.app import (
     routes_oidc,
     routes_packs,
     routes_runner,
+    routes_stats,
     static,
 )
 from armature.server.app.deps import Server
@@ -80,7 +81,7 @@ def create_app(cfg: ServerConfig, engine: Engine, keyring: Keyring, *, clock: Ca
 
     for router in (health, routes_auth.router, routes_api.router, routes_defs.router, routes_live.router,
                    routes_runner.router, routes_oidc.router, routes_packs.router, routes_export.router,
-                   routes_assist.router, routes_dryrun.router, static.router):
+                   routes_assist.router, routes_dryrun.router, routes_stats.router, static.router):
         app.include_router(router, prefix=base)
 
     if base:

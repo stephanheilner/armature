@@ -25,9 +25,9 @@ function stubFetch(responses) {
   return calls;
 }
 
-test('parseHash defaults to runs', () => {
-  assert.deepEqual({ ...parseHash(''), query: String(parseHash('').query) }, { name: 'runs', args: [], query: '' });
-  assert.equal(parseHash('#/').name, 'runs');
+test('parseHash defaults to the overview', () => {
+  assert.deepEqual({ ...parseHash(''), query: String(parseHash('').query) }, { name: 'overview', args: [], query: '' });
+  assert.equal(parseHash('#/').name, 'overview');
 });
 
 test('parseHash splits name, args, and query', () => {
@@ -165,9 +165,9 @@ test('a network failure reads as unreachable', async () => {
 test('navFor hides what a role cannot use', () => {
   const lead = { user: { id: 1 }, memberships: [{ scope_kind: 'team', scope_id: 't', role: 'team_lead' }] };
   const viewer = { user: { id: 2 }, memberships: [{ scope_kind: 'project', scope_id: 'p', role: 'viewer' }] };
-  assert.deepEqual(navFor({ user: { is_admin: true } }), ['runs', 'teams', 'workflows', 'roles', 'packs', 'users', 'secrets', 'runner-keys', 'settings', 'account']);
-  assert.deepEqual(navFor(lead), ['runs', 'teams', 'workflows', 'roles', 'packs', 'users', 'secrets', 'account']);
-  assert.deepEqual(navFor(viewer), ['runs', 'teams', 'workflows', 'roles', 'packs', 'account']);
+  assert.deepEqual(navFor({ user: { is_admin: true } }), ['overview', 'runs', 'trends', 'teams', 'workflows', 'roles', 'packs', 'users', 'secrets', 'runner-keys', 'settings', 'account']);
+  assert.deepEqual(navFor(lead), ['overview', 'runs', 'trends', 'teams', 'workflows', 'roles', 'packs', 'users', 'secrets', 'account']);
+  assert.deepEqual(navFor(viewer), ['overview', 'runs', 'trends', 'teams', 'workflows', 'roles', 'packs', 'account']);
   assert.deepEqual(navFor({ user: null }), []);
 });
 

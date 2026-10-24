@@ -1,4 +1,4 @@
-export const DEFAULT_VIEW = 'runs';
+export const DEFAULT_VIEW = 'overview';
 
 function decode(part) {
   try {

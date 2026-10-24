@@ -289,7 +289,7 @@ async def test_top_level_run_registers_with_the_server(monkeypatch, tmp_path):
         assert path == "/api/runner/runs"
         assert headers["Authorization"] == "Bearer rk"
         assert body == {"workflow": "events-test", "project": "android", "actor": "alice",
-                        "trigger_kind": "schedule", "trigger_ref": {}, "rerun_of": None}
+                        "trigger_kind": "schedule", "trigger_ref": {}, "subject": None, "rerun_of": None}
         events = r.wait_for(9)
         assert events[0]["kind"] == "run_start" and events[0]["token"] == "srv-token"
         assert harness._events._closed

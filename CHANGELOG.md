@@ -10,6 +10,38 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **Run artifacts and a tabbed run page.** A step can save a named report
+  with `python -m armature.events artifact --name review.md --file PATH` (or
+  `--text`, with `--type text/markdown`, `text/plain`, or
+  `application/json`), up to 1 MB. The emitter redacts it and sends it in
+  parts that each fit one event, over the socket or HTTP, and the server
+  redacts the whole artifact again before storing it in `run_artifacts`. A
+  later artifact with the same name replaces the earlier one.
+  `GET /api/runs/{id}/artifacts` lists them, `GET /api/runs/{id}/artifacts/{name}`
+  returns one, and the run stream carries an `artifact` event so a tab appears
+  while the run is still going. The run page now has a header with the run's
+  title, verdict, subject, links, and a one-line progress strip, then one tab
+  per artifact (`review.md` first and default), Output (each step's status,
+  duration, error, and stored output, from `GET /api/runs/{id}/outputs`),
+  and Log (the live event feed). Markdown artifacts render through a small
+  renderer that builds only elements and text nodes: raw HTML shows as text,
+  images show their alt text and URL, and only http, https, mailto, and
+  same-page links become links. Each artifact has Copy and Download.
+- **Overview and Trends pages.** Signing in lands on an Overview of what is
+  running (live), what failed or was lost in the last 24 hours, provider
+  credential errors, today's spend against the 7-day average, code reviews
+  and re-evaluations today, agent time and man hours, and the latest runs.
+  Trends charts spend, runs, failure rate, median run time, review verdicts,
+  and man hours per day over 7, 30, or 90 days, with the slowest steps and
+  per-role review cost. Both read `GET /api/overview` and `GET /api/trends`,
+  scoped to the viewer's teams, with day boundaries and percentiles computed
+  in the configured time zone so the SQL stays portable. Admins set
+  `display.show_cost`, `display.show_man_hours`, `display.human_multiplier`,
+  `display.timezone`, and per-workflow labels, colors, and "show in runs by
+  default" from a Display section on the Settings page, and every page reads
+  them from `GET /api/display`. `GET /api/runs` leaves out hidden workflows
+  (`pr-merged` and `build-announce` until an admin saves otherwise) unless it
+  gets `workflows=` or `include_hidden=1`.
 - **`armature server init`, `migrate`, and `create-admin`** (the new
   `server` extra, with `postgres` and `mysql` extras for those drivers).
   `init` writes `~/.armature/server.yaml` if missing, generates a mode 0600

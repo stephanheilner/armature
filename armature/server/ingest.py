@@ -31,7 +31,13 @@ from typing import Any
 
 from sqlalchemy import Connection, Engine, func, select
 
+from armature.events.emitter import (
+    MAX_ARTIFACT_BYTES,
+    MAX_ARTIFACT_PARTS,
+    artifact_problem,
+)
 from armature.events.redact import REDACTED, redact_text
+from armature.events.summary import merge_summary, summary_patch
 from armature.server import runners
 from armature.server import secrets as secret_store
 from armature.server.auth import valid_token
@@ -72,6 +78,8 @@ SUCCEEDED = frozenset({"succeeded", "success", "ok", "completed", "complete", "d
 CANCELED = frozenset({"canceled", "cancelled"})
 
 TRUNCATED = "_truncated"
+UPLOAD = re.compile(r"^[0-9a-f]{16}$")
+MAX_UPLOADS = 4
 
 ACCEPTED, REJECTED, DUPLICATE = "accepted", "rejected", "duplicate"
 
@@ -166,6 +174,21 @@ class Branches:
 
 
 @dataclass
+class Upload:
+    """An artifact sent in parts, held until the last part arrives."""
+
+    name: str
+    media_type: str
+    parts: int
+    chunks: dict[int, str] = field(default_factory=dict)
+    size: int = 0
+
+
+def _index(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+@dataclass
 class RunState:
     run_id: str
     team_id: str
@@ -182,6 +205,7 @@ class RunState:
     summary_timer: asyncio.TimerHandle | None = None
     branches: dict[str, Branches] = field(default_factory=dict)
     eids: OrderedDict[str, int] = field(default_factory=OrderedDict)
+    uploads: OrderedDict[str, Upload] = field(default_factory=OrderedDict)
 
     @property
     def ended(self) -> bool:
@@ -221,10 +245,17 @@ def parse_eid(value: Any) -> tuple[str, int] | None:
     return (match.group(1), int(match.group(2))) if match else None
 
 
+def about(subject: str | None, reported: Any) -> dict[str, Any]:
+    """A run list row's subject, title, and verdict, the last two from the run's reported summary."""
+    reported = reported if isinstance(reported, dict) else {}
+    return {"subject": subject, "title": reported.get("title"), "verdict": reported.get("verdict")}
+
+
 def list_row(summary: dict[str, Any]) -> dict[str, Any]:
     """The fields a row of ``GET /api/runs`` has."""
-    return {k: summary[k] for k in ("id", "team_id", "project_id", "workflow", "status", "triggered_by",
-                                    "started_at", "finished_at", "cost_usd")}
+    return {**{k: summary[k] for k in ("id", "team_id", "project_id", "workflow", "status", "triggered_by",
+                                       "started_at", "finished_at", "cost_usd")},
+            **about(summary.get("subject"), summary.get("summary"))}
 
 
 def run_columns() -> list:
@@ -232,7 +263,7 @@ def run_columns() -> list:
             func.coalesce(workflows.c.name, runs.c.workflow_name).label("workflow"), runs.c.status,
             func.coalesce(runs.c.triggered_by, runs.c.actor).label("triggered_by"), runs.c.trigger_kind,
             runs.c.started_at, runs.c.finished_at, runs.c.cost_usd, runs.c.input_tokens, runs.c.output_tokens,
-            runs.c.rerun_of, runs.c.cancelled_by, runs.c.error]
+            runs.c.rerun_of, runs.c.cancelled_by, runs.c.error, runs.c.subject, runs.c.summary]
 
 
 def run_query():
@@ -458,6 +489,8 @@ class LiveHub:
             return REJECTED
         now = self.clock()
         ts = parse_ts(event.get("ts"), now)
+        if kind == "artifact":
+            return self._artifact(state, eid, step_id, ts, now, payload)
         payload = utf8(redact({k: v for k, v in payload.items() if k not in STRIPPED}, state.secrets))
         if step_id is not None:
             step_id = utf8(_scrub(step_id, state.secrets))[:191]
@@ -466,6 +499,46 @@ class LiveHub:
             self._accept(state, "dropped", None, now, now, {"count": state.rejected, "reason": "server_limit"})
             state.rejected = 0
         self._accept(state, kind, step_id, ts, now, payload)
+        return ACCEPTED
+
+    def _artifact(self, state: RunState, eid: tuple[str, int] | None, step_id: str | None, ts: datetime,
+                  now: datetime, payload: dict[str, Any]) -> str:
+        """One part of an artifact. The whole artifact is redacted and stored when its last part arrives."""
+        name, media_type, content = payload.get("name"), payload.get("media_type"), payload.get("content")
+        part, parts = _index(payload.get("part", 0)), _index(payload.get("parts", 1))
+        if (artifact_problem(name, media_type, content) or parts is None or part is None
+                or not 1 <= parts <= MAX_ARTIFACT_PARTS or not 0 <= part < parts):
+            return REJECTED
+        state.remember(eid)
+        if parts > 1:
+            upload_id = payload.get("upload")
+            if not isinstance(upload_id, str) or not UPLOAD.fullmatch(upload_id):
+                return REJECTED
+            upload = state.uploads.get(upload_id)
+            if upload is None:
+                upload = state.uploads[upload_id] = Upload(name=name, media_type=media_type, parts=parts)
+                while len(state.uploads) > MAX_UPLOADS:
+                    state.uploads.popitem(last=False)
+            elif (upload.name, upload.media_type, upload.parts) != (name, media_type, parts):
+                return REJECTED
+            previous = upload.chunks.get(part)
+            upload.size += len(content.encode("utf-8", "surrogatepass")) - (
+                len(previous.encode("utf-8", "surrogatepass")) if previous is not None else 0)
+            upload.chunks[part] = content
+            if upload.size > MAX_ARTIFACT_BYTES:
+                del state.uploads[upload_id]
+                return REJECTED
+            if len(upload.chunks) < parts:
+                return ACCEPTED
+            del state.uploads[upload_id]
+            content = "".join(upload.chunks[index] for index in range(parts))
+        content = utf8(_scrub(content, state.secrets))
+        if step_id is not None:
+            step_id = utf8(_scrub(step_id, state.secrets))[:191]
+        size = len(content.encode("utf-8"))
+        self._accept(state, "artifact", step_id, ts, now, {"name": name, "media_type": media_type, "size": size})
+        self.writer.add_artifact(state.run_id, {"name": name, "step_id": step_id, "media_type": media_type,
+                                                "content": content, "size": size, "created_at": now})
         return ACCEPTED
 
     async def _token(self, token_digest: str) -> runners.RunToken | None:
@@ -572,6 +645,12 @@ class LiveHub:
             changed = changed or bool(cost or tokens_in or tokens_out)
         elif kind == "finding":
             change.findings.append(self._finding(state, step_id, now, payload))
+        elif kind == "summary":
+            patch = summary_patch(payload)
+            if patch:
+                change.summary = merge_summary(change.summary, patch)
+                summary["summary"] = merge_summary(summary.get("summary"), patch)
+                changed = immediate = True
         elif kind == "run_end":
             status = run_status(payload.get("status"))
             error = None if status == "succeeded" else _text(payload.get("error") or payload.get("reason"), 10_000)

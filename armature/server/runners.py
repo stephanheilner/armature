@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import json
 import re
 import secrets as _random
 from dataclasses import dataclass
@@ -19,6 +18,7 @@ from typing import Any
 
 from sqlalchemy import Connection, delete, func, insert, or_, select, update
 
+from armature.events.summary import subject_problem, trigger_ref_problem
 from armature.server import audit
 from armature.server.auth import valid_token
 from armature.server.crypto import Keyring
@@ -38,7 +38,7 @@ TOKEN_TTL = timedelta(hours=48)
 TOUCH = timedelta(seconds=60)
 WORKFLOW = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._:/-]{0,190}$")
 TRIGGER_KIND = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,31}$")
-TRIGGER_REF_MAX = 4096
+SERVER_REF_KEYS = frozenset({"dry_run", "source", "import_hash"})
 ACTOR_MAX = 191
 OPERATIONS_SLUG = "operations"
 OPERATIONS_NAME = "Operations (unassigned runs)"
@@ -131,9 +131,12 @@ def register_run(conn: Connection, keyring: Keyring, *, key: Any, body: dict[str
     trigger_kind = _text(body.get("trigger_kind"), "trigger_kind", 32, TRIGGER_KIND)
     actor = _text(body.get("actor"), "actor", ACTOR_MAX)
     trigger_ref = body.get("trigger_ref")
-    if trigger_ref is not None and (not isinstance(trigger_ref, dict)
-                                    or len(json.dumps(trigger_ref, default=str)) > TRIGGER_REF_MAX):
-        raise RegistrationError(400, f"trigger_ref must be a JSON object of at most {TRIGGER_REF_MAX} bytes.")
+    problem = trigger_ref_problem(trigger_ref) if trigger_ref is not None else None
+    if problem:
+        raise RegistrationError(400, f"{problem[0].upper()}{problem[1:]}.")
+    subject = body.get("subject")
+    if subject is not None and subject_problem(subject):
+        raise RegistrationError(400, "subject is not valid.")
     project = _text(body.get("project"), "project", 191)
     if key.team_id is None:
         team_id, project_id = _instance_target(conn, project, now, ip)
@@ -153,10 +156,17 @@ def register_run(conn: Connection, keyring: Keyring, *, key: Any, body: dict[str
     workflow_id = resolved.id if resolved is not None else None
     row, token = open_run(conn, keyring, team_id=team_id, project_id=project_id, workflow_id=workflow_id,
                           workflow_name=workflow, now=now, actor=actor, trigger_kind=trigger_kind,
-                          trigger_ref=trigger_ref, rerun_of=rerun_of, runner_key_id=key.id)
+                          trigger_ref=_server_ref(trigger_ref), subject=subject, rerun_of=rerun_of,
+                          runner_key_id=key.id)
     audit.record(conn, action="run.register", actor_id=None, team_id=team_id, target_kind="run",
                  target_id=row["id"], detail={"runner_key_id": key.id, "workflow": workflow, "actor": actor}, ip=ip)
     return row, token
+
+
+def _server_ref(trigger_ref: dict[str, Any] | None) -> dict[str, Any]:
+    """The sender's reference with the server's own keys over it, so a runner cannot claim a dry run."""
+    ref = {k: v for k, v in (trigger_ref or {}).items() if k not in SERVER_REF_KEYS}
+    return {**ref, "source": "runner"}
 
 
 def _instance_target(conn: Connection, project: str | None, now: datetime,

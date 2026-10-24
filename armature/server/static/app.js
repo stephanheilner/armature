@@ -5,7 +5,7 @@ import { parseHash } from './router.js';
 import { isSso, navFor, setSession, ssoStepUpPath, user } from './session.js';
 
 const NAV_GROUPS = [
-  ['Work', [['runs', 'Runs', 'list'], ['teams', 'Teams', 'team']]],
+  ['Work', [['overview', 'Overview', 'home'], ['runs', 'Runs', 'list'], ['trends', 'Trends', 'chart'], ['teams', 'Teams', 'team']]],
   ['Definitions', [['workflows', 'Workflows', 'flow'], ['roles', 'Roles and prompts', 'doc'], ['packs', 'Packs', 'box']]],
   ['Manage', [['users', 'Users', 'people'], ['secrets', 'Secrets', 'key'], ['runner-keys', 'Runner keys', 'key'], ['settings', 'Settings', 'gear']]],
   ['You', [['account', 'Account', 'person']]],
@@ -13,7 +13,9 @@ const NAV_GROUPS = [
 
 // Simple 16px outline icons, drawn as SVG so the menu needs no icon font.
 const ICON_PATHS = {
+  home: 'M2 7.5L8 2.5l6 5M3.5 6.5v7h9v-7M6.5 13.5v-4h3v4',
   list: 'M5 4h9M5 8h9M5 12h9M2 4h.01M2 8h.01M2 12h.01',
+  chart: 'M2 2v12h12M5 11V8M8 11V5M11 11V7',
   team: 'M2 3h12v10H2zM2 6h12M6 6v7',
   people: 'M6 7a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5zM1.5 14c0-2.5 2-4.5 4.5-4.5s4.5 2 4.5 4.5M11 2.5a2.5 2.5 0 0 1 0 4.5M12.5 9.8c1.2.6 2 2 2 4.2',
   flow: 'M3 2.5h4v3H3zM9 10.5h4v3H9zM5 5.5v3.5h6v1.5',
@@ -38,6 +40,8 @@ function icon(name) {
 }
 
 const VIEW_LOADERS = {
+  overview: () => import('./views/overview.js'),
+  trends: () => import('./views/trends.js'),
   runs: () => import('./views/runs.js'),
   run: () => import('./views/run.js'),
   teams: () => import('./views/teams.js'),

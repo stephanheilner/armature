@@ -117,7 +117,7 @@ def test_registration_shape_and_validation(live, world):
     with live.engine.connect() as conn:
         row = conn.execute(select(runs).where(runs.c.id == body["run_id"])).one()
     assert (row.team_id, row.project_id, row.status, row.workflow_name, row.actor, row.trigger_ref) == \
-        (world["team"], world["project"], "running", "pr-review", "octocat", {"pr": 1})
+        (world["team"], world["project"], "running", "pr-review", "octocat", {"pr": 1, "source": "runner"})
     auth = {"Authorization": f"Bearer {world['key']}"}
     assert http.post("/api/runner/runs", json={"workflow": "w", "project": "web-app"}, headers=auth).status_code == 404
     assert http.post("/api/runner/runs", json={"workflow": "w", "rerun_of": "nope"}, headers=auth).status_code == 404
@@ -224,7 +224,7 @@ def test_ingest_writes_summary_on_run_end(live, world, keyring):
     summary = detail["run"]
     assert set(summary) == {"id", "team_id", "project_id", "workflow", "status", "triggered_by", "trigger_kind",
                             "started_at", "finished_at", "cost_usd", "input_tokens", "output_tokens", "rerun_of",
-                            "cancelled_by", "error", "last_seq", "dry_run"}
+                            "cancelled_by", "error", "subject", "summary", "last_seq", "dry_run"}
     assert summary["dry_run"] is False
     assert (summary["status"], summary["error"], summary["workflow"], summary["triggered_by"]) == \
         ("failed", "build broke", "pr-review", "octocat")
@@ -395,7 +395,7 @@ def test_runs_stream_is_scoped(live, world):
         assert {r["id"] for r in rows} == {run["run_id"]}
         assert [r["status"] for r in rows] == ["running", "succeeded"]
         assert set(rows[0]) == {"id", "team_id", "project_id", "workflow", "status", "triggered_by", "started_at",
-                                "finished_at", "cost_usd"}
+                                "finished_at", "cost_usd", "subject", "title", "verdict"}
         theirs_frames = theirs.until(lambda f: any(x.get("event") == "run" for x in f))
         assert [f["data"]["id"] for f in theirs_frames if f.get("event") == "run"] == [other_run["run_id"]]
 
@@ -530,3 +530,113 @@ def test_step_end_outputs_are_stored_with_fan_out_branches_as_a_list(live, world
     assert outputs["review"] == [{"finding": "a"}, {"finding": "b"}]
     assert outputs["post"] == {"body": "cut", "_truncated": True}
     assert without == ["plain"]
+
+
+def test_registration_stores_subject_and_trigger_ref(live, world):
+    http = live.client()
+    ref = {"repo": "fs-eng/android-tree", "number": 123, "draft": False, "job": {"mode": "fix"}, "dry_run": True,
+           "source": "spoofed"}
+    run = register(http, world["key"], subject="fs-eng/android-tree#123", trigger_ref=ref)
+    with live.engine.connect() as conn:
+        row = conn.execute(select(runs.c.subject, runs.c.trigger_ref).where(runs.c.id == run["run_id"])).one()
+    assert row.subject == "fs-eng/android-tree#123"
+    assert row.trigger_ref == {"repo": "fs-eng/android-tree", "number": 123, "draft": False, "job": {"mode": "fix"},
+                               "source": "runner"}
+    viewer = live.client(world["users"]["viewer"])
+    assert viewer.get(f"/api/runs/{run['run_id']}").json()["run"]["dry_run"] is False
+    auth = {"Authorization": f"Bearer {world['key']}"}
+    bad = [{"subject": "has space"}, {"subject": "x" * 192}, {"subject": 7}, {"subject": "a;b"},
+           {"trigger_ref": [1]}, {"trigger_ref": {"a": [1]}}, {"trigger_ref": {"a": None}},
+           {"trigger_ref": {"a": "x" * 4100}}, {"trigger_ref": {"a": {"b": {"c": {"d": {"e": 1}}}}}}]
+    for extra in bad:
+        response = http.post("/api/runner/runs", json={"workflow": "w", **extra}, headers=auth)
+        assert response.status_code == 400, extra
+    assert http.post("/api/runner/runs", json={"workflow": "w", "subject": "MEMTEMDIS-886"},
+                     headers=auth).status_code == 200
+
+
+def test_summary_events_merge_into_the_run(live, world):
+    http = live.client()
+    run = register(http, world["key"], subject="fs-eng/android-tree#7")
+    token = run["token"]
+    result = post(http, token,
+                  line("summary", None, title="Fix the crash", links=[
+                      {"label": "Pull request", "url": "https://github.com/fs-eng/android-tree/pull/7"},
+                      {"label": "Bad", "url": "javascript:alert(1)"},
+                      {"label": "Plain", "url": "http://example.com"},
+                      {"label": "Protocol relative", "url": "//evil.example.com/x"},
+                      {"label": "Dashboard", "url": "/runs/abc"}],
+                       fields={"platform": "android", "bad key": "x", "mode": "review"}),
+                  line("summary", None, verdict="approve", fields={"mode": "fix"}, links=[
+                      {"label": "PR", "url": "https://github.com/fs-eng/android-tree/pull/7"},
+                      {"label": "Review", "url": "https://github.com/fs-eng/android-tree/pull/7#r1"}]),
+                  line("summary", None, nothing="here"))
+    assert result == {"accepted": 3, "rejected": 0, "duplicates": 0}
+    expected = {"title": "Fix the crash", "verdict": "approve",
+                "links": [{"label": "PR", "url": "https://github.com/fs-eng/android-tree/pull/7"},
+                          {"label": "Dashboard", "url": "/runs/abc"},
+                          {"label": "Review", "url": "https://github.com/fs-eng/android-tree/pull/7#r1"}],
+                "fields": {"platform": "android", "mode": "fix"}}
+    viewer = live.client(world["users"]["viewer"])
+    assert viewer.get(f"/api/runs/{run['run_id']}").json()["run"]["summary"] == expected
+    live.flush()
+    with live.engine.connect() as conn:
+        assert conn.execute(select(runs.c.summary).where(runs.c.id == run["run_id"])).scalar() == expected
+    post(http, token, line("summary", None, title="Fix the crash, again"))
+    live.flush()
+    with live.engine.connect() as conn:
+        stored = conn.execute(select(runs.c.summary).where(runs.c.id == run["run_id"])).scalar()
+    assert stored == {**expected, "title": "Fix the crash, again"}
+
+
+def test_summary_is_redacted(live, world, keyring):
+    with live.engine.begin() as conn:
+        secret_store.set_secret(conn, keyring, team_id=world["team"], name="GH_TOKEN", value="hunter2-secret",
+                                actor_id=None)
+    http = live.client()
+    run = register(http, world["key"])
+    post(http, run["token"], line("summary", None, title="token hunter2-secret leaked",
+                                  fields={"note": "hunter2-secret"}))
+    live.flush()
+    with live.engine.connect() as conn:
+        stored = conn.execute(select(runs.c.summary).where(runs.c.id == run["run_id"])).scalar()
+    assert "hunter2-secret" not in str(stored) and stored["title"].startswith("token ")
+
+
+def test_run_list_filters_by_subject_and_shows_the_summary(live, world):
+    http = live.client()
+    first = register(http, world["key"], subject="fs-eng/android-tree#7")
+    register(http, world["key"], subject="MEMTEMDIS-886")
+    register(http, world["key"])
+    post(http, first["token"], line("summary", None, title="Fix it", verdict="request_changes"))
+    live.flush()
+    viewer = live.client(world["users"]["viewer"])
+    listed = viewer.get("/api/runs", params={"subject": "fs-eng/android-tree#7"}).json()["runs"]
+    assert [(r["id"], r["subject"], r["title"], r["verdict"]) for r in listed] == \
+        [(first["run_id"], "fs-eng/android-tree#7", "Fix it", "request_changes")]
+    everything = viewer.get("/api/runs").json()["runs"]
+    assert len(everything) == 3 and {r["subject"] for r in everything} == {"fs-eng/android-tree#7", "MEMTEMDIS-886",
+                                                                             None}
+    assert viewer.get("/api/runs", params={"subject": "x" * 192}).status_code == 400
+
+
+def test_run_list_filters_by_workflows_and_hides_hidden_ones(live, world, monkeypatch):
+    from armature.server import display
+    http = live.client()
+    for workflow in ("code-review", "digest", "jira-work"):
+        register(http, world["key"], workflow=workflow)
+    viewer = live.client(world["users"]["viewer"])
+
+    def names(**params):
+        return sorted(r["workflow"] for r in viewer.get("/api/runs", params=params).json()["runs"])
+
+    assert names() == ["code-review", "digest", "jira-work"]
+    assert names(workflows="code-review,jira-work") == ["code-review", "jira-work"]
+    assert names(workflows=" digest ,,") == ["digest"]
+    real = display.load
+    monkeypatch.setattr(display, "load", lambda conn: {**real(conn), "workflow_labels": {
+        "digest": {"label": "", "color": "", "hidden": True}, "jira-work": {"label": "Jira", "color": ""}}})
+    assert names() == ["code-review", "jira-work"]
+    assert names(include_hidden="1") == ["code-review", "digest", "jira-work"]
+    assert names(workflows="digest") == ["digest"]
+    assert names(workflow="digest") == ["digest"]

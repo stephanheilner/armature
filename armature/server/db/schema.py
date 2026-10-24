@@ -361,8 +361,10 @@ runs = Table(
     Column("runner_key_id", String(36)),
     Column("error", Text),
     _ts("last_event_at", nullable=True),
+    Column("subject", String(191)),
     Index(None, "team_id", "started_at"),
     Index(None, "status"),
+    Index(None, "subject", "started_at"),
 )
 
 # step_key is parent_step/step_id for a subagent's or nested run's step, so it never merges into the parent's row.
@@ -410,6 +412,19 @@ findings = Table(
     Column("step_id", String(191)),
     _ts("created_at", nullable=True),
     Index(None, "project_id", "finding_key"),
+)
+
+# A later artifact with the same name replaces the earlier one.
+run_artifacts = Table(
+    "run_artifacts", metadata,
+    Column("run_id", String(36), ForeignKey("runs.id"), nullable=False),
+    Column("name", name_type(100), nullable=False),
+    Column("step_id", String(191)),
+    Column("media_type", String(64), nullable=False),
+    Column("content", LongText, nullable=False),
+    Column("size", Integer, nullable=False),
+    _ts("created_at"),
+    PrimaryKeyConstraint("run_id", "name"),
 )
 
 runner_keys = Table(

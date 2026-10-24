@@ -1,8 +1,12 @@
 import { api, listOf } from '../api.js';
-import { card, clear, duration, element, empty, errorBox, link, money, pageHeader, statusChip, when } from '../dom.js';
-import { applyStepEvent, branchText, descendants, stepKey, describe, earlierPage, elapsedSeconds, FeedModel, groupItems, newestBefore, oneLine, stepTree, summarizeInput, TERMINAL } from '../feed.js';
+import { append, card, clear, duration, element, empty, errorBox, link, loading, money, pageHeader, statusChip, tabs, when } from '../dom.js';
+import { loadDisplay, workflowLabel } from '../display.js';
+import { applyStepEvent, branchText, describe, earlierPage, elapsedSeconds, FeedModel, groupItems, newestBefore, oneLine, stepKey, stepTree, summarizeInput, TERMINAL } from '../feed.js';
 import { every, subscribe } from '../live.js';
+import { renderMarkdown } from '../markdown.js';
 import { hashFor } from '../router.js';
+import { activeTab, artifactForTab, byteSize, downloadType, LOG_TAB, orderArtifacts, OUTPUT_TAB, outputText, prettyJson, progress, runTabs, summaryLinks } from '../runpage.js';
+import { subjectLink, verdictChip } from './runs.js';
 
 const PAGE = 1000;
 const EARLIER_PAGE = 500;
@@ -10,17 +14,19 @@ const POLL_MS = 2000;
 const REFRESH_MS = 1500;
 const SETTLE_MS = 1500;
 const ANNOUNCE_MS = 2000;
-const FINDINGS_SHOWN = 500;
-const FINDINGS_PAGE = 50;
+const FINDINGS_PAGE = 200;
 const BOTTOM_SLACK = 24;
 const LIVE_STATES = { live: 'Live', reconnecting: 'Reconnecting…', polling: 'Refreshing every 2 s', ended: 'Finished' };
 const STEP_WORDS = { step_start: 'started', step_end: 'finished', step_failed: 'failed', step_skipped: 'skipped', retry: 'retrying' };
 
 const runPath = (runId) => `/api/runs/${encodeURIComponent(runId)}`;
 const eventsPath = (runId, after, limit) => `/api/runs/${encodeURIComponent(runId)}/events?after=${after}&limit=${limit}`;
-const findingsPath = (runId, before, limit) => (before === null ? `/api/runs/${encodeURIComponent(runId)}/findings?limit=${limit}` : `/api/runs/${encodeURIComponent(runId)}/findings?before=${encodeURIComponent(before)}&limit=${limit}`);
+const findingsPath = (runId, limit) => `/api/runs/${encodeURIComponent(runId)}/findings?limit=${limit}`;
 const beforePath = (runId, before, limit) => `/api/runs/${encodeURIComponent(runId)}/events?before=${before}&limit=${limit}`;
 const streamPath = (runId, after) => (after === null ? `/api/runs/${encodeURIComponent(runId)}/stream` : `/api/runs/${encodeURIComponent(runId)}/stream?after=${after}`);
+const artifactsPath = (runId) => `/api/runs/${encodeURIComponent(runId)}/artifacts`;
+const artifactPath = (runId, name) => `/api/runs/${encodeURIComponent(runId)}/artifacts/${encodeURIComponent(name)}`;
+const outputsPath = (runId) => `/api/runs/${encodeURIComponent(runId)}/outputs`;
 
 const tokens = (value) => (Number.isFinite(Number(value)) ? Number(value).toLocaleString('en-US') : '—');
 
@@ -68,6 +74,119 @@ function itemNode(item) {
     element('span', { class: 'feed-label' }, label), ' ', element('span', {}, text));
 }
 
+function findingNode(finding) {
+  const where = finding.path ? `${finding.path}${finding.line ? `:${finding.line}` : ''}` : '';
+  return element('li', {},
+    element('div', {}, element('span', { class: `chip ${finding.severity === 'high' || finding.severity === 'critical' ? 'bad' : 'warn'}` }, String(finding.severity || 'finding')), oneLine(finding.title || 'Finding', 200)),
+    where ? element('code', { class: 'wrap-anywhere' }, where) : null,
+    finding.body ? element('p', { class: 'finding-body' }, oneLine(finding.body, 400)) : null);
+}
+
+function artifactBody(artifact) {
+  if (artifact.media_type === 'text/markdown') return renderMarkdown(artifact.content);
+  const text = artifact.media_type === 'application/json' ? prettyJson(artifact.content) : artifact.content;
+  return element('pre', { class: 'artifact-text' }, text);
+}
+
+// One artifact with its copy and download buttons. ``load`` fetches it again, as when a newer one replaces it.
+function artifactView(runId, name, signal) {
+  const body = element('div', { class: 'artifact-body' }, loading());
+  const details = element('span', { class: 'muted artifact-meta' });
+  const status = element('span', { class: 'muted', role: 'status' });
+  const copyButton = element('button', { type: 'button', disabled: true }, 'Copy');
+  const downloadButton = element('button', { type: 'button', disabled: true }, 'Download');
+  let current = null;
+  copyButton.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(current.content);
+      setText(status, 'Copied.');
+    } catch {
+      setText(status, 'Could not copy. Use Download instead.');
+    }
+  });
+  downloadButton.addEventListener('click', () => {
+    const href = URL.createObjectURL(new Blob([current.content], { type: downloadType(current.media_type) }));
+    const anchor = element('a', { download: name, hidden: true });
+    anchor.href = href;
+    document.body.append(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(href), 1000);
+  });
+  const node = card(element('div', { class: 'artifact-bar' }, element('span', { class: 'artifact-name mono' }, name), details,
+    element('span', { class: 'artifact-actions' }, copyButton, downloadButton, status)), body);
+  const load = async () => {
+    try {
+      const { artifact } = await api(artifactPath(runId, name));
+      if (signal?.aborted) return;
+      current = artifact;
+      copyButton.disabled = false;
+      downloadButton.disabled = false;
+      setText(details, [artifact.media_type, byteSize(artifact.size), `saved ${when(artifact.created_at)}`, artifact.step_id ? `by step ${artifact.step_id}` : null].filter(Boolean).join(' · '));
+      clear(body).append(artifactBody(artifact));
+    } catch (err) {
+      clear(body).append(errorBox(err));
+    }
+  };
+  return { node, load };
+}
+
+// Every step in run order with its children under it. Failed steps start open, and output is drawn on first open.
+function outputView(runId, signal) {
+  const list = element('div', { class: 'output-list' });
+  const findingsSlot = element('div', {});
+  const opened = new Set();
+  let outputs = {};
+  let steps = [];
+  const fill = (details, step, key) => {
+    const { text, truncated } = outputText(outputs[key]);
+    details.append(element('div', { class: 'output-body' },
+      step.error ? element('div', { class: 'banner bad', role: 'alert' }, String(step.error)) : null,
+      Object.hasOwn(outputs, key) ? [element('pre', { class: 'output-text' }, text), truncated ? element('p', { class: 'note' }, 'This output was cut short before it was stored.') : null]
+        : element('p', { class: 'muted' }, 'No output recorded.')));
+  };
+  const draw = () => {
+    clear(list);
+    const ordered = stepTree(steps);
+    if (!ordered.length) list.append(empty('No steps yet.'));
+    for (const { step, key, depth } of ordered) {
+      const failed = step.status === 'failed';
+      const details = element('details', { class: `output-step depth-${Math.min(depth, 4)}${failed ? ' tone-bad' : ''}`, open: failed || opened.has(key) },
+        element('summary', {}, statusChip(step.status), ' ', element('span', { class: 'step-name' }, step.step_id),
+          element('span', { class: 'step-num' }, duration(elapsedSeconds(step.started_at, step.finished_at))),
+          step.cost_usd === null || step.cost_usd === undefined ? null : element('span', { class: 'step-num' }, money(step.cost_usd, 4)),
+          branchText(step) ? element('span', { class: 'step-branches' }, branchText(step)) : null));
+      if (details.open) fill(details, step, key);
+      details.addEventListener('toggle', () => {
+        if (details.open) opened.add(key);
+        else opened.delete(key);
+        if (details.open && details.childElementCount === 1) fill(details, step, key);
+      });
+      list.append(details);
+    }
+  };
+  const refresh = async (freshSteps) => {
+    steps = freshSteps;
+    try {
+      outputs = (await api(outputsPath(runId)))?.outputs || {};
+    } catch (err) {
+      clear(list).append(errorBox(err));
+      return;
+    }
+    if (!signal?.aborted) draw();
+  };
+  const showFindings = async () => {
+    try {
+      const findings = listOf(await api(findingsPath(runId, FINDINGS_PAGE)), 'findings');
+      if (!findings.length || signal?.aborted) return;
+      clear(findingsSlot).append(card(element('h2', { class: 'inline' }, 'Findings'),
+        element('ul', { class: 'finding-list', role: 'list' }, findings.map(findingNode)),
+        findings.length >= FINDINGS_PAGE ? element('p', { class: 'note' }, `Showing the newest ${FINDINGS_PAGE}.`) : null));
+    } catch {}
+  };
+  return { node: element('div', {}, card(element('h2', { class: 'visually-hidden' }, 'Steps and their output'), list), findingsSlot), refresh, showFindings };
+}
+
 export async function render(root, { args, signal }) {
   const runId = args[0];
   if (!runId) {
@@ -75,31 +194,45 @@ export async function render(root, { args, signal }) {
     return;
   }
   let detail;
+  let artifactList;
+  let display;
   try {
-    detail = await api(runPath(runId));
+    [detail, artifactList, display] = await Promise.all([api(runPath(runId)), api(artifactsPath(runId)).catch(() => ({ artifacts: [] })), loadDisplay()]);
   } catch (err) {
     root.append(pageHeader('Run'), errorBox(err));
     return;
   }
   let run = detail?.run || {};
   let steps = Array.isArray(detail?.steps) ? detail.steps.map((step) => ({ ...step })) : [];
+  let names = orderArtifacts(listOf(artifactList, 'artifacts').map((artifact) => artifact.name));
+  const active = activeTab(args[1], names);
 
+  // Header
+  const workflowName = workflowLabel(display, run.workflow);
+  const titleText = element('span', {}, run.summary?.title || workflowName || 'Run');
   const chipSlot = element('span', {}, statusChip(run.status));
+  const verdictSlot = element('span', {});
   const liveNote = element('span', { class: 'live-state muted', role: 'status' }, 'Connecting…');
   const projectText = element('span', {}, '—');
   const durationText = element('span', { class: 'mono' });
   const costText = element('span', { class: 'mono' });
   const tokenText = element('span', { class: 'mono' });
   const extraMeta = element('span', {});
+  const fieldsSlot = element('span', { class: 'run-fields' });
+  const linksSlot = element('div', { class: 'run-links' });
+  const progressText = element('p', { class: 'run-progress' });
   const errorSlot = element('div', {});
-  root.append(element('p', { class: 'crumb' }, link(hashFor('runs'), 'Runs')),
-    pageHeader(run.workflow || 'Run', chipSlot, run.dry_run ? element('span', { class: 'chip warn', title: 'Recorded outputs stood in for every step.' }, 'Dry run') : null, liveNote),
+  const heading = pageHeader('', chipSlot, verdictSlot, run.dry_run ? element('span', { class: 'chip warn', title: 'Recorded outputs stood in for every step.' }, 'Dry run') : null, liveNote);
+  heading.querySelector('h1').append(titleText);
+  root.append(element('p', { class: 'crumb' }, link(hashFor('runs'), 'Runs')), heading,
     element('div', { class: 'meta' },
+      run.subject ? labelled('Subject', subjectLink(run.subject)) : null,
+      run.summary?.title ? labelled('Workflow', element('span', {}, workflowName)) : null,
       labelled('Project', projectText),
       labelled('Triggered by', element('span', {}, [run.triggered_by || '—', run.trigger_kind ? ` (${run.trigger_kind})` : ''].join(''))),
       labelled('Started', element('span', { title: run.started_at || null }, when(run.started_at))),
-      labelled('Duration', durationText), labelled('Cost', costText), labelled('Tokens', tokenText), extraMeta),
-    errorSlot);
+      labelled('Duration', durationText), labelled('Cost', costText), labelled('Tokens', tokenText), fieldsSlot, extraMeta),
+    linksSlot, progressText, errorSlot);
   if (run.team_id) {
     api(`/api/teams/${encodeURIComponent(run.team_id)}/projects`).then((payload) => {
       const project = listOf(payload, 'projects').find((candidate) => String(candidate.id) === String(run.project_id));
@@ -108,11 +241,29 @@ export async function render(root, { args, signal }) {
   }
 
   let shownStatus = run.status;
+  let shownSummary = null;
+  const drawSummary = () => {
+    const summary = run.summary && typeof run.summary === 'object' ? run.summary : {};
+    const key = JSON.stringify(summary);
+    if (key === shownSummary) return;
+    shownSummary = key;
+    setText(titleText, summary.title || workflowName || 'Run');
+    append(clear(verdictSlot), [verdictChip(summary.verdict)]);
+    const fields = summary.fields && typeof summary.fields === 'object' ? Object.entries(summary.fields) : [];
+    append(clear(fieldsSlot), fields.map(([name, value]) => labelled(name, element('span', {}, String(value)))));
+    append(clear(linksSlot), summaryLinks(summary).map(({ label, url }) => {
+      const anchor = element('a', { rel: 'noopener noreferrer', target: url.startsWith('/') ? null : '_blank' }, label);
+      // dom.js keeps to https and hash links, and summaryLinks has already vetted this one.
+      anchor.setAttribute('href', url);
+      return anchor;
+    }));
+  };
   const updateHeader = () => {
     if (run.status !== shownStatus) {
       shownStatus = run.status;
       clear(chipSlot).append(statusChip(run.status));
     }
+    drawSummary();
     const isOpen = !TERMINAL.has(run.status);
     setText(durationText, duration(elapsedSeconds(run.started_at, run.finished_at || (isOpen ? null : run.started_at))));
     setText(costText, money(run.cost_usd, 4));
@@ -123,104 +274,55 @@ export async function render(root, { args, signal }) {
     const errorText = run.error ? oneLine(run.error, 600) : '';
     if (errorSlot.textContent !== errorText) clear(errorSlot).append(errorText ? element('div', { class: 'banner bad', role: 'alert' }, errorText) : null);
   };
+  const syncProgress = () => setText(progressText, progress(steps).text);
   updateHeader();
+  syncProgress();
 
-  // Steps
-  let stepFilter = null;
-  let shownSteps = null;
-  const stepRows = new Map();
-  const stepList = element('ul', { class: 'step-list', role: 'list' });
-  const allSteps = element('button', { type: 'button', class: 'link-button', hidden: true }, 'Show all steps');
-  const stepsCard = card(element('h2', { class: 'inline' }, 'Steps'), stepList, allSteps);
-  const syncSteps = () => {
-    for (const { step, key, parent } of stepTree(steps)) {
-      let row = stepRows.get(key);
-      if (!row) {
-        const button = element('button', { type: 'button', class: 'step-row', 'aria-pressed': 'false' });
-        row = {
-          button, chip: element('span', {}), name: element('span', { class: 'step-name' }, step.step_id), time: element('span', { class: 'step-num step-time' }),
-          cost: element('span', { class: 'step-num step-cost' }), branches: element('span', { class: 'step-branches' }), item: element('li', {}), children: null, status: null,
-        };
-        button.append(row.chip, row.name, row.time, row.cost, row.branches);
-        button.addEventListener('click', () => setFilter(stepFilter === key ? null : key));
-        row.item.append(button);
-        stepRows.set(key, row);
-      }
-      const parentRow = parent ? stepRows.get(parent) : null;
-      if (parentRow && !parentRow.children) parentRow.item.append(parentRow.children = element('ul', { class: 'step-list step-children', role: 'list' }));
-      const list = parentRow ? parentRow.children : stepList;
-      if (row.item.parentElement !== list) list.append(row.item);
-      if (row.status !== step.status) {
-        row.status = step.status;
-        clear(row.chip).append(statusChip(step.status));
-      }
-      setText(row.time, duration(elapsedSeconds(step.started_at, step.finished_at)));
-      setText(row.cost, step.cost_usd === null || step.cost_usd === undefined ? '' : money(step.cost_usd, 4));
-      setText(row.branches, branchText(step));
-      if (step.error) row.button.title = oneLine(step.error, 300);
+  // Tabs
+  const baseHash = hashFor('run', [runId]);
+  let tabRow = tabs(baseHash, runTabs(names), active, { label: 'Run sections' });
+  const panel = tabRow.panel;
+  root.append(tabRow.tablist, panel);
+  const activeArtifact = artifactForTab(active, names);
+  const artifactTab = activeArtifact ? artifactView(runId, activeArtifact, signal) : null;
+  const output = active === OUTPUT_TAB ? outputView(runId, signal) : null;
+  const onArtifact = (payload) => {
+    if (typeof payload?.name !== 'string') return;
+    if (payload.name === activeArtifact) artifactTab.load();
+    if (names.includes(payload.name)) return;
+    names = orderArtifacts([...names, payload.name]);
+    const fresh = tabs(baseHash, runTabs(names), active, { label: 'Run sections' });
+    tabRow.tablist.replaceWith(fresh.tablist);
+    tabRow = { tablist: fresh.tablist, panel };
+  };
+  let outputTimer = 0;
+  const outputSoon = () => {
+    if (output && !outputTimer) {
+      outputTimer = setTimeout(() => {
+        outputTimer = 0;
+        output.refresh(steps);
+      }, REFRESH_MS);
     }
-    if (!steps.length && !stepList.firstChild) stepList.append(element('li', { class: 'muted' }, 'No steps yet.'));
-    else if (steps.length) stepList.querySelector(':scope > li.muted')?.remove();
   };
 
-  // Findings come newest first from their own route. Live finding events go on top.
-  let findingsFromRoute = false;
-  let findingsBefore = null;
-  const routeFindings = new Set();
-  const findingSignature = (finding) => `${finding.path || ''}:${finding.line || ''}:${finding.title || ''}`;
-  const findingList = element('ul', { class: 'finding-list', role: 'list' });
-  const findingNote = element('p', { class: 'muted' }, 'None yet.');
-  const moreFindings = element('button', { type: 'button', class: 'link-button', hidden: true }, 'Load more');
-  const findingsCard = card(element('h2', { class: 'inline' }, 'Findings'), findingNote, findingList, moreFindings);
-  const findingNode = (finding) => {
-    const where = finding.path ? `${finding.path}${finding.line ? `:${finding.line}` : ''}` : '';
-    return element('li', {},
-      element('div', {}, element('span', { class: `chip ${finding.severity === 'high' || finding.severity === 'critical' ? 'bad' : 'warn'}` }, String(finding.severity || 'finding')), oneLine(finding.title || 'Finding', 200)),
-      where ? element('code', { class: 'wrap-anywhere' }, where) : null,
-      finding.body ? element('p', { class: 'finding-body' }, oneLine(finding.body, 400)) : null);
-  };
-  const addFinding = (finding, { atTop = true } = {}) => {
-    if (atTop && routeFindings.delete(findingSignature(finding))) return;
-    findingNote.hidden = true;
-    if (atTop) findingList.prepend(findingNode(finding));
-    else findingList.append(findingNode(finding));
-    while (findingList.childElementCount > FINDINGS_SHOWN) findingList.lastElementChild.remove();
-  };
-  const loadFindings = async () => {
-    const page = await api(findingsPath(runId, findingsBefore, FINDINGS_PAGE));
-    for (const finding of listOf(page, 'findings')) addFinding(finding, { atTop: false });
-    findingsBefore = page?.next_before ?? null;
-    moreFindings.hidden = findingsBefore === null || findingList.childElementCount >= FINDINGS_SHOWN;
-    return page;
-  };
-  moreFindings.addEventListener('click', async () => {
-    moreFindings.disabled = true;
-    try {
-      await loadFindings();
-    } catch (err) {
-      findingsCard.append(errorBox(err));
-    } finally {
-      moreFindings.disabled = false;
-    }
-  });
-  // A finding written between the run summary and this fetch also arrives as a live event, so the first page's are remembered.
-  const firstFindings = loadFindings().then((page) => {
-    findingsFromRoute = true;
-    for (const finding of listOf(page, 'findings')) routeFindings.add(findingSignature(finding));
-  }).catch(() => {});
-
-  // Feed
+  // Log
   const announcer = element('div', { class: 'visually-hidden', role: 'log', 'aria-live': 'polite' });
   const earlierButton = element('button', { type: 'button', class: 'link-button' }, 'Load earlier');
   const earlierRow = element('div', { class: 'feed-earlier', hidden: true }, earlierButton);
   const feedList = element('div', { class: 'feed-list' });
-  const feedBox = element('div', { class: 'feed', tabindex: 0, role: 'region', 'aria-label': 'Run activity' }, earlierRow, feedList);
+  const feedBox = element('div', { class: 'feed', tabindex: 0, role: 'region', 'aria-label': 'Run log' }, earlierRow, feedList);
   const jumpButton = element('button', { type: 'button', class: 'jump', hidden: true }, 'Jump to latest');
-  const filterNote = element('p', { class: 'note', hidden: true });
-  const feedCard = card(element('h2', { class: 'inline' }, 'Activity'), filterNote, element('div', { class: 'feed-frame' }, feedBox, jumpButton), announcer);
-  root.append(element('div', { class: 'run-layout' },
-    element('div', { class: 'run-steps' }, stepsCard), element('div', { class: 'run-feed' }, feedCard), element('div', { class: 'run-findings' }, findingsCard)));
-  syncSteps();
+
+  if (artifactTab) {
+    panel.append(artifactTab.node);
+    artifactTab.load();
+  } else if (output) {
+    panel.append(output.node);
+    output.refresh(steps);
+    if (!names.length) output.showFindings();
+  } else {
+    panel.append(card(element('div', { class: 'feed-frame' }, feedBox, jumpButton), announcer));
+  }
 
   const model = new FeedModel();
   const nodes = new Map();
@@ -239,8 +341,7 @@ export async function render(root, { args, signal }) {
     updateChrome();
   });
 
-  const groupNode = (stepId) => element('section', { class: 'feed-group', 'data-step': stepId ?? '', hidden: shownSteps !== null && !shownSteps.has(stepId) },
-    element('h3', { class: 'feed-step' }, stepId || 'Run'));
+  const groupNode = (stepId) => element('section', { class: 'feed-group', 'data-step': stepId ?? '' }, element('h3', { class: 'feed-step' }, stepId || 'Run'));
   const place = (item, node) => {
     const last = feedList.lastElementChild;
     const group = last && last.dataset.step === (item.step_key ?? '') ? last : feedList.appendChild(groupNode(item.step_key));
@@ -291,22 +392,11 @@ export async function render(root, { args, signal }) {
     for (const item of added) place(item, itemNode(item));
   };
 
-  const setFilter = (stepId) => {
-    stepFilter = stepId;
-    for (const [id, row] of stepRows) row.button.setAttribute('aria-pressed', String(id === stepId));
-    shownSteps = stepId === null ? null : descendants(steps, stepId);
-    for (const group of feedList.children) group.hidden = shownSteps !== null && !shownSteps.has(group.dataset.step);
-    allSteps.hidden = stepId === null;
-    filterNote.hidden = stepId === null;
-    setText(filterNote, stepId === null ? '' : `Showing step ${stepId}${shownSteps.size > 1 ? ' and its child steps' : ''} only.`);
-    toBottom();
-  };
-  allSteps.addEventListener('click', () => setFilter(null));
-
   // Screen readers hear step and run changes at most every ANNOUNCE_MS, never each event.
   let announceTimer = 0;
   let pendingAnnouncements = [];
   const announce = (text) => {
+    if (active !== LOG_TAB) return;
     pendingAnnouncements.push(text);
     if (announceTimer) return;
     announceTimer = setTimeout(() => {
@@ -319,6 +409,7 @@ export async function render(root, { args, signal }) {
 
   let refreshTimer = 0;
   let lastRefresh = 0;
+  let settleSoon = () => {};
   const refresh = async () => {
     refreshTimer = 0;
     lastRefresh = Date.now();
@@ -331,7 +422,7 @@ export async function render(root, { args, signal }) {
         steps = fresh.steps.map((step) => ({ branch_total: known.get(stepKey(step))?.branch_total, branches_done: known.get(stepKey(step))?.branches_done, ...step }));
       }
       updateHeader();
-      syncSteps();
+      syncProgress();
       if (TERMINAL.has(run.status)) settleSoon();
     } catch {}
   };
@@ -339,7 +430,11 @@ export async function render(root, { args, signal }) {
     if (!refreshTimer) refreshTimer = setTimeout(refresh, Math.max(0, REFRESH_MS - (Date.now() - lastRefresh)));
   };
 
-  let sideSeq = 0;
+  // Only the log replays history. Every tab follows what happens after the page loads.
+  const isLog = active === LOG_TAB;
+  const lastSeq = run.last_seq === undefined ? NaN : Number(run.last_seq);
+  const hasBefore = Number.isFinite(lastSeq);
+  let sideSeq = !isLog && hasBefore ? lastSeq : 0;
   const sideEffects = (events, { live }) => {
     let stepsChanged = false;
     for (const event of events) {
@@ -351,18 +446,19 @@ export async function render(root, { args, signal }) {
         stepsChanged = true;
         if (live) announce(`Step ${event.step_id} ${STEP_WORDS[event.kind]}.`);
       }
-      if (event.kind === 'finding' && (live || !findingsFromRoute)) addFinding(payload);
+      if (live && event.kind === 'artifact') onArtifact(payload);
       if (event.kind === 'run_end' && payload.status) {
         run = { ...run, status: payload.status, error: payload.error ?? run.error, finished_at: run.finished_at || event.ts };
         if (live) announce(`Run ${payload.status}.`);
         updateHeader();
       }
       if (live && ['step_end', 'step_failed', 'cost', 'run_end'].includes(event.kind)) refreshSoon();
+      if (live && ['step_start', 'step_end', 'step_failed', 'step_skipped'].includes(event.kind)) outputSoon();
     }
-    if (stepsChanged) syncSteps();
+    if (stepsChanged) syncProgress();
   };
 
-  let phase = 'loading';
+  let phase = isLog ? 'loading' : 'live';
   let queue = [];
   let frame = 0;
   const flush = () => {
@@ -379,6 +475,10 @@ export async function render(root, { args, signal }) {
   const seenSeq = () => Math.max(sideSeq, streamSeq);
   const receive = (events) => {
     for (const event of events) streamSeq = Math.max(streamSeq, Number(event?.seq) || 0);
+    if (!isLog) {
+      sideEffects(events, { live: true });
+      return;
+    }
     queue.push(...events);
     if (phase === 'live' && !frame) frame = requestAnimationFrame(flush);
   };
@@ -396,7 +496,7 @@ export async function render(root, { args, signal }) {
   };
   let catching = null;
   const catchUp = () => {
-    catching ||= fetchAfter(sideSeq, receive).catch(() => {}).finally(() => { catching = null; });
+    catching ||= fetchAfter(seenSeq(), receive).catch(() => {}).finally(() => { catching = null; });
     return catching;
   };
 
@@ -404,7 +504,8 @@ export async function render(root, { args, signal }) {
   let poller = null;
   let settled = false;
   const setLive = (state) => setText(liveNote, LIVE_STATES[state] || '');
-  const settleSoon = () => {
+  const ticker = setInterval(updateHeader, 1000);
+  settleSoon = () => {
     if (settled) return;
     settled = true;
     setTimeout(async () => {
@@ -414,17 +515,14 @@ export async function render(root, { args, signal }) {
       clearInterval(ticker);
       setLive('ended');
       updateHeader();
+      outputSoon();
     }, SETTLE_MS);
   };
-
-  const ticker = setInterval(() => {
-    updateHeader();
-    syncSteps();
-  }, 1000);
   signal?.addEventListener('abort', () => {
     clearInterval(ticker);
     clearTimeout(refreshTimer);
     clearTimeout(announceTimer);
+    clearTimeout(outputTimer);
     cancelAnimationFrame(frame);
     stream?.close();
     poller?.stop();
@@ -487,15 +585,14 @@ export async function render(root, { args, signal }) {
     model.noteStart(page, events);
     finishLoad();
   };
-  const lastSeq = run.last_seq === undefined ? NaN : Number(run.last_seq);
-  const hasBefore = Number.isFinite(lastSeq);
-  await firstFindings;
-  try {
-    if (hasBefore) await loadNewest(newestBefore(lastSeq));
-    else await loadTail(0);
-  } catch (err) {
-    feedList.append(errorBox(err));
-    phase = 'live';
+  if (isLog) {
+    try {
+      if (hasBefore) await loadNewest(newestBefore(lastSeq));
+      else await loadTail(0);
+    } catch (err) {
+      feedList.append(errorBox(err));
+      phase = 'live';
+    }
   }
   if (signal?.aborted) return;
   if (TERMINAL.has(run.status)) {

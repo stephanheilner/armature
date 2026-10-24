@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import random
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -15,8 +16,8 @@ from armature.server import rbac
 from armature.server.app.deps import Granted, by_run, require, server, signed_in
 from armature.server.app.http import ApiError
 from armature.server.auth import Session, load_session
-from armature.server.db.schema import findings, run_steps, runs
-from armature.server.ingest import list_row, load_summary
+from armature.server.db.schema import findings, run_artifacts, run_steps, runs
+from armature.server.ingest import TRUNCATED, list_row, load_summary
 from armature.server.live import (
     Message,
     Subscription,
@@ -272,3 +273,67 @@ def list_findings(run_id: str, request: Request, before: str | None = None,
     listed = [{"id": r.id, "path": r.path, "line": r.line, "severity": r.severity, "title": r.title,
                "body": r.body, "step_id": r.step_id, "created_at": r.created_at} for r in rows]
     return {"findings": listed, "next_before": rows[-1].id if len(rows) == limit else None}
+
+
+OUTPUT_SHOWN_BYTES = 256 * 1024
+
+
+def _shown_output(output: Any) -> Any:
+    text = json.dumps(output, ensure_ascii=False, default=str)
+    if len(text.encode("utf-8")) <= OUTPUT_SHOWN_BYTES:
+        return output
+    return {TRUNCATED: True, "value": text.encode("utf-8")[:OUTPUT_SHOWN_BYTES].decode("utf-8", "ignore")}
+
+
+@router.get("/api/runs/{run_id}/outputs")
+async def list_outputs(run_id: str, request: Request,
+                       granted: Granted = Depends(require("viewer", by_run()))) -> dict[str, Any]:
+    """Each step's stored output by step key, for steps that have one. A very large output is cut to text."""
+    def read() -> list[Any]:
+        with server(request).engine.connect() as conn:
+            return conn.execute(select(run_steps.c.step_key, run_steps.c.output)
+                                .where(run_steps.c.run_id == run_id, run_steps.c.output.is_not(None))).all()
+
+    rows = await asyncio.to_thread(read)
+    return {"outputs": {r.step_key: _shown_output(r.output) for r in rows if r.output is not None}}
+
+
+ARTIFACT_FIELDS = ("name", "step_id", "media_type", "size", "created_at")
+
+
+def _artifact(row: Any, content: bool = False) -> dict[str, Any]:
+    fields = (*ARTIFACT_FIELDS, "content") if content else ARTIFACT_FIELDS
+    return {name: row[name] for name in fields}
+
+
+@router.get("/api/runs/{run_id}/artifacts")
+async def list_artifacts(run_id: str, request: Request,
+                         granted: Granted = Depends(require("viewer", by_run()))) -> dict[str, Any]:
+    """Every artifact of the run, without content, ordered by name."""
+    def read() -> list[dict[str, Any]]:
+        columns = [run_artifacts.c[name] for name in ARTIFACT_FIELDS]
+        with server(request).engine.connect() as conn:
+            rows = conn.execute(select(*columns).where(run_artifacts.c.run_id == run_id)).all()
+        return [dict(r._mapping) for r in rows]
+
+    stored = {a["name"]: a for a in await asyncio.to_thread(read)}
+    stored.update({name: _artifact(a) for name, a in _live(request).writer.pending_artifacts(run_id).items()})
+    return {"artifacts": [stored[name] for name in sorted(stored)]}
+
+
+@router.get("/api/runs/{run_id}/artifacts/{name}")
+async def get_artifact(run_id: str, name: str, request: Request,
+                       granted: Granted = Depends(require("viewer", by_run()))) -> dict[str, Any]:
+    pending = _live(request).writer.pending_artifacts(run_id).get(name)
+    if pending is not None:
+        return {"artifact": _artifact(pending, content=True)}
+
+    def read() -> Any:
+        with server(request).engine.connect() as conn:
+            return conn.execute(select(run_artifacts).where(run_artifacts.c.run_id == run_id,
+                                                            run_artifacts.c.name == name)).first()
+
+    row = await asyncio.to_thread(read)
+    if row is None:
+        raise ApiError(404, "No such artifact.")
+    return {"artifact": _artifact(row._mapping, content=True)}
