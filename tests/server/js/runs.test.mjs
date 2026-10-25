@@ -15,8 +15,8 @@ test('runLabel prefers the title, then the workflow label', () => {
   assert.equal(runLabel({}, {}), 'Unnamed workflow');
 });
 
-test('subjectHref links the run list filtered to the subject', () => {
-  assert.equal(subjectHref('fs-eng/android-tree#12'), '#/runs?subject=fs-eng%2Fandroid-tree%2312');
+test('subjectHref links the subject page', () => {
+  assert.equal(subjectHref('fs-eng/android-tree#12'), '#/subject/fs-eng%2Fandroid-tree%2312');
 });
 
 test('verdictTone reads approvals as ok and blocks as bad', () => {

@@ -45,7 +45,7 @@ export function workflowOptions(display, names) {
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
-export const subjectHref = (subject) => hashFor('runs', [], { subject });
+export const subjectHref = (subject) => hashFor('subject', [subject]);
 
 export function verdictTone(verdict) {
   const text = String(verdict || '').toLowerCase();

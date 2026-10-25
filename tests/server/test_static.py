@@ -88,6 +88,12 @@ CONTRACT = [
     "GET /api/display",
     "GET /api/overview",
     "GET /api/trends",
+    "GET /api/runs/{id}/actions",
+    "POST /api/runs/{id}/actions/{action}",
+    "GET /api/operations",
+    "GET /api/status",
+    "GET /api/subjects",
+    "GET /api/subjects/{subject}",
 ]
 CONTRACT_PATTERNS = [re.compile("^" + re.sub(r"\\\{\w+\\\}", "[^/]+", re.escape(entry.split(" ", 1)[1])) + "$") for entry in CONTRACT]
 

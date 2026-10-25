@@ -8,7 +8,7 @@ from sqlalchemy import insert
 
 from armature.server import secrets as secret_store
 from armature.server.db import new_id
-from armature.server.db.schema import run_artifacts, runs
+from armature.server.db.schema import findings, run_artifacts, runs
 from tests.server.app_support import (
     ORIGIN,
     Clock,
@@ -48,6 +48,17 @@ READS = [
                                             "failure_rate", "verdicts_per_day",
                                             "man_hours_per_day", "agent_hours_per_day", "slowest_steps",
                                             "cost_by_role", "timezone"}),
+    ("views/subject.js", "row", "subject_row", {"subject", "title", "status", "runs", "reviews", "fixes", "cost_usd",
+                                                "last_activity"}),
+    ("views/subject.js", "page", "subjects", {"next_before"}),
+    ("views/subject.js", "detail", "subject", {"subject", "title", "status", "latest_verdict", "repo", "links", "runs",
+                                               "findings"}),
+    ("views/subject.js", "run", "subject_run", {"id", "kind", "workflow", "workflow_label", "status", "started_at",
+                                                "verdict", "mode", "head", "cost_usd", "artifacts", "fix", "merge",
+                                                "fields"}),
+    ("views/subject.js", "finding", "subject_finding", {"finding_key", "title", "path", "line",
+                                                        "current_disposition", "history"}),
+    ("views/subject.js", "event", "finding_event", {"run_id", "started_at", "disposition"}),
 ]
 
 
@@ -67,6 +78,12 @@ def responses(sqlite_engine, keyring):
         conn.execute(insert(run_artifacts).values(run_id=run_id, name="review.md", step_id="post",
                                                   media_type="text/markdown", content="# Review", size=8,
                                                   created_at=clock()))
+        subject_run = new_id()
+        conn.execute(insert(runs).values(id=subject_run, team_id=side.team, status="succeeded", started_at=clock(),
+                                         workflow_name="pr-fix", subject="acme/app#1", summary={"title": "T"},
+                                         trigger_ref={"head": "abc", "fix": {"outcome": "pushed"}}))
+        conn.execute(insert(findings).values(id=new_id(), run_id=subject_run, finding_key="k", disposition="keep",
+                                             created_at=clock()))
     admin_id, _ = add_user(sqlite_engine, keyring, clock, "root", is_admin=True)
     client = make_client(sqlite_engine, keyring, clock)
     csrf = sign_in_as(client, sqlite_engine, keyring, clock, admin_id)
@@ -76,6 +93,7 @@ def responses(sqlite_engine, keyring):
     guest = make_client(sqlite_engine, keyring, clock)
     guest_csrf = guest.get("/api/session").json()["csrf"]
     users = client.get("/api/users").json()["users"]
+    subject = client.get("/api/subjects/acme%2Fapp%231").json()["subject"]
     created_key = client.post("/api/runner-keys", json={"name": "host"}, headers=mutation(csrf)).json()
     return {
         "inspect": guest.post("/api/invite/inspect", json={"token": token},
@@ -96,6 +114,12 @@ def responses(sqlite_engine, keyring):
         "artifact": client.get(f"/api/runs/{run_id}/artifacts/review.md").json()["artifact"],
         "overview": client.get("/api/overview").json(),
         "trends": client.get("/api/trends").json(),
+        "subjects": client.get("/api/subjects").json(),
+        "subject_row": client.get("/api/subjects").json()["subjects"][0],
+        "subject": subject,
+        "subject_run": subject["runs"][0],
+        "subject_finding": subject["findings"][0],
+        "finding_event": subject["findings"][0]["history"][0],
     }
 
 

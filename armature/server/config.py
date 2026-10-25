@@ -60,6 +60,49 @@ class ExportConfig(BaseModel):
         return value
 
 
+def _argv(value: list[str] | None) -> list[str] | None:
+    if value is not None and (not value or not all(value) or any("\0" in part for part in value)):
+        raise ValueError("command is a non-empty list of non-empty arguments")
+    return value
+
+
+class ActionConfig(BaseModel):
+    """A host command a user can run against one run from its page. Only the config file sets it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{0,39}$")
+    label: str = Field(min_length=1, max_length=60)
+    workflows: list[str] = Field(min_length=1)
+    statuses: list[str] = Field(default_factory=list)
+    min_role: Literal["viewer", "contributor", "project_lead", "team_lead", "admin"] = "contributor"
+    admin_only: bool = False
+    confirm: str | None = Field(default=None, max_length=500)
+    command: list[str]
+    cwd: str | None = None
+
+    @field_validator("command")
+    @classmethod
+    def _command(cls, value: list[str]) -> list[str]:
+        return _argv(value)
+
+
+class StatusConfig(BaseModel):
+    """A host command whose Markdown output the Status page shows. Only the config file sets it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    command: list[str]
+    interval_seconds: float = Field(default=30, ge=5)
+    timeout_seconds: float = Field(default=20, ge=1, le=300)
+    cwd: str | None = None
+
+    @field_validator("command")
+    @classmethod
+    def _command(cls, value: list[str]) -> list[str]:
+        return _argv(value)
+
+
 class AssistConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -95,6 +138,8 @@ class ServerConfig(BaseModel):
     export_on_change: ExportConfig | None = None
     assist: AssistConfig = Field(default_factory=AssistConfig)
     dry_run: DryRunConfig = Field(default_factory=DryRunConfig)
+    actions: list[ActionConfig] = Field(default_factory=list)
+    status: StatusConfig | None = None
 
     @field_validator("base_path")
     @classmethod
@@ -109,6 +154,14 @@ class ServerConfig(BaseModel):
         scheme, _, rest = value.partition(":")
         if scheme not in ("env", "file", "kms") or not rest:
             raise ValueError("master_key must be env:<NAME>, file:<path>, or kms:<key-arn>")
+        return value
+
+    @field_validator("actions")
+    @classmethod
+    def _unique_actions(cls, value: list[ActionConfig]) -> list[ActionConfig]:
+        ids = [action.id for action in value]
+        if len(ids) != len(set(ids)):
+            raise ValueError("each action needs its own id")
         return value
 
     @model_validator(mode="after")
@@ -143,7 +196,7 @@ def load_config(path: Path | str | None = None, env: Mapping[str, str] | None = 
             raise ValueError(f"{p} must hold a mapping")
         data = dict(loaded or {})
     for name in ServerConfig.model_fields:
-        if name in ("oidc", "export_on_change", "assist", "dry_run"):
+        if name in ("oidc", "export_on_change", "assist", "dry_run", "actions", "status"):
             continue
         value = env.get(ENV_PREFIX + name.upper())
         if value is not None:

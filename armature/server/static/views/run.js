@@ -1,3 +1,4 @@
+import { actionsBar } from '../actions.js';
 import { api, listOf } from '../api.js';
 import { append, card, clear, duration, element, empty, errorBox, link, loading, money, pageHeader, statusChip, tabs, when } from '../dom.js';
 import { loadDisplay, workflowLabel } from '../display.js';
@@ -222,6 +223,7 @@ export async function render(root, { args, signal }) {
   const linksSlot = element('div', { class: 'run-links' });
   const progressText = element('p', { class: 'run-progress' });
   const errorSlot = element('div', {});
+  const actions = actionsBar(runId);
   const heading = pageHeader('', chipSlot, verdictSlot, run.dry_run ? element('span', { class: 'chip warn', title: 'Recorded outputs stood in for every step.' }, 'Dry run') : null, liveNote);
   heading.querySelector('h1').append(titleText);
   root.append(element('p', { class: 'crumb' }, link(hashFor('runs'), 'Runs')), heading,
@@ -232,7 +234,8 @@ export async function render(root, { args, signal }) {
       labelled('Triggered by', element('span', {}, [run.triggered_by || '—', run.trigger_kind ? ` (${run.trigger_kind})` : ''].join(''))),
       labelled('Started', element('span', { title: run.started_at || null }, when(run.started_at))),
       labelled('Duration', durationText), labelled('Cost', costText), labelled('Tokens', tokenText), fieldsSlot, extraMeta),
-    linksSlot, progressText, errorSlot);
+    linksSlot, actions.node, progressText, errorSlot);
+  actions.refresh();
   if (run.team_id) {
     api(`/api/teams/${encodeURIComponent(run.team_id)}/projects`).then((payload) => {
       const project = listOf(payload, 'projects').find((candidate) => String(candidate.id) === String(run.project_id));
@@ -262,6 +265,7 @@ export async function render(root, { args, signal }) {
     if (run.status !== shownStatus) {
       shownStatus = run.status;
       clear(chipSlot).append(statusChip(run.status));
+      actions.refresh();
     }
     drawSummary();
     const isOpen = !TERMINAL.has(run.status);

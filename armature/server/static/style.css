@@ -363,6 +363,8 @@ section.adapter { border-top: 1px solid var(--rule); margin-top: 14px; padding-t
 
 /* Run page: header strip, artifacts, and step output. */
 .run-links { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: -6px 0 10px; font-size: 13.5px; }
+.run-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 10px; }
+.run-actions:empty { display: none; }
 .run-fields { display: contents; }
 .run-progress { margin: 0 0 4px; color: var(--ink-2); font-size: 13.5px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .artifact-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; padding-bottom: 12px; margin-bottom: 14px; border-bottom: 1px solid var(--rule); }

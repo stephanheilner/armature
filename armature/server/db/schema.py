@@ -448,3 +448,25 @@ run_tokens = Table(
     Column("team_id", String(36), nullable=False),
     _ts("expires_at"),
 )
+
+OPERATION_OUTCOMES = ("ok", "refused", "failed")
+
+# active_run and active_action hold the run and action while the command runs, so their unique keys allow one at a time.
+operations = Table(
+    "operations", metadata,
+    _id(),
+    Column("action_id", String(64), nullable=False),
+    Column("run_id", String(36), ForeignKey("runs.id"), nullable=False),
+    Column("requested_by", String(36)),
+    _ts("started_at"),
+    _ts("finished_at", nullable=True),
+    Column("exit_code", Integer),
+    Column("outcome", String(16)),
+    Column("message", Text),
+    Column("log", LongText),
+    Column("active_run", String(36), unique=True),
+    Column("active_action", String(64), unique=True),
+    Index(None, "run_id", "started_at"),
+    Index(None, "started_at"),
+    CheckConstraint(f"outcome IS NULL OR {_in('outcome', OPERATION_OUTCOMES)}", name="outcome"),
+)

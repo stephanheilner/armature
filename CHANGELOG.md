@@ -10,6 +10,37 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **Run actions and a Status page.** The server config file (never the UI)
+  can list `actions`, each with an `id`, `label`, the `workflows` and
+  `statuses` it applies to, a `min_role` (contributor by default),
+  `admin_only`, `confirm` text, and a `command`. The run page shows a button
+  for each action the viewer may use, asks for confirmation, then runs the
+  command with no shell, a minimal environment, and a 120-second timeout. The
+  run's fields reach it only as JSON in the file `ARMATURE_ACTION_RUN` names.
+  Exit 0 is done, 3 is refused with the command's message, and anything else
+  failed. Each run is recorded in the new `operations` table, with its
+  message (up to 2 KB) and log (up to 64 KB) redacted, plus an audit row.
+  Only one operation runs at a time per run and per action, and an
+  `admin_only` action needs step-up. `GET /api/runs/{id}/actions`,
+  `POST /api/runs/{id}/actions/{action}`, `GET /api/operations`, and
+  `GET /api/operations/{id}` serve them, the last with the log for admins
+  only. A `status` command runs every `interval_seconds` on a background
+  thread, and `GET /api/status` and the new Status page show its latest
+  Markdown, redacted with the instance's secret values. Admins also see the
+  recent operations there.
+- **Pull request and issue pages.** `GET /api/subjects` lists every subject
+  the viewer can see (a pull request such as `owner/repo#123`, or an issue
+  key) with its latest title and verdict, a status of `merged` once a
+  `pr-merged` run exists, else the latest review verdict, else the latest
+  run's status, and counts of runs, reviews, and fixes. It searches subject
+  and title with `q`, narrows with `team`, and pages with `before`. Hidden
+  workflows stay out of the counts and cost, never out of access or status.
+  `GET /api/subjects/{subject}` returns every visible run in order with its
+  head, verdict, mode, cost, and report names, the merged links, and each
+  finding with its disposition in every review, and answers 404 when the
+  viewer sees none of its runs. The new Pull requests page lists them, and a
+  subject link anywhere now opens `#/subject/<subject>` with Runs, Findings,
+  and Activity tabs.
 - **Run artifacts and a tabbed run page.** A step can save a named report
   with `python -m armature.events artifact --name review.md --file PATH` (or
   `--text`, with `--type text/markdown`, `text/plain`, or
