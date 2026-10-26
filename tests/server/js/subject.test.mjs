@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 const STATIC = new URL('../../../armature/server/static/', import.meta.url);
-const { activityRuns, dispositionLabel, outcomeText, statusCapsuleTone, statusLabel, subjectPageHref, totals, workText } =
+const { activityRuns, dispositionLabel, outcomeText, statusCapsuleTone, statusLabel, subjectPageHref, subjectPath, totals, workText } =
   await import(new URL('views/subject.js', STATIC));
 const { parseHash } = await import(new URL('router.js', STATIC));
 
@@ -11,6 +11,11 @@ test('subjectPageHref keeps a subject with # and / in one route segment', () => 
   assert.equal(href, '#/subject/group%2Fsub%2Frepo%235/findings');
   assert.deepEqual(parseHash(href).args, ['group/sub/repo#5', 'findings']);
   assert.deepEqual(parseHash(subjectPageHref('PROJ-7')).args, ['PROJ-7']);
+});
+
+test('subjectPath keeps slashes literal and encodes the rest of each segment', () => {
+  assert.equal(subjectPath('fs-eng/android-tree#1870'), '/api/subjects/fs-eng/android-tree%231870');
+  assert.equal(subjectPath('PROJ-7'), '/api/subjects/PROJ-7');
 });
 
 test('status capsules read merged, verdicts, and run statuses', () => {

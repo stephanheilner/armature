@@ -229,6 +229,8 @@ def test_subject_with_hash_and_slashes_round_trips(engine, keyring, seeded):
     client = _client(engine, keyring, seeded, "viewer")
     detail = client.get(_path(odd)).json()["subject"]
     assert detail["subject"] == odd and detail["repo"] == "group/sub/repo" and detail["number"] == 5
+    # The UI sends slashes literally, because Apache refuses %2F in a path.
+    assert client.get("/api/subjects/group/sub/repo%235").json()["subject"]["subject"] == odd
     assert client.get(_path(ISSUE)).json()["subject"]["number"] is None
 
 

@@ -14,7 +14,8 @@ const DISPOSITIONS = {
 };
 const DISPOSITION_TONE = { resolved: 'ok', drop_rebutted: 'ok', block: 'bad', keep: 'warn', act: 'warn', change: 'warn' };
 
-const subjectPath = (subject) => `/api/subjects/${encodeURIComponent(subject)}`;
+// Apache refuses %2F in a path, so the slashes stay literal for the {subject:path} route.
+export const subjectPath = (subject) => `/api/subjects/${String(subject).split('/').map(encodeURIComponent).join('/')}`;
 
 export const subjectPageHref = (subject, tab) => hashFor('subject', tab ? [subject, tab] : [subject]);
 
