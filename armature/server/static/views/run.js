@@ -1,13 +1,14 @@
 import { actionsBar } from '../actions.js';
+import { backfill, decisionCard, feedSlot, findingBadge, findingWhere, isBlocking, nowText, rosterLine, RunActivity, stageTrack } from '../activity.js';
 import { api, listOf } from '../api.js';
-import { append, card, clear, duration, element, empty, errorBox, link, loading, money, pageHeader, statusChip, tabs, when } from '../dom.js';
+import { append, card, clear, duration, element, empty, errorBox, link, loading, money, pageHeader, statusChip, table, tabs, when } from '../dom.js';
 import { loadDisplay, workflowLabel } from '../display.js';
 import { applyStepEvent, branchText, describe, earlierPage, elapsedSeconds, FeedModel, groupItems, newestBefore, oneLine, stepKey, stepTree, summarizeInput, TERMINAL } from '../feed.js';
 import { every, subscribe } from '../live.js';
 import { renderMarkdown } from '../markdown.js';
 import { hashFor } from '../router.js';
 import { activeTab, artifactForTab, byteSize, downloadType, LOG_TAB, orderArtifacts, OUTPUT_TAB, outputText, prettyJson, progress, runTabs, summaryLinks } from '../runpage.js';
-import { subjectLink, verdictChip } from './runs.js';
+import { listParams, runStatus, shortWhen, subjectLink, verdictChip } from './runs.js';
 
 const PAGE = 1000;
 const EARLIER_PAGE = 500;
@@ -64,15 +65,123 @@ function fillTool(details, item) {
     ] : element('div', { class: 'tool-head muted' }, 'No result yet.')));
 }
 
+// A finding with its badge in words, where it is, the claim, and the body behind a disclosure.
+function findingCard(finding, opened = null) {
+  const blocking = isBlocking(finding);
+  const where = findingWhere(finding);
+  const body = finding.body ? String(finding.body) : '';
+  return element('div', { class: `finding-card${blocking ? ' blocking' : ''}` },
+    element('div', { class: 'finding-head' },
+      element('span', { class: `chip ${blocking ? 'bad' : finding.severity === 'high' || finding.severity === 'critical' ? 'warn' : ''}` }, findingBadge(finding)),
+      where ? element('code', { class: 'finding-where wrap-anywhere' }, where) : null,
+      finding.role ? element('span', { class: 'muted finding-by' }, `from ${finding.role}`) : null),
+    element('p', { class: 'finding-claim' }, oneLine(finding.claim || finding.title || 'Finding', 300)),
+    body ? findingDetails(finding, body, opened) : null);
+}
+
+// The Where panel redraws every second, so it remembers which finding bodies are open.
+function findingDetails(finding, body, opened) {
+  const key = [finding.role, finding.path, finding.line, finding.claim || finding.title].join('|');
+  const details = element('details', { class: 'finding-more', open: Boolean(opened?.has(key)) },
+    element('summary', {}, 'Details'), element('p', { class: 'finding-text' }, body));
+  if (opened) details.addEventListener('toggle', () => (details.open ? opened.add(key) : opened.delete(key)));
+  return details;
+}
+
+function reviewDisclosure(review) {
+  const details = element('details', { class: 'feed-review' }, element('summary', {}, 'Review'));
+  details.addEventListener('toggle', () => {
+    if (details.open && details.childElementCount === 1) details.append(element('div', { class: 'feed-review-body' }, renderMarkdown(review)));
+  });
+  return details;
+}
+
 function itemNode(item, showCost) {
   if (item.kind === 'tool_call') return toolNode(item);
+  if (item.kind === 'finding') return element('div', { class: 'feed-item', title: item.ts }, findingCard(item.payload));
   if (item.kind === 'text') {
     return element('div', { class: 'feed-item feed-text', title: item.ts }, String(item.payload.text ?? ''),
       item.payload.truncated ? element('span', { class: 'muted' }, ' (truncated)') : null);
   }
   const { tone, label, text } = describe(item, { showCost });
-  return element('div', { class: `feed-item feed-line tone-${tone}`, title: item.ts },
+  const line = element('div', { class: `feed-item feed-line tone-${tone}`, title: item.ts },
     element('span', { class: 'feed-label' }, label), ' ', element('span', {}, text));
+  const review = item.kind === 'log' && typeof item.payload.review === 'string' && item.payload.review ? item.payload.review : null;
+  return review ? element('div', { class: 'feed-item' }, line, reviewDisclosure(review)) : line;
+}
+
+function rosterNode(entry, now, reviews) {
+  const line = rosterLine(entry, now);
+  const key = `${entry.step_key}\u0000${entry.role}`;
+  let review = null;
+  if (entry.review) {
+    review = element('details', { class: 'feed-review', 'data-key': key }, element('summary', {}, 'Review'));
+    if (reviews.open.has(key)) {
+      review.open = true;
+      review.append(reviews.body(key, entry.review));
+    }
+    review.addEventListener('toggle', () => {
+      if (review.open) reviews.open.add(key);
+      else reviews.open.delete(key);
+      if (review.open && review.childElementCount === 1) review.append(reviews.body(key, entry.review));
+    });
+  }
+  return element('li', { class: `roster-row roster-${line.state}` },
+    element('span', { class: 'roster-icon', 'aria-hidden': 'true' }, line.icon),
+    element('span', { class: 'roster-role' }, entry.role),
+    element('span', { class: 'roster-state' }, line.state === 'running' ? 'working' : line.label),
+    line.detail ? element('span', { class: 'roster-detail' }, line.detail) : null,
+    review);
+}
+
+// Where the run is: the decision once there is one, the steps in order, and who is working on each.
+function whereView() {
+  const node = element('section', { class: 'where', 'aria-label': 'Where the run is', hidden: true });
+  const cache = new Map();
+  const reviews = {
+    open: new Set(),
+    body: (key, text) => {
+      if (!cache.has(key)) cache.set(key, element('div', { class: 'feed-review-body' }, renderMarkdown(text)));
+      return cache.get(key);
+    },
+  };
+  const openStages = new Map();
+  const openFindings = new Set();
+  // A tick skips the redraw while focus is inside, so a keyboard user keeps their place.
+  const draw = (steps, activity, { tick = false, now = Date.now() } = {}) => {
+    if (tick && node.contains(document.activeElement)) return;
+    const track = stageTrack(steps, activity, now);
+    const decision = decisionCard(activity);
+    node.hidden = !track.length && !decision;
+    if (node.hidden) return;
+    const lastWithRoles = [...track].reverse().find((stage) => stage.roles.length)?.key;
+    const anyCurrent = track.some((stage) => stage.current && stage.roles.length);
+    append(clear(node), [
+      decision ? element('div', { class: `decision tone-${decision.tone}` },
+        element('h2', { class: 'decision-verdict' }, element('span', { 'aria-hidden': 'true' }, decision.icon), ' ', decision.verdict),
+        element('p', { class: 'decision-counts' }, `${decision.blocking} blocking · ${decision.nonBlocking} non-blocking`,
+          decision.role ? element('span', { class: 'muted' }, ` · decided by ${decision.role}`) : null),
+        decision.findings.length ? element('div', { class: 'finding-cards' }, decision.findings.map((finding) => findingCard(finding, openFindings))) : null) : null,
+      element('ol', { class: 'stage-track', 'aria-label': 'Steps' }, track.map((stage) => element('li', {
+        class: `stage stage-${stage.state}${stage.current ? ' current' : ''}`, 'aria-current': stage.current ? 'step' : null, title: stage.error || null },
+      element('span', { class: 'stage-icon', 'aria-hidden': 'true' }, stage.icon), ' ', element('span', { class: 'stage-name' }, stage.label),
+      element('span', { class: 'visually-hidden' }, ` ${stage.state}`),
+      stage.seconds && stage.state !== 'waiting' ? element('span', { class: 'stage-time' }, duration(stage.seconds)) : null))),
+      track.filter((stage) => stage.headline).map((stage) => element('p', { class: 'where-headline' }, stage.headline)),
+      track.filter((stage) => stage.roles.length > 1 || (stage.roles.length && !stage.headline)).map((stage) => {
+        const open = openStages.has(stage.key) ? openStages.get(stage.key) : stage.current || (!anyCurrent && stage.key === lastWithRoles);
+        const details = element('details', { class: 'roster', open },
+          element('summary', {}, element('span', { class: 'stage-name' }, stage.label), ' ',
+            element('span', { class: 'muted' }, [`${stage.done}/${stage.total} done`, stage.failed ? `${stage.failed} failed` : null,
+              stage.findings ? `${stage.findings} ${stage.findings === 1 ? 'finding' : 'findings'}` : null].filter(Boolean).join(' · '))),
+          element('ul', { class: 'roster-list', role: 'list' }, stage.roles.map((entry) => rosterNode(entry, now, reviews)),
+            stage.waiting ? element('li', { class: 'roster-row roster-waiting' }, element('span', { class: 'roster-icon', 'aria-hidden': 'true' }, '…'),
+              element('span', { class: 'roster-role' }, `${stage.waiting} more waiting`)) : null));
+        details.addEventListener('toggle', () => openStages.set(stage.key, details.open));
+        return details;
+      })]);
+  };
+  return { node, draw };
 }
 
 function findingNode(finding) {
@@ -81,6 +190,30 @@ function findingNode(finding) {
     element('div', {}, element('span', { class: `chip ${finding.severity === 'high' || finding.severity === 'critical' ? 'bad' : 'warn'}` }, String(finding.severity || 'finding')), oneLine(finding.title || 'Finding', 200)),
     where ? element('code', { class: 'wrap-anywhere' }, where) : null,
     finding.body ? element('p', { class: 'finding-body' }, oneLine(finding.body, 400)) : null);
+}
+
+async function subjectRuns(slot, run, display, signal) {
+  const scope = run.thread ? { thread: run.thread } : { subject: run.subject };
+  const params = listParams({ ...scope, hidden: true, every: true });
+  let listed;
+  try {
+    listed = listOf(await api(`/api/runs?${params}`), 'runs');
+  } catch {
+    return;
+  }
+  if (signal?.aborted || !listed.some((other) => String(other.id) !== String(run.id))) return;
+  slot.append(card(element('h2', { class: 'inline' }, 'Runs on this subject'), table(['Started', 'Workflow', 'Status'], listed.map((other) => {
+    const status = runStatus(other, other.pr);
+    const started = shortWhen(other.started_at);
+    return [
+      String(other.id) === String(run.id)
+        ? element('span', { title: when(other.started_at), 'aria-current': 'page' }, started, element('span', { class: 'muted' }, ' · this run'))
+        : link(hashFor('run', [other.id]), started, { title: when(other.started_at) }),
+      workflowLabel(display, other.workflow),
+      element('span', { class: `state state-${status.tone}` }, status.text),
+    ];
+  })), listed.length >= Number(params.get('limit'))
+    ? element('p', { class: 'note' }, link(hashFor('runs', [], { ...scope, every: '1' }), 'See every run on this subject')) : null));
 }
 
 function artifactBody(artifact) {
@@ -223,6 +356,7 @@ export async function render(root, { args, signal }) {
   const linksSlot = element('div', { class: 'run-links' });
   const progressText = element('p', { class: 'run-progress' });
   const errorSlot = element('div', {});
+  const subjectSlot = element('div', {});
   const actions = actionsBar(runId);
   const heading = pageHeader('', chipSlot, verdictSlot, run.dry_run ? element('span', { class: 'chip warn', title: 'Recorded outputs stood in for every step.' }, 'Dry run') : null, liveNote);
   heading.querySelector('h1').append(titleText);
@@ -234,8 +368,27 @@ export async function render(root, { args, signal }) {
       labelled('Triggered by', element('span', {}, [run.triggered_by || '—', run.trigger_kind ? ` (${run.trigger_kind})` : ''].join(''))),
       labelled('Started', element('span', { title: run.started_at || null }, when(run.started_at))),
       labelled('Duration', durationText), display.show_cost ? labelled('Cost', costText) : null, labelled('Tokens', tokenText), fieldsSlot, extraMeta),
-    linksSlot, actions.node, progressText, errorSlot);
+    linksSlot, actions.node, progressText, errorSlot, subjectSlot);
+  const where = whereView();
+  const activity = new RunActivity();
+  let activityReady = false;
+  let activityQueue = [];
+  let whereFrame = 0;
+  const drawWhere = () => {
+    if (!whereFrame) {
+      whereFrame = requestAnimationFrame(() => {
+        whereFrame = 0;
+        where.draw(steps, activity);
+      });
+    }
+  };
+  const feedActivity = (events) => {
+    if (!activityReady) activityQueue.push(...events);
+    else if (activity.apply(events)) drawWhere();
+  };
+  root.append(where.node);
   actions.refresh();
+  if (run.subject) subjectRuns(subjectSlot, run, display, signal);
   if (run.team_id) {
     api(`/api/teams/${encodeURIComponent(run.team_id)}/projects`).then((payload) => {
       const project = listOf(payload, 'projects').find((candidate) => String(candidate.id) === String(run.project_id));
@@ -278,9 +431,19 @@ export async function render(root, { args, signal }) {
     const errorText = run.error ? oneLine(run.error, 600) : '';
     if (errorSlot.textContent !== errorText) clear(errorSlot).append(errorText ? element('div', { class: 'banner bad', role: 'alert' }, errorText) : null);
   };
-  const syncProgress = () => setText(progressText, progress(steps).text);
+  const syncProgress = () => {
+    setText(progressText, progress(steps).text);
+    drawWhere();
+  };
   updateHeader();
   syncProgress();
+  backfill(activity, (after) => api(eventsPath(runId, after, PAGE)), { signal }).catch(() => {}).finally(() => {
+    if (signal?.aborted) return;
+    activityReady = true;
+    activity.apply(activityQueue.sort((left, right) => left.seq - right.seq));
+    activityQueue = [];
+    drawWhere();
+  });
 
   // Tabs
   const baseHash = hashFor('run', [runId]);
@@ -346,23 +509,59 @@ export async function render(root, { args, signal }) {
   });
 
   const groupNode = (stepId) => element('section', { class: 'feed-group', 'data-step': stepId ?? '' }, element('h3', { class: 'feed-step' }, stepId || 'Run'));
+  // A step whose events carry roles shows its roles' lines, with each role's session activity collapsed and no start or finish rows.
+  const roleSteps = new Set();
+  const boundaryNodes = new Map();
+  const activityBoxes = new WeakMap();
+  const markRoleStep = (key) => {
+    if (roleSteps.has(key)) return;
+    roleSteps.add(key);
+    for (const node of boundaryNodes.get(key) || []) node.hidden = true;
+    boundaryNodes.delete(key);
+  };
+  const activityBox = (section, role) => {
+    if (!activityBoxes.has(section)) activityBoxes.set(section, new Map());
+    const boxes = activityBoxes.get(section);
+    if (!boxes.has(role)) {
+      const label = element('span', { class: 'feed-label' });
+      const latest = element('span', { class: 'feed-activity-now' });
+      const body = element('div', { class: 'feed-activity-body' });
+      const details = element('details', { class: 'feed-item feed-activity' }, element('summary', {}, label, ' ', latest), body);
+      section.append(details);
+      boxes.set(role, { label, latest, body, count: 0 });
+    }
+    return boxes.get(role);
+  };
+  const putInto = (section, item, node) => {
+    const { slot, role } = feedSlot(item);
+    if (role) markRoleStep(item.step_key);
+    if (slot === 'activity') {
+      const box = activityBox(section, role);
+      box.body.append(node);
+      box.count += 1;
+      setText(box.label, `${role} · activity (${box.count.toLocaleString('en-US')})`);
+      const latest = nowText(item.kind, item.payload);
+      if (latest) setText(box.latest, latest);
+    } else {
+      section.append(node);
+      if (slot === 'boundary' && roleSteps.has(item.step_key)) node.hidden = true;
+      else if (slot === 'boundary') boundaryNodes.set(item.step_key, [...(boundaryNodes.get(item.step_key) || []), node]);
+    }
+    nodes.set(item.id, node);
+  };
   const place = (item, node) => {
     const last = feedList.lastElementChild;
     const group = last && last.dataset.step === (item.step_key ?? '') ? last : feedList.appendChild(groupNode(item.step_key));
-    group.append(node);
-    nodes.set(item.id, node);
+    putInto(group, item, node);
   };
   const renderAll = () => {
     clear(feedList);
     nodes.clear();
+    boundaryNodes.clear();
     const fragment = document.createDocumentFragment();
     for (const group of groupItems(model.items)) {
       const section = groupNode(group.step_key);
-      for (const item of group.items) {
-        const node = itemNode(item, display.show_cost);
-        section.append(node);
-        nodes.set(item.id, node);
-      }
+      for (const item of group.items) putInto(section, item, itemNode(item, display.show_cost));
       fragment.append(section);
     }
     feedList.append(fragment);
@@ -374,8 +573,10 @@ export async function render(root, { args, signal }) {
       for (const id of removed) {
         const node = nodes.get(id);
         nodes.delete(id);
-        const group = node?.parentElement;
+        const group = node?.closest('.feed-group');
+        const box = node?.parentElement?.classList.contains('feed-activity-body') ? node.parentElement : null;
         node?.remove();
+        if (box && !box.childElementCount) box.parentElement.remove();
         if (group && group.childElementCount <= 1) group.remove();
       }
       if (!following) feedBox.scrollTop -= before - feedList.scrollHeight;
@@ -459,6 +660,7 @@ export async function render(root, { args, signal }) {
       if (live && ['step_end', 'step_failed', 'cost', 'run_end'].includes(event.kind)) refreshSoon();
       if (live && ['step_start', 'step_end', 'step_failed', 'step_skipped'].includes(event.kind)) outputSoon();
     }
+    feedActivity(events);
     if (stepsChanged) syncProgress();
   };
 
@@ -508,7 +710,10 @@ export async function render(root, { args, signal }) {
   let poller = null;
   let settled = false;
   const setLive = (state) => setText(liveNote, LIVE_STATES[state] || '');
-  const ticker = setInterval(updateHeader, 1000);
+  const ticker = setInterval(() => {
+    updateHeader();
+    where.draw(steps, activity, { tick: true });
+  }, 1000);
   settleSoon = () => {
     if (settled) return;
     settled = true;
@@ -519,11 +724,13 @@ export async function render(root, { args, signal }) {
       clearInterval(ticker);
       setLive('ended');
       updateHeader();
+      drawWhere();
       outputSoon();
     }, SETTLE_MS);
   };
   signal?.addEventListener('abort', () => {
     clearInterval(ticker);
+    cancelAnimationFrame(whereFrame);
     clearTimeout(refreshTimer);
     clearTimeout(announceTimer);
     clearTimeout(outputTimer);

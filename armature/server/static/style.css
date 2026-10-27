@@ -396,6 +396,49 @@ section.adapter { border-top: 1px solid var(--rule); margin-top: 14px; padding-t
 .run-actions:empty { display: none; }
 .run-fields { display: contents; }
 .run-progress { margin: 0 0 4px; color: var(--ink-2); font-size: 13.5px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.run-where { margin: 0 0 4px; color: var(--ink-2); font-size: 13px; overflow-wrap: anywhere; }
+.where { margin: 10px 0 14px; display: flex; flex-direction: column; gap: 8px; }
+.stage-track { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; }
+.stage { display: inline-flex; align-items: center; gap: 4px; padding: 3px 10px; border: 1px solid var(--rule); border-radius: 999px; font-size: 13px; color: var(--muted); background: var(--surface); }
+.stage-done { color: var(--ok); } .stage-failed { color: var(--bad); background: var(--danger-bg); border-color: transparent; }
+.stage.current { color: var(--accent); border-color: var(--accent); font-weight: 600; background: var(--accent-wash); }
+.stage-time { font-variant-numeric: tabular-nums; color: var(--muted); font-weight: 400; margin-left: 2px; }
+.where-headline { margin: 0; font-size: 14px; color: var(--ink); }
+.roster > summary { cursor: pointer; font-size: 13.5px; padding: 2px 0; }
+.roster .stage-name { font-weight: 600; }
+.roster-list { list-style: none; margin: 4px 0 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.roster-row { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; padding: 3px 0; font-size: 13px; border-bottom: 1px solid var(--rule); }
+.roster-row:last-child { border-bottom: 0; }
+.roster-icon { width: 1.2em; text-align: center; }
+.roster-role { font-weight: 600; color: var(--ink); min-width: 7em; }
+.roster-state { color: var(--ink-2); }
+.roster-detail { color: var(--muted); overflow-wrap: anywhere; min-width: 0; flex: 1; font-variant-numeric: tabular-nums; }
+.roster-running .roster-icon { color: var(--accent); } .roster-done .roster-icon { color: var(--ok); }
+.roster-failed .roster-icon, .roster-failed .roster-detail { color: var(--bad); }
+.roster-waiting { color: var(--muted); } .roster-waiting .roster-role { font-weight: 400; color: var(--muted); }
+.roster-row > .feed-review { flex-basis: 100%; }
+.decision { border: 1px solid var(--rule); border-left-width: 4px; border-radius: 8px; padding: 10px 14px; background: var(--surface); }
+.decision.tone-ok { border-left-color: var(--ok); } .decision.tone-warn { border-left-color: var(--warn); } .decision.tone-bad { border-left-color: var(--bad); }
+.decision-verdict { margin: 0; font-size: 17px; }
+.decision.tone-ok .decision-verdict { color: var(--ok); } .decision.tone-warn .decision-verdict { color: var(--warn); } .decision.tone-bad .decision-verdict { color: var(--bad); }
+.decision-counts { margin: 2px 0 8px; font-size: 13px; color: var(--ink-2); }
+.finding-cards { display: flex; flex-direction: column; gap: 6px; }
+.finding-card { border: 1px solid var(--rule); border-radius: 6px; padding: 6px 10px; background: var(--surface); }
+.finding-card.blocking { border-left: 3px solid var(--bad); }
+.finding-head { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 8px; }
+.finding-where { font: 12.5px/1.4 var(--mono); color: var(--ink-2); }
+.finding-by { font-size: 12.5px; }
+.finding-claim { margin: 4px 0 0; font-weight: 600; color: var(--ink); }
+.finding-more > summary { cursor: pointer; font-size: 12.5px; color: var(--muted); }
+.finding-text { margin: 4px 0 0; white-space: pre-wrap; font-size: 13px; color: var(--ink-2); }
+.feed-review > summary { cursor: pointer; font-size: 12.5px; color: var(--accent); }
+.feed-review-body { padding: 4px 0 4px 10px; border-left: 2px solid var(--rule); font-size: 13.5px; }
+.feed-activity > summary { cursor: pointer; font-size: 12.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.feed-activity-now { font-family: var(--mono); color: var(--muted); }
+.feed-activity-body { padding-left: 12px; border-left: 2px solid var(--rule); }
+.tail-now { display: flex; flex-direction: column; gap: 1px; font-size: 12.5px; color: var(--ink-2); }
+.tail-now-line { margin: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tail-role { color: var(--ink-2); font-weight: 600; }
 .artifact-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; padding-bottom: 12px; margin-bottom: 14px; border-bottom: 1px solid var(--rule); }
 .artifact-name { font-weight: 600; color: var(--ink); }
 .artifact-meta { font-size: 13px; }
