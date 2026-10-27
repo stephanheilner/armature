@@ -19,7 +19,7 @@ from typing import Any
 from sqlalchemy import Connection, delete, func, insert, or_, select, update
 
 from armature.events.summary import subject_problem, trigger_ref_problem
-from armature.server import audit
+from armature.server import audit, threads
 from armature.server.auth import valid_token
 from armature.server.crypto import Keyring
 from armature.server.db import new_id
@@ -203,6 +203,7 @@ def open_run(conn: Connection, keyring: Keyring, *, team_id: str, project_id: st
     row = {"id": run_id, "team_id": team_id, "project_id": project_id, "workflow_id": workflow_id,
            "workflow_name": workflow_name, "status": "running", "started_at": now, "cost_usd": 0, "input_tokens": 0,
            "output_tokens": 0, **columns}
+    row["thread"] = threads.opening_thread(conn, team_id, row.get("subject"), now)
     conn.execute(insert(runs).values(**row))
     token = _random.token_urlsafe(32)
     conn.execute(insert(run_tokens).values(token_hmac=digest(keyring, token), run_id=run_id, team_id=team_id,

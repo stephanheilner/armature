@@ -227,7 +227,8 @@ def test_ingest_writes_summary_on_run_end(live, world, keyring, clock):
     summary = detail["run"]
     assert set(summary) == {"id", "team_id", "project_id", "workflow", "status", "triggered_by", "trigger_kind",
                             "started_at", "finished_at", "cost_usd", "input_tokens", "output_tokens", "rerun_of",
-                            "cancelled_by", "error", "subject", "summary", "last_seq", "dry_run", "kind", "trigger"}
+                            "cancelled_by", "error", "subject", "thread", "summary", "last_seq", "dry_run", "kind",
+                            "trigger"}
     assert summary["dry_run"] is False and summary["kind"] == "review"
     assert (summary["status"], summary["error"], summary["workflow"], summary["triggered_by"]) == \
         ("failed", "build broke", "pr-review", "octocat")
@@ -398,7 +399,7 @@ def test_runs_stream_is_scoped(live, world):
         assert {r["id"] for r in rows} == {run["run_id"]}
         assert [r["status"] for r in rows] == ["running", "succeeded"]
         assert set(rows[0]) == {"id", "team_id", "project_id", "workflow", "status", "triggered_by", "started_at",
-                                "finished_at", "cost_usd", "subject", "title", "verdict", "trigger"}
+                                "finished_at", "cost_usd", "subject", "thread", "title", "verdict", "trigger"}
         theirs_frames = theirs.until(lambda f: any(x.get("event") == "run" for x in f))
         assert [f["data"]["id"] for f in theirs_frames if f.get("event") == "run"] == [other_run["run_id"]]
 
@@ -621,6 +622,59 @@ def test_run_list_filters_by_subject_and_shows_the_summary(live, world):
     assert len(everything) == 3 and {r["subject"] for r in everything} == {"fs-eng/android-tree#7", "MEMTEMDIS-886",
                                                                              None}
     assert viewer.get("/api/runs", params={"subject": "x" * 192}).status_code == 400
+
+
+def test_pull_request_runs_join_the_issue_thread_by_title_or_link(live, world):
+    http = live.client()
+    dev = register(http, world["key"], workflow="development", subject="MEM-5")
+    review = register(http, world["key"], workflow="code-review", subject="acme/app#9")
+    titled = register(http, world["key"], workflow="code-review", subject="acme/app#10")
+    elsewhere = register(http, world["other_key"], workflow="code-review", subject="acme/app#9")
+    post(http, titled["token"], line("summary", None, title="[MEM-6] Tidy"))
+    post(http, review["token"], line("summary", None, title="No prefix here"))
+    viewer = live.client(world["users"]["viewer"])
+    assert viewer.get(f"/api/runs/{titled['run_id']}").json()["run"]["thread"] == "MEM-6"
+    post(http, dev["token"], line("summary", None, links=[
+        {"label": "Pull request", "url": "https://github.com/acme/app/pull/9"}]))
+    assert viewer.get(f"/api/runs/{review['run_id']}").json()["run"]["thread"] == "MEM-5"
+    live.flush()
+    fix = register(http, world["key"], workflow="pr-fix", subject="acme/app#9")
+    with live.engine.connect() as conn:
+        threads = dict(conn.execute(select(runs.c.id, runs.c.thread)).all())
+    assert {name: threads[run["run_id"]] for name, run in
+            (("dev", dev), ("review", review), ("titled", titled), ("elsewhere", elsewhere), ("fix", fix))} == \
+        {"dev": "MEM-5", "review": "MEM-5", "titled": "MEM-6", "elsewhere": None, "fix": "MEM-5"}
+    grouped = viewer.get("/api/runs", params={"group": True}).json()["runs"]
+    assert {(r["thread"], r["group_size"]) for r in grouped} == {("MEM-5", 3), ("MEM-6", 1)}
+
+
+def test_a_pull_request_opened_after_its_issue_run_linked_it_joins_that_thread(live, world):
+    http = live.client()
+    dev = register(http, world["key"], workflow="development", subject="MEM-7")
+    post(http, dev["token"], line("summary", None, links=[
+        {"label": "Pull request", "url": "https://github.com/acme/app/pull/12"}]))
+    live.flush()
+    review = register(http, world["key"], workflow="code-review", subject="acme/app#12")
+    near_miss = register(http, world["key"], workflow="code-review", subject="acme/app#1")
+    longer = register(http, world["key"], workflow="code-review", subject="acme/app#123")
+    elsewhere = register(http, world["other_key"], workflow="code-review", subject="acme/app#12")
+    with live.engine.connect() as conn:
+        threads = dict(conn.execute(select(runs.c.id, runs.c.thread)).all())
+    assert [threads[run["run_id"]] for run in (review, near_miss, longer, elsewhere)] == ["MEM-7", None, None, None]
+
+
+def test_a_titled_run_brings_its_pull_requests_other_runs_into_the_thread(live, world):
+    http = live.client()
+    first = register(http, world["key"], workflow="code-review", subject="acme/app#20")
+    second = register(http, world["key"], workflow="pr-fix", subject="acme/app#20")
+    post(http, first["token"], line("step_start", "x"))
+    post(http, second["token"], line("summary", None, title="[MEM-8] Tidy"))
+    viewer = live.client(world["users"]["viewer"])
+    assert viewer.get(f"/api/runs/{first['run_id']}").json()["run"]["thread"] == "MEM-8"
+    live.flush()
+    with live.engine.connect() as conn:
+        threads = dict(conn.execute(select(runs.c.id, runs.c.thread)).all())
+    assert (threads[first["run_id"]], threads[second["run_id"]]) == ("MEM-8", "MEM-8")
 
 
 def test_run_list_filters_by_workflows_and_hides_hidden_ones(live, world, monkeypatch):

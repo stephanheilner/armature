@@ -208,17 +208,23 @@ test('sign-in keeps the view a link pointed at', () => {
   assert.equal(returnHash('?return=https%3A%2F%2Fevil.test'), '');
   assert.equal(returnHash('?return=%2F%2Fevil.test'), '');
   assert.equal(returnHash(''), '');
+  assert.equal(returnHash('', '#/run/abc/log'), '#/run/abc/log');
+  assert.equal(returnHash('?return=%23%2Fruns', '#/run/abc/log'), '#/runs');
+  assert.equal(returnHash('', '#/x"><script>'), '');
+  assert.equal(returnHash('', '#/'), '');
   assert.equal(ssoLoginPath('#/run/abc/log'), '/auth/oidc/login?return=%23%2Frun%2Fabc%2Flog');
   assert.equal(ssoLoginPath(''), '/auth/oidc/login');
 });
 
-const { alertKey, keptDismissals, visibleAlerts } = await import(new URL('views/overview.js', STATIC));
+const { alertKey, hiddenAlerts, visibleAlerts } = await import(new URL('views/overview.js', STATIC));
 
-test('a dismissed alert stays hidden until a newer run fails', () => {
+test('a dismissed alert stays hidden for good, even after newer runs fail', () => {
   const alert = { kind: 'failed', workflow: 'code-review', run_id: 'r1', message: '10 runs of code-review failed' };
+  const lost = { kind: 'lost', run_id: 'r9', message: '2 runs were lost' };
   assert.equal(alertKey(alert), 'failed:code-review');
   assert.deepEqual(visibleAlerts([alert], {}), [alert]);
-  assert.deepEqual(visibleAlerts([alert], { 'failed:code-review': 'r1' }), []);
-  assert.deepEqual(visibleAlerts([{ ...alert, run_id: 'r2' }], { 'failed:code-review': 'r1' }).length, 1);
-  assert.deepEqual(keptDismissals([alert], { 'failed:code-review': 'r1', 'lost:': 'r9' }), { 'failed:code-review': 'r1' });
+  assert.deepEqual(visibleAlerts([alert], { 'failed:code-review': true }), []);
+  assert.deepEqual(visibleAlerts([{ ...alert, run_id: 'r2' }], { 'failed:code-review': 'r1' }), []);
+  assert.deepEqual(visibleAlerts([alert, lost], { 'failed:code-review': true }), [lost]);
+  assert.deepEqual(hiddenAlerts([alert, lost], { 'failed:code-review': true }), [alert]);
 });

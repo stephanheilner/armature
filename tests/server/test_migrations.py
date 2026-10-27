@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
@@ -244,3 +245,41 @@ def test_0009_backfills_kind_and_links_runs_by_scope_precedence(db_url):
         "in_project": ids["project_review"], "in_team": ids["team_review"],
         "other_team_review": ids["instance:code-review"], "other_team_only": None,
         "project_build": ids["team_build"], "cased": None, "unknown": None}
+
+
+def test_0011_backfills_threads_from_subjects_titles_and_pull_request_links(db_url):
+    migrate(db_url, "0010")
+    own, other = new_id(), new_id()
+    pull_link = json.dumps({"links": [{"label": "Pull request", "url": "https://github.com/acme/app/pull/7"}]})
+    seeded = [("dev", own, "MEM-1", pull_link), ("review", own, "acme/app#7", None),
+              ("fix", own, "acme/app#7", json.dumps({"title": "Fix comments"})),
+              ("titled", own, "acme/app#8", json.dumps({"title": "[MEM-2] Tidy"})),
+              ("titled_sibling", own, "acme/app#8", json.dumps({"title": "Follow up"})),
+              ("too_long", own, "acme/app#10", json.dumps({"title": f"[{'A' * 250}-1] Long"})),
+              ("lower", own, "acme/app#9", json.dumps({"title": "[mem-3] Tidy"})),
+              ("other_team", other, "acme/app#7", None), ("loose", own, None, None), ("digest", own, "digest", None)]
+    ids = {name: new_id() for name, *_ in seeded}
+    engine = make_engine(db_url)
+    try:
+        with engine.begin() as conn:
+            at = {"at": "2026-10-27 12:00:00"}
+            for team_id, name in ((own, "own"), (other, "other")):
+                conn.execute(text("INSERT INTO teams (id, name, created_at) VALUES (:t, :n, :at)"),
+                             {"t": team_id, "n": name, **at})
+            for name, team_id, subject, summary in seeded:
+                conn.execute(text("INSERT INTO runs (id, team_id, status, started_at, subject, summary) "
+                                  "VALUES (:r, :t, 'succeeded', :at, :s, :m)"),
+                             {"r": ids[name], "t": team_id, "s": subject, "m": summary, **at})
+    finally:
+        engine.dispose()
+    migrate(db_url)
+    engine = make_engine(db_url)
+    try:
+        with engine.connect() as conn:
+            threads = dict(conn.execute(select(runs.c.id, runs.c.thread)).all())
+    finally:
+        engine.dispose()
+    assert {name: threads[run_id] for name, run_id in ids.items()} == {
+        "dev": "MEM-1", "review": "MEM-1", "fix": "MEM-1", "titled": "MEM-2", "titled_sibling": "MEM-2",
+        "too_long": None, "lower": None, "other_team": None,
+        "loose": None, "digest": None}

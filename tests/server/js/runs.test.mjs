@@ -2,8 +2,8 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 const STATIC = new URL('../../../armature/server/static/', import.meta.url);
-const { capsules, chosenWorkflows, hashParams, isHidden, isLive, listParams, liveElapsed, liveRuns, matches, prTitle, repoOf, runHeaders, runStatus, shortWhen,
-  subjectHref, triggerOf, verdictText, verdictTone, workflowOptions } =
+const { capsules, chosenWorkflows, groupText, hashParams, isHidden, isNewer, isLive, listParams, liveElapsed, liveRuns, matches, prTitle, repoOf, runHeaders, runStatus, shortWhen,
+  rethreaded, subjectHref, threadOf, triggerOf, verdictText, verdictTone, workflowOptions } =
   await import(new URL('views/runs.js', STATIC));
 const { hashFor } = await import(new URL('router.js', STATIC));
 
@@ -34,6 +34,9 @@ test('verdictText maps review verdicts and tidies the rest', () => {
   assert.equal(verdictText('No changes'), 'No changes');
   assert.equal(verdictText('ok'), 'Ok');
   assert.equal(verdictText('push_failed'), 'Push failed');
+  assert.equal(verdictText('opened'), 'PR Created');
+  assert.equal(verdictText('review-blocked'), 'Review Blocked');
+  assert.equal(verdictText('blocked'), 'Blocked');
   assert.equal(verdictText(null), '');
 });
 
@@ -88,8 +91,43 @@ test('workflow choices round-trip through the hash', () => {
 
 test('listParams asks the API for the chosen workflows and hidden ones', () => {
   const params = listParams({ team: 't', subject: 'MEM-1', workflows: ['a', 'b'], hidden: true }, 'cursor');
-  assert.equal(String(params), 'limit=50&team=t&subject=MEM-1&workflows=a%2Cb&include_hidden=1&before=cursor');
-  assert.equal(String(listParams({ workflows: [] })), 'limit=50');
+  assert.equal(String(params), 'limit=50&team=t&subject=MEM-1&workflows=a%2Cb&include_hidden=1&group=1&before=cursor');
+  assert.equal(String(listParams({ workflows: [] })), 'limit=50&group=1');
+  assert.equal(String(listParams({ workflows: [], every: true })), 'limit=50');
+});
+
+test('a thread filter reaches the API and the hash, and groups a pull request with its issue', () => {
+  assert.equal(String(listParams({ thread: 'MEM-1', workflows: [], every: true })), 'limit=50&thread=MEM-1');
+  assert.equal(hashFor('runs', [], hashParams({ thread: 'MEM-1', workflows: [], every: true })), '#/runs?thread=MEM-1&every=1');
+  assert.equal(threadOf({ subject: 'acme/app#7', thread: 'MEM-1' }), 'MEM-1');
+  assert.equal(threadOf({ subject: 'acme/app#7', thread: null }), 'acme/app#7');
+  assert.equal(threadOf({}), '');
+  assert.equal(rethreaded('acme/app#7', { subject: 'acme/app#7', thread: 'MEM-1' }), true);
+  assert.equal(rethreaded('MEM-1', { subject: 'acme/app#7', thread: 'MEM-1' }), false);
+  assert.equal(rethreaded(undefined, {}), false);
+  const base = { workflows: [], hidden: true, thread: 'MEM-1' };
+  assert.equal(matches({ workflow: 'x', subject: 'acme/app#7', thread: 'MEM-1' }, base, {}), true);
+  assert.equal(matches({ workflow: 'x', subject: 'MEM-1', thread: 'MEM-1' }, base, {}), true);
+  assert.equal(matches({ workflow: 'x', subject: 'acme/app#7', thread: null }, base, {}), false);
+});
+
+test('every run round-trips through the hash and only groups of several get a marker', () => {
+  assert.equal(hashFor('runs', [], hashParams({ workflows: [], every: true })), '#/runs?every=1');
+  assert.equal(hashFor('runs', [], hashParams({ workflows: [], every: false })), '#/runs');
+  assert.equal(groupText(3), '3 runs');
+  assert.equal(groupText(1), '');
+  assert.equal(groupText(undefined), '');
+});
+
+test('isNewer only lets a later run replace the shown one', () => {
+  const shown = { id: 'b', started_at: '2026-10-27T12:00:01Z' };
+  assert.equal(isNewer({ id: 'a', started_at: '2026-10-27T12:00:02Z' }, shown), true);
+  assert.equal(isNewer({ id: 'z', started_at: '2026-10-27T12:00:00Z' }, shown), false);
+  assert.equal(isNewer({ id: 'c', started_at: shown.started_at }, shown), true);
+  assert.equal(isNewer({ id: 'a', started_at: shown.started_at }, shown), false);
+  assert.equal(isNewer({ id: 'b', started_at: shown.started_at }, shown), false);
+  assert.equal(isNewer({ id: 'a', started_at: null }, shown), false);
+  assert.equal(isNewer({ id: 'a', started_at: shown.started_at }, { id: 'b' }), true);
 });
 
 test('matches hides hidden workflows unless shown or chosen', () => {

@@ -1,7 +1,6 @@
 """Subjects: every run about one pull request or issue, grouped into a list row and a history page."""
 from __future__ import annotations
 
-import re
 from datetime import UTC, datetime
 from typing import Any
 
@@ -10,13 +9,13 @@ from sqlalchemy import Connection, String, and_, cast, func, or_, select
 from armature.server import display, rbac
 from armature.server.db.schema import findings, run_artifacts, runs, workflows
 from armature.server.ingest import RUN_KIND
+from armature.server.threads import PULL_SUBJECT
 
 RUNS_MAX = 500
 FINDINGS_MAX = 2000
 SEARCH_BATCHES = 10
 HEAD_LENGTH = 12
 POSTED_LABEL = "Posted result"
-PULL_SUBJECT = re.compile(r"^(?P<repo>[^#\s]+/[^#\s]+)#(?P<number>[1-9][0-9]{0,9})$")
 
 WORKFLOW = func.coalesce(workflows.c.name, runs.c.workflow_name)
 

@@ -516,19 +516,31 @@ def _fix_outcome(ref: Any) -> str | None:
     return outcome if isinstance(outcome, str) and outcome else None
 
 
+def _latest_per_subject(query):
+    """Keep the newest run of each thread or subject the query finds, with how many runs it stands for."""
+    bucket = func.coalesce(runs.c.thread, runs.c.subject, runs.c.id)
+    newest = (runs.c.started_at.desc(), runs.c.id.desc())
+    ranked = query.add_columns(func.row_number().over(partition_by=bucket, order_by=newest).label("subject_rank"),
+                               func.count().over(partition_by=bucket).label("group_size")).subquery()
+    latest = select(*[c for c in ranked.c if c.name != "subject_rank"]).where(ranked.c.subject_rank == 1)
+    return latest, ranked.c.started_at, ranked.c.id
+
+
 @router.get("/api/runs")
 def list_runs(request: Request, team: str | None = None, project: str | None = None, status: str | None = None,
               workflow: str | None = Query(None, max_length=191), with_outputs: bool = False,
-              subject: str | None = Query(None, max_length=191), before: str | None = None,
+              subject: str | None = Query(None, max_length=191), thread: str | None = Query(None, max_length=191),
+              before: str | None = None,
               workflow_list: str | None = Query(None, alias="workflows", max_length=4000),
-              include_hidden: bool = False,
+              include_hidden: bool = False, group: bool = False,
               limit: int = Query(LIMIT_DEFAULT, ge=1, le=LIMIT_MAX),
               session: Session = Depends(signed_in)) -> dict[str, Any]:
     scope = rbac.visible_scope(_access(request, session))
     query = (select(runs.c.id, runs.c.team_id, runs.c.project_id,
                     func.coalesce(workflows.c.name, runs.c.workflow_name).label("workflow"), runs.c.status,
                     func.coalesce(runs.c.triggered_by, runs.c.actor).label("triggered_by"), runs.c.started_at,
-                    runs.c.finished_at, runs.c.cost_usd, runs.c.subject, runs.c.summary, *trigger.columns())
+                    runs.c.finished_at, runs.c.cost_usd, runs.c.subject, runs.c.thread, runs.c.summary,
+                    *trigger.columns())
              .select_from(runs.outerjoin(workflows, workflows.c.id == runs.c.workflow_id))
              .where(rbac.scope_clause(scope, runs.c.team_id, runs.c.project_id)))
     if team:
@@ -543,6 +555,8 @@ def list_runs(request: Request, team: str | None = None, project: str | None = N
         query = query.where(name.in_(chosen))
     if subject:
         query = query.where(runs.c.subject == subject)
+    if thread:
+        query = query.where(or_(runs.c.thread == thread, and_(runs.c.thread.is_(None), runs.c.subject == thread)))
     if with_outputs:
         query = query.where(exists().where(run_steps.c.run_id == runs.c.id, run_steps.c.parent_step.is_(None),
                                            run_steps.c.output.is_not(None)))
@@ -550,10 +564,7 @@ def list_runs(request: Request, team: str | None = None, project: str | None = N
         if status not in RUN_STATUSES:
             raise ApiError(400, f"status must be one of {', '.join(RUN_STATUSES)}.")
         query = query.where(runs.c.status == status)
-    clause = _before_clause(_cursor(before), runs.c.started_at, runs.c.id)
-    if clause is not None:
-        query = query.where(clause)
-    query = query.order_by(runs.c.started_at.desc(), runs.c.id.desc()).limit(limit)
+    cursor = _cursor(before)
     with server(request).engine.connect() as conn:
         settings = display.load(conn)
         if not include_hidden:
@@ -564,15 +575,22 @@ def list_runs(request: Request, team: str | None = None, project: str | None = N
             if actors:
                 actor = func.coalesce(runs.c.triggered_by, runs.c.actor)
                 query = query.where(or_(actor.is_(None), actor.not_in(actors)))
-        rows = conn.execute(query).all()
+        at, row_id = runs.c.started_at, runs.c.id
+        if group:
+            query, at, row_id = _latest_per_subject(query)
+        clause = _before_clause(cursor, at, row_id)
+        if clause is not None:
+            query = query.where(clause)
+        rows = conn.execute(query.order_by(at.desc(), row_id.desc()).limit(limit)).all()
         pulls = subjects.pull_states(conn, scope, {r.subject for r in rows if r.subject})
         started = trigger.describe(conn, [r._mapping for r in rows])
     listed = [{"id": r.id, "team_id": r.team_id, "project_id": r.project_id, "workflow": r.workflow,
                "status": r.status, "triggered_by": r.triggered_by, "started_at": r.started_at,
                "finished_at": r.finished_at,
                "cost_usd": float(r.cost_usd) if r.cost_usd is not None and settings["show_cost"] else None,
-               **about(r.subject, r.summary), "pr": pulls.get(r.subject), "outcome": _fix_outcome(r.trigger_ref),
-               "trigger": started[r.id]}
+               **about(r.subject, r.summary), "thread": r.thread, "pr": pulls.get(r.subject),
+               "outcome": _fix_outcome(r.trigger_ref),
+               "trigger": started[r.id], **({"group_size": r.group_size} if group else {})}
               for r in rows]
     return {"runs": listed, "next_before": _next(rows, limit, "started_at")}
 

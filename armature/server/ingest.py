@@ -38,7 +38,7 @@ from armature.events.emitter import (
 )
 from armature.events.redact import REDACTED, redact_text
 from armature.events.summary import merge_summary, summary_patch
-from armature.server import runners, trigger
+from armature.server import runners, threads, trigger
 from armature.server import secrets as secret_store
 from armature.server.auth import valid_token
 from armature.server.crypto import Keyring
@@ -260,7 +260,8 @@ def list_row(summary: dict[str, Any]) -> dict[str, Any]:
     """The fields a row of ``GET /api/runs`` has."""
     return {**{k: summary[k] for k in ("id", "team_id", "project_id", "workflow", "status", "triggered_by",
                                        "started_at", "finished_at", "cost_usd")},
-            **about(summary.get("subject"), summary.get("summary")), "trigger": summary.get("trigger")}
+            **about(summary.get("subject"), summary.get("summary")), "thread": summary.get("thread"),
+            "trigger": summary.get("trigger")}
 
 
 def run_columns() -> list:
@@ -268,7 +269,7 @@ def run_columns() -> list:
             func.coalesce(workflows.c.name, runs.c.workflow_name).label("workflow"), RUN_KIND.label("kind"),
             runs.c.status, func.coalesce(runs.c.triggered_by, runs.c.actor).label("triggered_by"), runs.c.trigger_kind,
             runs.c.started_at, runs.c.finished_at, runs.c.cost_usd, runs.c.input_tokens, runs.c.output_tokens,
-            runs.c.rerun_of, runs.c.cancelled_by, runs.c.error, runs.c.subject, runs.c.summary]
+            runs.c.rerun_of, runs.c.cancelled_by, runs.c.error, runs.c.subject, runs.c.thread, runs.c.summary]
 
 
 def run_query():
@@ -661,6 +662,7 @@ class LiveHub:
             if patch:
                 change.summary = merge_summary(change.summary, patch)
                 summary["summary"] = merge_summary(summary.get("summary"), patch)
+                self._join_thread(state)
                 changed = immediate = True
         elif kind == "run_end":
             status = run_status(payload.get("status"))
@@ -718,6 +720,18 @@ class LiveHub:
                 "title": _text(payload.get("title"), 2000), "body": body, "step_id": step_id, "created_at": now}
 
     # Run summaries.
+
+    def _join_thread(self, state: RunState) -> None:
+        """Mirror what the writer's thread update does to this run and the team's other live runs."""
+        thread, joined = threads.joining(state.summary.get("subject"), state.summary["summary"])
+        if thread is None:
+            return
+        state.summary["thread"] = thread
+        for other in self._runs.values():
+            if (other is not state and other.team_id == state.team_id and other.summary.get("thread") is None
+                    and other.summary.get("subject") in joined):
+                other.summary["thread"] = thread
+                self._publish_summary(other, True)
 
     def run_started(self, summary: dict[str, Any]) -> None:
         if self.running:

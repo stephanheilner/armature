@@ -144,7 +144,7 @@ async function detailPage(root, subject, requestedTab) {
       element('span', { class: 'mono wrap-anywhere' }, detail.subject),
       detail.repo ? element('span', {}, detail.repo) : null,
       latest ? element('span', {}, `Last activity ${when(latest.started_at)}`) : null,
-      link(hashFor('runs', [], { subject: detail.subject }), 'All runs')),
+      link(hashFor('runs', [], { subject: detail.subject, every: '1' }), 'All runs')),
     linkRow(detail.links || []));
   const { tablist, panel } = tabs(subjectPageHref(subject), TABS, active, { label: 'Subject sections' });
   root.append(tablist, panel);

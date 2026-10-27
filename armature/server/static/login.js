@@ -5,7 +5,7 @@ const form = document.getElementById('login');
 const intro = document.getElementById('intro');
 const errorMessage = document.getElementById('err');
 const sso = document.getElementById('sso');
-const back = returnHash(location.search);
+const back = returnHash(location.search, location.hash);
 
 document.getElementById('sso-button').addEventListener('click', () => location.assign(url(ssoLoginPath(back))));
 

@@ -22,7 +22,7 @@ from typing import Any
 from sqlalchemy import Connection, Engine, delete, func, insert, select, text, update
 
 from armature.events.summary import merge_summary
-from armature.server import runners
+from armature.server import runners, threads
 from armature.server.db import new_id
 from armature.server.db.schema import (
     findings,
@@ -336,8 +336,14 @@ def _apply_run(conn: Connection, run_id: str, change: RunChange) -> None:
         status, finished_at, error = change.end
         values.update(status=status, finished_at=finished_at, error=error)
     if change.summary:
-        current = conn.execute(select(runs.c.summary).where(runs.c.id == run_id)).scalar()
-        values["summary"] = merge_summary(current, change.summary)
+        current = conn.execute(select(runs.c.summary, runs.c.subject, runs.c.team_id)
+                               .where(runs.c.id == run_id)).first()
+        if current is not None:
+            values["summary"] = merge_summary(current.summary, change.summary)
+            thread, joined = threads.joining(current.subject, values["summary"])
+            if thread is not None:
+                values["thread"] = thread
+            threads.adopt(conn, current.team_id, joined, thread)
     if values:
         conn.execute(update(runs).where(runs.c.id == run_id).values(**values))
     if change.end is None and change.last_event_at is not None:

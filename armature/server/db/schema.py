@@ -416,9 +416,11 @@ runs = Table(
     Column("error", Text),
     _ts("last_event_at", nullable=True),
     Column("subject", String(191)),
+    Column("thread", String(191)),
     Index(None, "team_id", "started_at"),
     Index(None, "status"),
     Index(None, "subject", "started_at"),
+    Index(None, "thread", "started_at"),
 )
 
 # step_key is parent_step/step_id for a subagent's or nested run's step, so it never merges into the parent's row.

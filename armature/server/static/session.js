@@ -34,9 +34,10 @@ export function ssoStepUpPath(hash) {
 // Mirrors RETURN_HASH in routes_oidc.py, so a link from a pull request survives sign-in.
 const RETURN_HASH = /^#\/[A-Za-z0-9/_?=&.%+-]{0,200}$/;
 
-export function returnHash(search) {
-  const back = new URLSearchParams(search || '').get('return') || '';
-  return RETURN_HASH.test(back) ? back : '';
+// The server's signed-out redirect to /login keeps the link's own hash, so that counts too.
+export function returnHash(search, hash = '') {
+  const back = new URLSearchParams(search || '').get('return') || hash || '';
+  return RETURN_HASH.test(back) && back !== '#/' ? back : '';
 }
 
 export function loginPath(hash) {
