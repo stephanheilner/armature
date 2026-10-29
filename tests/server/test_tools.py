@@ -345,6 +345,14 @@ def test_jira_get_issue_returns_plain_text_and_hides_an_unreadable_issue(app, ru
                                                                                  "found": False}
 
 
+def test_jira_get_issue_caps_the_description_and_each_comment(app, run, vendor):
+    from armature.server.tools.jira import BODY_MAX
+    long = "x" * (BODY_MAX + 10)
+    vendor.jira_issue = {"fields": {"description": adf(long), "comment": {"comments": [{"body": adf(long)}]}}}
+    out = tool(app, run, "read", "jira.get-issue", {"issue": "MOB-12"}).json()
+    assert out["description"] == "x" * BODY_MAX + "\n[truncated]" == out["comments"][0]["body"]
+
+
 def test_jira_comment_goes_out_as_plain_adf(app, run, vendor):
     response = tool(app, run, "jira", "jira.comment", {"issue": "MOB-12", "body": "One *bold*\n\nTwo"})
     assert response.status_code == 200 and response.json()["commented"] is True

@@ -46,10 +46,11 @@ def _capped(lines: list[str], what: str) -> str:
     return text[:FILE_CAP] + f"\n\n[{what} truncated]\n" if len(text) > FILE_CAP else text
 
 
-def jira_keys(*texts: str) -> list[str]:
+def jira_keys(*texts: str, project: str | None = None) -> list[str]:
+    """The distinct keys the texts name, only the ``project``'s when it's set."""
     keys: list[str] = []
     for key in JIRA_KEY.findall(" ".join(texts)):
-        if key not in keys:
+        if key not in keys and (not project or key.split("-")[0] == project):
             keys.append(key)
     return keys[:JIRA_KEY_CAP]
 
@@ -185,7 +186,9 @@ def context(call: Call, params: dict[str, Any]) -> dict[str, Any]:
         issue_comments = gh.pages(f"/repos/{repo}/issues/{number}/comments")
         roots, review_comments = posted_findings(gh, number, own)
         reviews = gh.pages(f"/repos/{repo}/pulls/{number}/reviews")
-    keys = jira_keys(str(pr.get("title") or ""), str((pr.get("head") or {}).get("ref") or ""))
+    project = call.policy.get("project")
+    keys = jira_keys(str(pr.get("title") or ""), str((pr.get("head") or {}).get("ref") or ""),
+                     project=project if isinstance(project, str) else None)
     return {"head": (pr.get("head") or {}).get("sha"), "jira_keys": keys, "pr": pr_md(pr, keys),
             "files": files_of(files),
             "discussion": discussion_md(repo, number, issue_comments, reviews, review_comments, own),

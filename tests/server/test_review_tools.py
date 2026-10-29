@@ -534,6 +534,21 @@ def test_context_lists_each_files_commentable_ranges_and_the_jira_keys_once():
         {"path": "a.swift", "status": "modified", "lines": [[1, 3], [11, 12]]},
         {"path": "gone.swift", "status": "deleted", "lines": []}]
     assert context.jira_keys("MOB-1 and MOB-1", "MOB-2-x MOB-3 MOB-4") == ["MOB-1", "MOB-2", "MOB-3"]
+    assert context.jira_keys("UTF-8 fix for MOB-7", "feature/ABC-2-MOB-9", project="MOB") == ["MOB-7", "MOB-9"]
+
+
+def test_context_keeps_only_the_jira_projects_keys_once_it_is_set(app, sqlite_engine, world, vendor, run):
+    vendor.pr.update(title="MOB-12 and UTF-8 cleanup")
+
+    def keys():
+        response = tool(app, run, "context", "review.context", {"repo": REPO, "number": NUMBER})
+        assert response.status_code == 200, response.text
+        return response.json()["jira_keys"]
+
+    assert keys() == ["MOB-12", "UTF-8"]
+    with sqlite_engine.begin() as conn:
+        conn.execute(insert(settings).values(team_id=world.team, key="jira.project", value="MOB"))
+    assert keys() == ["MOB-12"]
 
 
 def test_context_keeps_the_newest_comments_past_the_cap(monkeypatch):

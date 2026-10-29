@@ -255,8 +255,8 @@ async def test_a_dry_run_reads_github_runs_the_panel_and_records_every_write(flo
     assert "Looks good to me." in lead["discussion"]
     assert json.loads(lead["jira"])["issue"] == "MOB-12" and specialist["jira"] == lead["jira"]
     assert json.loads(lead["verify.json"])["ran"] is False
-    assert json.loads(lead["reviews"])["correctness"] == {"findings": []}
-    assert json.loads(lead["reviews"])["beauty"] == {"_skipped": True}
+    assert json.loads(lead["reviews"]) == {role: {"findings": []} if role in risk.DEFAULT_LOW_RISK_PANEL
+                                           else {"_skipped": True} for role in risk.SPECIALISTS}
 
 
 async def test_a_dry_auto_fix_run_says_it_would_push_and_never_opens_a_write_session(flow, sqlite_engine, keyring,  # noqa: F811

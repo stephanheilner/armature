@@ -437,7 +437,7 @@ def call_tool(engine: Engine, keyring: Keyring, *, public_url: str, token: Any, 
             ctx.policy = _push_policy(conn, job, run, ctx.project_id)
         elif tool == "github.open-pr":
             ctx.policy = {"head_sha": run.head_sha}
-        elif tool == "jira.create":
+        elif tool in ("jira.create", "review.context"):
             ctx.policy = {"project": setting(conn, jira_tools.PROJECT_KEY, job.team_id, job.project_id)}
         held = tool == "github.open-pr" and not marks.may_open(conn, run.id)
     if held:
