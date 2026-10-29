@@ -276,6 +276,14 @@ def test_permission_and_pr_diff_in_a_dry_run_read_github_for_real(app, sqlite_en
                                                                 ("github.pr-diff", "live")]
 
 
+def test_a_stub_mode_test_run_reads_nothing_for_real(app, sqlite_engine, keyring, clock, world, vendor):
+    run = start_run(sqlite_engine, keyring, clock, world, trigger_ref={"dry_run": True, "mode": "stub"})
+    assert tool(app, run, "permission", "github.permission", {"repo": REPO, "user": "ana"}).json()["dry_run"]
+    assert tool(app, run, "read", "jira.get-issue", {"issue": "MOB-12"}).json()["dry_run"] is True
+    assert [r for r in vendor.requests if "/access_tokens" not in r.url.path] == []
+    assert [c.mode for c in calls(sqlite_engine)] == ["dry", "dry"]
+
+
 def test_every_tool_is_classified_and_only_reads_run_in_a_dry_run():
     from armature.server.tools import registry
     reads = {name for name, spec in registry().items() if spec.reads}

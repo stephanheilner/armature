@@ -411,7 +411,7 @@ def call_tool(engine: Engine, keyring: Keyring, *, public_url: str, token: Any, 
               now: datetime, ip: str | None, transport: httpx.BaseTransport | None = None,
               packs_dir: str | None = None, hub: Any = None) -> dict[str, Any]:
     """Run one built-in tool for the step the grant names. In a dry run, a tool that only reads runs, and any other
-    is recorded and calls no vendor.
+    is recorded and calls no vendor. A stub-mode test run records every tool.
 
     The live ``hub`` hears of a run whose risk or outcome a tool changed, and takes the findings review.decisions
     records as the step's own events. Without one, the findings are stored directly.
@@ -430,7 +430,9 @@ def call_tool(engine: Engine, keyring: Keyring, *, public_url: str, token: Any, 
         run, job = _run_job(conn, grant.run_id)
         ctx = _context(conn, keyring, public_url, run, job, grant, spec.kind, params, now, transport, tool)
         ctx.engine = engine
-        dry = _dry(conn, run, job) and not spec.reads
+        # A test run in stub mode replays recorded outputs, so it reads nothing for real either.
+        any_dry = _dry(conn, run, job)
+        dry = any_dry and (not spec.reads or (run.trigger_ref or {}).get("mode") == "stub")
         if tool in ("github.push", "review.pushable"):
             ctx.policy = _push_policy(conn, job, run, ctx.project_id)
         elif tool == "github.open-pr":
@@ -459,6 +461,10 @@ def call_tool(engine: Engine, keyring: Keyring, *, public_url: str, token: Any, 
     approved = result.get("approved")
     outcome = "approved" if approved is True else "refused" if approved is False else "ok"
     detail = {k: result[k] for k in ("reason", "branch", "head") if result.get(k) is not None} or None
+    if any_dry and tool == "review.pushable":
+        # The answer is real, so a dry run shows whether it would push, but no step may act on it.
+        result = {**result, "dry_run": True}
+        detail = {**(detail or {}), "would_push": result.get("pushable") is True}
     with engine.begin() as conn:
         if tool == "github.post-review":
             detail = marks.review_detail(params, result)

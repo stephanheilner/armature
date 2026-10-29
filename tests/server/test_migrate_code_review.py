@@ -257,3 +257,15 @@ async def test_a_dry_run_reads_github_runs_the_panel_and_records_every_write(flo
     assert json.loads(lead["verify.json"])["ran"] is False
     assert json.loads(lead["reviews"])["correctness"] == {"findings": []}
     assert json.loads(lead["reviews"])["beauty"] == {"_skipped": True}
+
+
+async def test_a_dry_auto_fix_run_says_it_would_push_and_never_opens_a_write_session(flow, sqlite_engine, keyring,  # noqa: F811
+                                                                                     clock, world, vendor, tmp_path):
+    flow.run = start_run(sqlite_engine, keyring, clock, world, trigger_ref={"dry_run": True}, risk=None)
+    flow.verdicts[1] = "comment"
+    result = await run_flow(tmp_path, "code-review", {**INPUTS, "auto_fix": True})
+    assert result["pushable"] == {"pushable": True, "reason": result["pushable"]["reason"], "dry_run": True}
+    assert result["fix"] == result["push"] == result["second"] == {"_skipped": True}
+    assert "fix" not in flow.sessions and "github.push" not in flow.tools and vendor.writes() == []
+    [row] = [c for c in calls(sqlite_engine) if c.tool == "review.pushable"]
+    assert row.detail["would_push"] is True

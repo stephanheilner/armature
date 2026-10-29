@@ -19,7 +19,8 @@ HOST_ONLY_ENV = (AGENT_USER_ENV, AGENT_DIR_ENV, SAME_USER_ENV, SESSIONS_ENV, SKI
 FILE_TOOLS = ("Read", "Grep", "Glob")
 GIT_READS = ("log", "diff", "show", "status", "blame", "ls-files", "merge-base", "rev-list", "cat-file")
 # Claude Code asks, so a headless session is denied, before any of these reads outside the working and added dirs.
-SHELL_READS = ("cd", "ls", "wc", "cat", "head", "tail", "grep", "rg", "find")
+# No find or rg, whose -exec and --pre run programs. Glob and Grep cover them.
+SHELL_READS = ("cd", "ls", "wc", "cat", "head", "tail", "grep")
 READ_TOOLS = (*(f"{tool}(./**)" for tool in FILE_TOOLS), "Skill", *(f"Bash(git {cmd}:*)" for cmd in GIT_READS),
               *(f"Bash({cmd}:*)" for cmd in SHELL_READS))
 WRITE_TOOLS = (*READ_TOOLS, "Bash", "Edit", "Write")
@@ -28,10 +29,7 @@ SECRET_READS = ("Read(~/.claude.json)", "Read(~/.claude/**)", "Read(~/.aws/**)",
 # Git options that write files, run programs, or set config, which a read-only git command could otherwise carry.
 GIT_ESCAPES = ("Bash(git *--output*)", "Bash(git *--out*)", "Bash(git *--no-index*)", "Bash(git *--ext-diff*)",
                "Bash(git *--ext-d*)", "Bash(git *-c *)")
-# Options that run programs or write files, which a read-only find or rg could otherwise carry.
-SHELL_ESCAPES = ("Bash(find *-exec*)", "Bash(find *-ok*)", "Bash(find *-delete*)", "Bash(find *-fprint*)",
-                 "Bash(find *-fls*)", "Bash(rg *--pre*)")
-READ_DENIED = ("Edit", "Write", "NotebookEdit", *SECRET_READS, *GIT_ESCAPES, *SHELL_ESCAPES)
+READ_DENIED = ("Edit", "Write", "NotebookEdit", *SECRET_READS, *GIT_ESCAPES)
 WRITE_DENIED = ("NotebookEdit", *SECRET_READS, *GIT_ESCAPES, "Edit(./.claude/**)", "Write(./.claude/**)",
                 "Edit(./.git/**)", "Write(./.git/**)")
 WRITE_ENV = {"BASH_DEFAULT_TIMEOUT_MS": "1800000", "BASH_MAX_TIMEOUT_MS": "7300000"}
