@@ -343,11 +343,12 @@ def test_review_tools_tell_the_live_hub_the_run_changed(sqlite_engine, keyring, 
     assert heard == [run.id]
 
 
-def test_a_dry_run_rates_nothing(app, sqlite_engine, keyring, clock, world):
+def test_a_dry_run_rates_its_own_run_from_githubs_files(app, sqlite_engine, keyring, clock, world, vendor):
     run = start_run(sqlite_engine, keyring, clock, world, trigger_ref={"dry_run": True}, risk=None)
     out = _risk(app, run)
-    assert out["dry_run"] is True and _row(sqlite_engine, run.id).risk is None
-    assert [c.mode for c in calls(sqlite_engine)] == ["dry"]
+    assert "dry_run" not in out and out["level"] == "low" and out["head"] == HEAD and out["panel"]
+    assert _row(sqlite_engine, run.id).risk == "low" and vendor.writes() == []
+    assert [c.mode for c in calls(sqlite_engine)] == ["live"]
 
 
 def test_the_runs_risk_reads_high_once_its_row_is_gone(sqlite_engine, run):

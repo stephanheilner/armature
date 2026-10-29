@@ -410,7 +410,8 @@ def _checked(tool: str, params: Any) -> dict[str, Any]:
 def call_tool(engine: Engine, keyring: Keyring, *, public_url: str, token: Any, tool: str, params: Any,
               now: datetime, ip: str | None, transport: httpx.BaseTransport | None = None,
               packs_dir: str | None = None, hub: Any = None) -> dict[str, Any]:
-    """Run one built-in tool for the step the grant names. In a dry run, record the call and call no vendor.
+    """Run one built-in tool for the step the grant names. In a dry run, a tool that only reads runs, and any other
+    is recorded and calls no vendor.
 
     The live ``hub`` hears of a run whose risk or outcome a tool changed, and takes the findings review.decisions
     records as the step's own events. Without one, the findings are stored directly.
@@ -429,7 +430,7 @@ def call_tool(engine: Engine, keyring: Keyring, *, public_url: str, token: Any, 
         run, job = _run_job(conn, grant.run_id)
         ctx = _context(conn, keyring, public_url, run, job, grant, spec.kind, params, now, transport, tool)
         ctx.engine = engine
-        dry = _dry(conn, run, job)
+        dry = _dry(conn, run, job) and not spec.reads
         if tool in ("github.push", "review.pushable"):
             ctx.policy = _push_policy(conn, job, run, ctx.project_id)
         elif tool == "github.open-pr":

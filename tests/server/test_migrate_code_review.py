@@ -10,14 +10,26 @@ import httpx
 import pytest
 from sqlalchemy import func, insert, select, update
 
-from armature.server import defs, starters, webhooks
+from armature.server import defs, risk, starters, webhooks
 from armature.server.db import new_id
 from armature.server.db.schema import jobs, projects, settings, teams, workflows
 from armature.server.db.schema import webhooks as webhooks_table
 from armature.server.migrate_ops import code_review, import_ops
 from tests.server import ops_harness
 from tests.server.test_review_flow import INPUTS, flow, run_flow  # noqa: F401
-from tests.server.tool_support import NUMBER, REPO, app, clock, dns, pem, vendor, world  # noqa: F401
+from tests.server.tool_support import (  # noqa: F401
+    HEAD,
+    NUMBER,
+    REPO,
+    app,
+    calls,
+    clock,
+    dns,
+    pem,
+    start_run,
+    vendor,
+    world,
+)
 
 NOW = datetime(2026, 10, 28, 12, 0, tzinfo=UTC)
 GOLDENS = {path.stem: ops_harness.load(path) for path in ops_harness.fixtures("code-review")}
@@ -200,3 +212,16 @@ async def test_a_recorded_review_posts_what_ops_posted(flow, app, vendor, tmp_pa
         return [(c["path"], c["line"], c.get("side"), c["body"]) for c in review.get("comments", [])]
 
     assert anchors(posted) == anchors(ops)
+
+
+async def test_a_dry_run_reads_github_runs_the_panel_and_records_every_write(flow, sqlite_engine, keyring, clock,  # noqa: F811
+                                                                             world, vendor, tmp_path):
+    flow.run = start_run(sqlite_engine, keyring, clock, world, trigger_ref={"dry_run": True}, risk=None)
+    result = await run_flow(tmp_path, "code-review", INPUTS)
+    assert sorted(flow.specialists[0]) == sorted(risk.DEFAULT_LOW_RISK_PANEL)
+    assert result["first"]["risk"] == "low" and result["first"]["head"] == HEAD
+    assert result["first"]["verdict"] == "approve"
+    assert vendor.writes() == [] and vendor.check_runs == []
+    assert sorted((c.tool, c.mode) for c in calls(sqlite_engine)) == [
+        ("github.post-review", "dry"), ("review.decisions", "dry"), ("review.mark", "dry"),
+        ("review.marked", "live"), ("review.risk", "live")]
