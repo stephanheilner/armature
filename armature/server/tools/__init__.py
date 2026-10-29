@@ -57,7 +57,15 @@ class Tool:
 
 
 def registry() -> dict[str, Tool]:
-    from armature.server.tools import github, jira, linear, marks, review, slack
+    from armature.server.tools import (
+        context,
+        github,
+        jira,
+        linear,
+        marks,
+        review,
+        slack,
+    )
     return {
         "github.post-review": Tool("github_app", review.post),
         "github.check-run": Tool("github_app", github.check_run),
@@ -82,4 +90,5 @@ def registry() -> dict[str, Tool]:
         "review.mark": Tool("github_app", marks.mark),
         "review.pushable": Tool("github_app", marks.pushable, reads=True),
         "review.decisions": Tool("github_app", marks.decisions),
+        "review.context": Tool("github_app", context.context, reads=True),
     }

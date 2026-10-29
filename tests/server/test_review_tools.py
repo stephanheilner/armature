@@ -521,3 +521,26 @@ def test_a_live_hub_takes_the_decisions_as_events(sqlite_engine, keyring, clock,
     assert (run_id, step, payload["finding_key"], payload["decision"]) == (run.id, "decisions", "0123456789ab",
                                                                             "block")
     assert "token" not in payload and "finding_id" not in payload
+
+
+# review.context
+
+
+def test_context_lists_each_files_commentable_ranges_and_the_jira_keys_once():
+    from armature.server.tools import context
+    patch = "@@ -1,3 +1,3 @@\n line 1\n-old\n+new\n line 3\n@@ -10,0 +11,2 @@\n+a\n+b"
+    assert context.files_of([{"filename": "a.swift", "status": "modified", "patch": patch},
+                             {"filename": "gone.swift", "status": "removed"}]) == [
+        {"path": "a.swift", "status": "modified", "lines": [[1, 3], [11, 12]]},
+        {"path": "gone.swift", "status": "deleted", "lines": []}]
+    assert context.jira_keys("MOB-1 and MOB-1", "MOB-2-x MOB-3 MOB-4") == ["MOB-1", "MOB-2", "MOB-3"]
+
+
+def test_context_keeps_the_newest_comments_past_the_cap(monkeypatch):
+    from armature.server.tools import context
+    monkeypatch.setattr(context, "COMMENT_CAP", 2)
+    comments = [{"id": n, "user": {"login": "ana"}, "created_at": f"2026-10-2{n}T00:00:00Z", "body": f"note {n}"}
+                for n in range(1, 4)]
+    text = context.discussion_md(REPO, NUMBER, comments, [], [], lambda item: False)
+    assert "note 1" not in text and "note 2" in text and "note 3" in text
+    assert "1 older comments were left out" in text

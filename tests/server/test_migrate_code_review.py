@@ -10,6 +10,7 @@ import httpx
 import pytest
 from sqlalchemy import func, insert, select, update
 
+from armature.nodes.agent import _render as render_context
 from armature.server import defs, risk, starters, webhooks
 from armature.server.db import new_id
 from armature.server.db.schema import jobs, projects, settings, teams, workflows
@@ -18,6 +19,7 @@ from armature.server.migrate_ops import code_review, import_ops
 from tests.server import ops_harness
 from tests.server.test_review_flow import INPUTS, flow, run_flow  # noqa: F401
 from tests.server.tool_support import (  # noqa: F401
+    BOT,
     HEAD,
     NUMBER,
     REPO,
@@ -25,6 +27,7 @@ from tests.server.tool_support import (  # noqa: F401
     calls,
     clock,
     dns,
+    marker,
     pem,
     start_run,
     vendor,
@@ -217,11 +220,40 @@ async def test_a_recorded_review_posts_what_ops_posted(flow, app, vendor, tmp_pa
 async def test_a_dry_run_reads_github_runs_the_panel_and_records_every_write(flow, sqlite_engine, keyring, clock,  # noqa: F811
                                                                              world, vendor, tmp_path):
     flow.run = start_run(sqlite_engine, keyring, clock, world, trigger_ref={"dry_run": True}, risk=None)
+    vendor.pr.update(title="MOB-12 Fix the cache leak", body="Clears the cache on sign-out.")
+    vendor.comments = [{"id": 31, "user": {"login": BOT}, "path": "src/a.swift", "line": 3,
+                        "created_at": "2026-10-27T10:00:00Z", "body": "It leaks.\n\n" + marker("0123456789ab")},
+                       {"id": 32, "in_reply_to_id": 31, "user": {"login": "jstutz4"}, "author_association": "MEMBER",
+                        "created_at": "2026-10-27T11:00:00Z", "body": "Won't fix: the cache is per session."}]
+    vendor.issue_comments = [{"id": 41, "user": {"login": "ana"}, "created_at": "2026-10-27T12:00:00Z",
+                              "body": "Looks good to me."}]
+    seen = {}
+    played = flow.agent
+
+    async def agent(node, context):
+        seen[node._stage.id] = {name: render_context(text, context)
+                                for name, text in node._stage.agent.context_files.items()}
+        return await played(node, context)
+
+    flow.agent = agent
     result = await run_flow(tmp_path, "code-review", INPUTS)
     assert sorted(flow.specialists[0]) == sorted(risk.DEFAULT_LOW_RISK_PANEL)
     assert result["first"]["risk"] == "low" and result["first"]["head"] == HEAD
     assert result["first"]["verdict"] == "approve"
     assert vendor.writes() == [] and vendor.check_runs == []
     assert sorted((c.tool, c.mode) for c in calls(sqlite_engine)) == [
-        ("github.post-review", "dry"), ("review.decisions", "dry"), ("review.mark", "dry"),
-        ("review.marked", "live"), ("review.risk", "live")]
+        ("github.post-review", "dry"), ("jira.get-issue", "live"), ("review.context", "live"),
+        ("review.decisions", "dry"), ("review.mark", "dry"), ("review.marked", "live"), ("review.risk", "live")]
+
+    specialist, lead = seen["correctness"], seen["team_lead"]
+    assert set(specialist) == {"pr", "files.json", "jira"}
+    assert set(lead) == {"reviews", "verify.json", "pr", "files.json", "findings", "discussion", "jira"}
+    assert "# MOB-12 Fix the cache leak" in lead["pr"] and "Clears the cache on sign-out." in lead["pr"]
+    assert json.loads(lead["files.json"]) == [{"path": "src/a.swift", "status": "modified", "lines": [[1, 12]]}]
+    assert "## Finding 0123456789ab" in lead["findings"] and "`src/a.swift:3`" in lead["findings"]
+    assert "Won't fix: the cache is per session." in lead["discussion"] and "[armature]" in lead["discussion"]
+    assert "Looks good to me." in lead["discussion"]
+    assert json.loads(lead["jira"])["issue"] == "MOB-12" and specialist["jira"] == lead["jira"]
+    assert json.loads(lead["verify.json"])["ran"] is False
+    assert json.loads(lead["reviews"])["correctness"] == {"findings": []}
+    assert json.loads(lead["reviews"])["beauty"] == {"_skipped": True}
