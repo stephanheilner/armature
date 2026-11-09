@@ -24,7 +24,7 @@ from typing import Any
 import httpx
 from ruamel.yaml import YAML
 from ruamel.yaml.error import YAMLError
-from sqlalchemy import Connection, Engine, func, insert, select
+from sqlalchemy import Connection, Engine, func, insert, select, update
 
 from armature.events.sign import sign_engine
 from armature.packs import BUILTIN_DIR, Catalog
@@ -87,6 +87,10 @@ CAP_KEY = "github.push_daily_cap"
 DEFAULT_PUSH_CAP = 3
 # Pushes to one pull request across all runs in a day, whatever the team's daily cap says.
 PR_PUSH_CAP = 6
+# Crash issues a project files a day, across all runs, failed ones included.
+CRASH_CAP = 2
+# Shorter than a day, so a fixed daily schedule's next run is never refused, even a faster one or across DST.
+CRASH_WINDOW = timedelta(hours=20)
 
 _minted: dict[str, list[tuple[str, str, httpx.BaseTransport | None]]] = {}
 _minted_lock = threading.Lock()
@@ -369,6 +373,60 @@ def _admit_push(engine: Engine, grant: Grant, job: Any, result: dict[str, Any], 
     return result
 
 
+def _create_policy(conn: Connection, job: Any) -> dict[str, Any]:
+    """The project's Jira components and sprint board for a crash issue. A malformed value is refused, not dropped."""
+    components = setting(conn, jira_tools.COMPONENTS_KEY, job.team_id, job.project_id)
+    board = setting(conn, jira_tools.BOARD_KEY, job.team_id, job.project_id)
+    if components is not None and (not isinstance(components, list) or not all(
+            isinstance(c, str) and 0 < len(c) <= 255 for c in components)):
+        raise BrokerError(409, f"The {jira_tools.COMPONENTS_KEY} setting must be a list of component names.")
+    if board is not None and (not isinstance(board, int) or isinstance(board, bool) or board < 1):
+        raise BrokerError(409, f"The {jira_tools.BOARD_KEY} setting must be a board id.")
+    return {"components": components or [], "board": board}
+
+
+def _crash_label(params: dict[str, Any]) -> str | None:
+    return next(iter(jira_tools.crash_labels(params)), None)
+
+
+def _crash_create(engine: Engine, grant: Grant, job: Any, spec: Any, ctx: Call, params: dict[str, Any], label: str,
+                  now: datetime, ip: str | None) -> dict[str, Any]:
+    """jira.create for a crash: admitted under the project's lock against today's crash issues, and recorded before
+    the POST, so two runs can't both pass the cap and a failed POST still counts."""
+    call_id = new_id()
+    with github_tools.key_lock(f"crash:{job.project_id}"), engine.begin() as conn:
+        conn.execute(select(projects.c.id).where(projects.c.id == job.project_id).with_for_update())
+        filed = conn.execute(select(tool_calls.c.target).where(
+            tool_calls.c.tool == "jira.create", tool_calls.c.mode == "live", tool_calls.c.outcome != "refused",
+            tool_calls.c.project_id == job.project_id, tool_calls.c.target.like("crashlytics-%"),
+            tool_calls.c.created_at >= now - CRASH_WINDOW)).scalars().all()
+        refusal = (f"{label} was already filed today" if label in filed else
+                   f"the cap of {CRASH_CAP} crash issues a day is reached" if len(filed) >= CRASH_CAP else None)
+        if refusal:
+            _write(conn, grant, job, "jira.create", "live", "refused", label, {"reason": refusal}, now, ip)
+            return {"issue": None, "created": False, "reason": refusal}
+        _write(conn, grant, job, "jira.create", "live", "approved", label, None, now, ip, call_id)
+    try:
+        result = spec.run(ctx, params)
+    except ToolError as exc:
+        _settle(engine, grant, job, call_id, label, "refused", {"error": exc.message}, now, ip)
+        raise BrokerError(exc.status, exc.message) from exc
+    except VendorError as exc:
+        _settle(engine, grant, job, call_id, label, "failed", {"error": str(exc)}, now, ip)
+        raise BrokerError(502, str(exc)) from exc
+    created = result.get("created") is True
+    _settle(engine, grant, job, call_id, label, "ok" if created else "refused",
+            {"issue": result.get("issue")} if created else {"reason": result.get("reason")}, now, ip)
+    return result
+
+
+def _settle(engine: Engine, grant: Grant, job: Any, call_id: str, target: str, outcome: str,
+            detail: dict[str, Any], now: datetime, ip: str | None) -> None:
+    with engine.begin() as conn:
+        conn.execute(update(tool_calls).where(tool_calls.c.id == call_id).values(outcome=outcome, detail=detail))
+        _audit(conn, grant, job, "jira.create", "live", outcome, target, ip)
+
+
 def _redacted(value: Any) -> Any:
     value = ingest.redact(value, ())
     if isinstance(value, str):
@@ -387,10 +445,15 @@ def _record(engine: Engine, grant: Grant, job: Any, tool: str, mode: str, outcom
 
 
 def _write(conn: Connection, grant: Grant, job: Any, tool: str, mode: str, outcome: str, target: str | None,
-           detail: dict[str, Any] | None, now: datetime, ip: str | None) -> None:
-    conn.execute(insert(tool_calls).values(id=new_id(), run_id=grant.run_id, team_id=job.team_id,
+           detail: dict[str, Any] | None, now: datetime, ip: str | None, call_id: str | None = None) -> None:
+    conn.execute(insert(tool_calls).values(id=call_id or new_id(), run_id=grant.run_id, team_id=job.team_id,
                                            project_id=job.project_id, step_id=grant.step, tool=tool, mode=mode,
                                            outcome=outcome, target=target, detail=detail, created_at=now))
+    _audit(conn, grant, job, tool, mode, outcome, target, ip)
+
+
+def _audit(conn: Connection, grant: Grant, job: Any, tool: str, mode: str, outcome: str, target: str | None,
+           ip: str | None) -> None:
     audit.record(conn, action="tool.call", actor_id=None, team_id=job.team_id, target_kind="run",
                  target_id=grant.run_id, detail={"tool": tool, "step": grant.step, "mode": mode,
                                                  "outcome": outcome, "target": target}, ip=ip)
@@ -429,6 +492,9 @@ def call_tool(engine: Engine, keyring: Keyring, *, public_url: str, token: Any, 
         raise BrokerError(404, f"{tool} has no broker call. Git asks for its credential itself.")
     params = _checked(tool, params)
     target = _target(params)
+    crash = _crash_label(params) if tool == "jira.create" else None
+    if crash:
+        target = crash
     with engine.connect() as conn:
         run, job = _run_job(conn, grant.run_id)
         ctx = _context(conn, keyring, public_url, run, job, grant, spec.kind, params, now, transport, tool)
@@ -440,8 +506,10 @@ def call_tool(engine: Engine, keyring: Keyring, *, public_url: str, token: Any, 
             ctx.policy = _push_policy(conn, job, run, ctx.project_id)
         elif tool == "github.open-pr":
             ctx.policy = {"head_sha": run.head_sha}
-        elif tool in ("jira.create", "review.context"):
+        elif tool in ("jira.create", "jira.search", "review.context"):
             ctx.policy = {"project": setting(conn, jira_tools.PROJECT_KEY, job.team_id, job.project_id)}
+            if crash:
+                ctx.policy.update(_create_policy(conn, job))
         held = tool == "github.open-pr" and not marks.may_open(conn, run.id)
     if held:
         _record(engine, grant, job, tool, "dry" if dry else "live", "refused", target,
@@ -451,6 +519,8 @@ def call_tool(engine: Engine, keyring: Keyring, *, public_url: str, token: Any, 
         shown = _redacted(params)
         _record(engine, grant, job, tool, "dry", "ok", target, {"params": shown}, now, ip)
         return {"dry_run": True, "tool": tool, "params": shown}
+    if crash:
+        return _crash_create(engine, grant, job, spec, ctx, params, crash, now, ip)
     try:
         result = spec.run(ctx, params)
     except ToolError as exc:

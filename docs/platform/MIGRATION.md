@@ -472,6 +472,77 @@ Steps:
 5. TODO, no replacement yet: ops' `push` mode, which pushed to the pull
    request's own branch.
 
+## crash-watch
+
+New on the platform, with no ops job to replace. Import it into
+`familysearch/mobile-ios` only, since the import refuses any other
+repository. Each morning it files the Tree iOS app's worst new or regressed
+fatal Crashlytics crashes as MEMTEMDIS Defects, at most two a day. ops'
+`jira-watch` then hands each one to `development`, since it is assigned to
+the Jira connection's account in the board's active sprint.
+
+The workflow has five parts, and no model sees crash data:
+
+1. `crashlytics/clusters` reads the project's GCP connection's BigQuery
+   table: fatal crashes of the last 7 days with at least 10 distinct
+   installations, the top 20 by users. The query reads only the issue id, the
+   blamed frame's symbol, file, line, and library, the display version, the
+   installation id (counted only), and the event time, filtered on the
+   `event_timestamp` partition of the daily table. It bills at most 10 GB.
+2. `jira/search` finds the issues labeled `crashlytics-<issue id>` in the
+   project's Jira project, in one call.
+3. For each crash whose last issue was resolved Fixed, with no open issue,
+   `github/release-contains` asks GitHub's compare whether each crashing
+   version's `familytree_<version>` tag holds the fix's merge commit. The
+   fix is the pull request a `Merged fs-eng/mobile-ios#<n>` comment names,
+   counted only when the Jira connection's own account wrote it, as
+   pr-merged does. Else it is the merged one from `armature/<key>`.
+4. The `crash_watch_triage` tool, a pure function in
+   `armature/server/crash_triage.py`, decides. An open issue skips the
+   crash. A resolution other than Fixed, or no merged fix, ignores it. A tag
+   that holds the fix and crashed after the tag was made is a regression. A
+   fix that shipped to no crashing version waits 21 days after resolution,
+   then the crash is ignored. A crash with no issue is new. Crashes rank by
+   users, then issue id, and the top two new or regressed ones are filed.
+5. Two `jira/create` steps file them one after another, with a templated
+   description. A regression is a new Defect with the same label, related
+   to the old issue.
+
+The server enforces the cap too. A `jira.create` with a `crashlytics-` label
+takes the project's lock, counts the project's crash issues of the last 20
+hours, failed ones included, refuses a third or the same label twice, and
+records the call before it posts. It then searches the label again and files
+nothing if an open issue has it. The issue, its components, labels,
+assignee, description, and link go out in one POST, and the move into the
+sprint goes last. A board with no active sprint, or more than one, files
+nothing.
+
+The import sets two project settings: `jira.components` to `["Mobile iOS"]`
+and `jira.board` to `3887`, the MEMTEMDIS scrum board. Both apply only to a
+`jira.create` with a `crashlytics-` label, so another workflow that files
+issues in the project, such as slack-intake, files them as before. It adds an S23
+`schedule` trigger at `30 6 * * *` America/Denver, created disabled.
+
+Dry-run test: `tests/server/test_migrate_crash_watch.py`, with the decisions
+in `tests/server/test_crash_triage.py` and the tools and cap in
+`tests/server/test_crash_tools.py`.
+
+- A day with a regressed crash, two new ones, an open one, and one below 10
+  users files the regression and the worst new crash.
+- A quiet day files nothing.
+
+Steps:
+
+1. On the `familysearch/mobile-ios` project, add a GCP connection with the
+   `crash-watch` service account's JSON key, project
+   `api-8264880723452882397-765839`, dataset `firebase_crashlytics`, and
+   table `org_familysearch_tree_IOS`. Verify it.
+2. Check the `jira.project` setting is `MEMTEMDIS` on the team or project.
+3. Run the import.
+4. Once the export has data, dry-run the workflow from its page, and check
+   the clusters and the issues it would file.
+5. Enable the schedule.
+
 ## Groundwork for the remaining workflows
 
 The workflows below don't have bodies yet. Their bodies depend on S14b

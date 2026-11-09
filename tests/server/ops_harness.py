@@ -50,7 +50,11 @@ SLACK_KEYS = ("channel", "text", "thread_ts", "unfurl_links", "unfurl_media")
 CONNECTIONS = {
     "slack": ({"bot_token": "xoxb-harness"}, {}),
     "jira": ({"api_token": "jira-harness"}, {"site_url": SITE, "email": "bot@familysearch.test"}),
+    "github_app": ({}, {"auth": "gh_cli", "api_base": "https://api.github.com"}),
+    "gcp": ({"service_account_json": "{}"}, {"project_id": "crash-harness", "dataset": "firebase_crashlytics",
+                                             "table": "org_familysearch_tree_IOS"}),
 }
+JIRA_ACCOUNT = "acct-harness"
 
 
 @dataclass
@@ -192,17 +196,19 @@ def _tool(vendor: Vendors, call: dict[str, Any], out: Replay) -> dict[str, Any]:
     creds, config = CONNECTIONS[tool.kind]
     if call["tool"] == "slack.post":
         vendor.slack = {"ok": True, "channel": params["channel"], "ts": SLACK_TS}
-    ctx = Call(run_id="dry-run", step_id=call["step"], connection=SimpleNamespace(config=config, identity={}),
+    ctx = Call(run_id="dry-run", step_id=call["step"],
+               connection=SimpleNamespace(id="harness", config=config,
+                                          identity={"account_id": JIRA_ACCOUNT} if tool.kind == "jira" else {}),
                creds=creds, now=datetime.now(UTC), transport=httpx.MockTransport(vendor),
-               policy={"project": JIRA_PROJECT} if call["tool"] == "jira.create" else {})
+               policy={"project": JIRA_PROJECT} if call["tool"] in ("jira.create", "jira.search") else {})
     return tool.run(ctx, params)
 
 
 def run_stored(engine, workflow_id: str, inputs: dict[str, Any], tmp: Path, monkeypatch,
-               agents: dict[str, Any] | None = None, pause: bool = False) -> Replay:
+               agents: dict[str, Any] | None = None, pause: bool = False, vendor: Vendors | None = None) -> Replay:
     """Run one stored workflow as a trigger with no delivery would, such as a schedule or a poll."""
     monkeypatch.setattr(vendors, "resolve_host", lambda host: ["140.82.112.5"])
-    vendor = Vendors()
+    vendor = vendor or Vendors()
     out = Replay()
     row, body, bundle = _workflow(engine, workflow_id)
     out.runs.append((row.name, row.project_id))

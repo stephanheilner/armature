@@ -1,0 +1,22 @@
+name: crashlytics
+version: 1.0.0
+description: >-
+  Crashlytics through the project's GCP connection, from its BigQuery export. Queries run on the server, so no
+  step holds the service account key, and they read only issue ids, the blamed frame, versions, and counts.
+adapters:
+  clusters:
+    description: >-
+      The top fatal crash clusters of the last days days with at least min_users distinct installations, most users
+      first, each with its label (crashlytics- and the issue id), blamed frame, counts, and crashing versions. A
+      missing table or a failed query fails the step.
+    cmd: armature tool crashlytics.clusters
+    writes: false
+    timeout: 120
+    params:
+      type: object
+      additionalProperties: false
+      properties:
+        days: {type: integer, minimum: 1, maximum: 30}
+        min_users: {type: integer, minimum: 1, maximum: 100000}
+        top: {type: integer, minimum: 1, maximum: 50}
+        connection: {type: string}

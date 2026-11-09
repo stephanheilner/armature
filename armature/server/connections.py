@@ -1,4 +1,5 @@
-"""Vendor connections: a team's or project's GitHub, Slack, Jira, and Linear credentials.
+"""Vendor connections: a team's or project's GitHub, Slack, Jira, and Linear credentials, and a project's GCP
+service account.
 
 Credentials are one sealed JSON object per row and write-only, as the AWS
 connection's are: the API shows whether each is set and, for a token, its last
@@ -29,19 +30,21 @@ from armature.server.db.schema import (
     projects,
     webhooks,
 )
-from armature.server.vendors import VendorError, github, jira, linear, slack
+from armature.server.vendors import VendorError, gcp, github, jira, linear, slack
 
 log = logging.getLogger(__name__)
 
 LABEL = "connections"
 SECRETS = {"github_app": ("private_key_pem", "webhook_secret"), "slack": ("bot_token", "signing_secret"),
-           "jira": ("api_token", "webhook_secret"), "linear": ("api_key", "webhook_secret")}
-REQUIRED = {"github_app": "private_key_pem", "slack": "bot_token", "jira": "api_token", "linear": "api_key"}
+           "jira": ("api_token", "webhook_secret"), "linear": ("api_key", "webhook_secret"),
+           "gcp": ("service_account_json",)}
+REQUIRED = {"github_app": "private_key_pem", "slack": "bot_token", "jira": "api_token", "linear": "api_key",
+            "gcp": "service_account_json"}
 HINTED = frozenset({"bot_token", "api_token", "api_key"})
 WEBHOOK_SECRET = {"github_app": "webhook_secret", "slack": "signing_secret", "jira": "webhook_secret",
                   "linear": "webhook_secret"}
 SOURCE_KIND = {"github": "github_app", "slack": "slack", "jira": "jira", "linear": "linear"}
-VENDORS = {"github_app": github, "slack": slack, "jira": jira, "linear": linear}
+VENDORS = {"github_app": github, "slack": slack, "jira": jira, "linear": linear, "gcp": gcp}
 NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]{0,99}$")
 CLIENT_ID = re.compile(r"^[A-Za-z0-9.]{8,64}$")
 APP_ID = re.compile(r"^\d{1,12}$")
@@ -50,6 +53,8 @@ SLACK_APP = re.compile(r"^A[A-Z0-9]{2,20}$")
 EMAIL = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,190}$")
 JIRA_HOST = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}\.atlassian\.net$")
 HOST = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$")
+GCP_PROJECT = re.compile(r"^[a-z][a-z0-9-]{4,61}[a-z0-9]$")
+BQ_NAME = re.compile(r"^[A-Za-z0-9_]{1,100}$")
 KEY_MAX = 16 * 1024
 SECRET_MAX = 512
 ERROR_MAX = 2000
@@ -160,16 +165,25 @@ def _config(kind: str, values: dict[str, Any]) -> dict[str, Any]:
     elif kind == "jira":
         found = {"site_url": _https(values.get("site_url"), "site_url", JIRA_HOST, required=True),
                  "email": _text(values.get("email"), "email", EMAIL, required=True)}
+    elif kind == "gcp":
+        found = {"project_id": _text(values.get("project_id"), "project_id", GCP_PROJECT, required=True),
+                 "dataset": _text(values.get("dataset"), "dataset", BQ_NAME, required=True),
+                 "table": _text(values.get("table"), "table", BQ_NAME, required=True)}
     else:
         found = {}
     return {k: v for k, v in found.items() if v is not None}
 
 
 def _secret(kind: str, name: str, value: Any) -> str:
-    limit = KEY_MAX if name == "private_key_pem" else SECRET_MAX
+    limit = KEY_MAX if name in ("private_key_pem", "service_account_json") else SECRET_MAX
     if not isinstance(value, str) or len(value.strip()) > limit:
         raise ConnError(400, f"{name} is text of at most {limit} characters.")
     value = value.strip()
+    if name == "service_account_json":
+        try:
+            return gcp.service_account(value)
+        except VendorError as exc:
+            raise ConnError(400, str(exc)) from exc
     if name == "private_key_pem":
         try:
             github.load_key(value)
@@ -201,11 +215,13 @@ def set_connection(conn: Connection, keyring: Keyring, *, team_id: str, project_
         raise ConnError(400, "A connection's kind can't change. Add another connection.")
     if row is None and kind == "github_app" and project_id is not None:
         raise ConnError(400, "A GitHub App connection belongs to a team. Add it on the team.")
+    if row is None and kind == "gcp" and project_id is None:
+        raise ConnError(400, "A GCP connection belongs to a project. Add it on the project.")
     name = _text(body.get("name") if "name" in body or row is None else row.name, "name", NAME, required=True)
     current_config = (row.config or {}) if row is not None else {}
     config = _config(kind, {k: body[k] if k in body else current_config.get(k)
                             for k in ("auth", "host", "client_id", "app_id", "api_base", "team_id", "site_url",
-                                      "email")})
+                                      "email", "project_id", "dataset", "table")})
     gh_cli = github.uses_gh_cli(config)
     if (gh_cli or github.uses_gh_cli(current_config)) and not is_admin:
         raise ConnError(403, "Only a server admin can add or change a gh CLI connection.")

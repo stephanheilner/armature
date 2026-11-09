@@ -27,7 +27,15 @@ export const KINDS = {
     config: [],
     secrets: [['api_key', 'API key', 'password'], ['webhook_secret', 'Webhook secret (optional)', 'password']],
   },
+  gcp: {
+    label: 'GCP',
+    hint: 'A service account’s JSON key with read access to one BigQuery table, such as a Crashlytics export, and that table’s project, dataset, and table. Verify gets a token for the account. Only a project has one.',
+    config: [['project_id', 'Project id', 'my-project'], ['dataset', 'Dataset', 'firebase_crashlytics'], ['table', 'Table', 'com_example_app_IOS']],
+    secrets: [['service_account_json', 'Service account key (JSON)', 'textarea']],
+  },
 };
+
+export const TEAM_KINDS = Object.keys(KINDS).filter((kind) => kind !== 'gcp');
 
 export const teamConnectionsPath = (teamId) => `/api/teams/${encodeURIComponent(teamId)}/connections`;
 export const projectConnectionsPath = (projectId) => `/api/projects/${encodeURIComponent(projectId)}/connections`;
@@ -64,6 +72,7 @@ export function identityText(connection) {
   if (connection?.kind === 'slack') return [found.bot_user && `@${found.bot_user}`, found.team].filter(Boolean).join(' in ');
   if (connection?.kind === 'jira') return found.display || '';
   if (connection?.kind === 'linear') return [found.user, found.org].filter(Boolean).join(' in ');
+  if (connection?.kind === 'gcp') return found.client_email || '';
   return '';
 }
 
@@ -144,7 +153,7 @@ function rowFor(connection, canManage, status, edit, reload) {
 }
 
 // One card for a team's or a project's connections. Everyone who sees the scope sees them, and only leads change them.
-export function connectionsCard({ listPath, canManage, prefix, note, kinds = Object.keys(KINDS) }) {
+export function connectionsCard({ listPath, canManage, prefix, note, kinds = TEAM_KINDS }) {
   const body = element('div', {}, loading());
   const slot = element('div');
   async function reload() {

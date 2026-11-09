@@ -59,6 +59,7 @@ class Tool:
 def registry() -> dict[str, Tool]:
     from armature.server.tools import (
         context,
+        crashlytics,
         github,
         jira,
         linear,
@@ -73,6 +74,7 @@ def registry() -> dict[str, Tool]:
         "github.open-pr": Tool("github_app", github.open_pr),
         "github.permission": Tool("github_app", github.permission, reads=True),
         "github.pr-diff": Tool("github_app", github.pr_diff, reads=True),
+        "github.release-contains": Tool("github_app", github.release_contains, reads=True),
         # Checkout only earns a read credential for git, through the broker's git-credential route.
         "github.checkout": Tool("github_app", None),
         "github.push": Tool("github_app", github.push_gate),
@@ -81,7 +83,9 @@ def registry() -> dict[str, Tool]:
         "jira.comment": Tool("jira", jira.comment),
         "jira.create": Tool("jira", jira.create),
         "jira.get-issue": Tool("jira", jira.get_issue, reads=True),
+        "jira.search": Tool("jira", jira.search, reads=True),
         "jira.transition": Tool("jira", jira.transition),
+        "crashlytics.clusters": Tool("gcp", crashlytics.clusters, reads=True),
         "linear.comment": Tool("linear", linear.comment),
         "linear.transition": Tool("linear", linear.transition),
         # risk and marked read only GitHub, and record the level or the no-op on their own run.

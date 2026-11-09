@@ -49,14 +49,18 @@ def load_key(private_key_pem: str) -> rsa.RSAPrivateKey:
     return key
 
 
+def rs256(private_key_pem: str, claims: dict[str, Any]) -> str:
+    header = _b64(json.dumps({"alg": "RS256", "typ": "JWT"}, separators=(",", ":")).encode())
+    body = _b64(json.dumps(claims, separators=(",", ":")).encode())
+    signing = f"{header}.{body}".encode()
+    signature = load_key(private_key_pem).sign(signing, padding.PKCS1v15(), hashes.SHA256())
+    return f"{header}.{body}.{_b64(signature)}"
+
+
 def app_jwt(private_key_pem: str, issuer: str, now: datetime) -> str:
     """An RS256 App JWT, backdated a minute for clock drift and good for nine more."""
     stamp = int(now.timestamp())
-    header = _b64(json.dumps({"alg": "RS256", "typ": "JWT"}, separators=(",", ":")).encode())
-    claims = _b64(json.dumps({"iat": stamp - 60, "exp": stamp + 540, "iss": issuer}, separators=(",", ":")).encode())
-    signing = f"{header}.{claims}".encode()
-    signature = load_key(private_key_pem).sign(signing, padding.PKCS1v15(), hashes.SHA256())
-    return f"{header}.{claims}.{_b64(signature)}"
+    return rs256(private_key_pem, {"iat": stamp - 60, "exp": stamp + 540, "iss": issuer})
 
 
 def headers(token: str | None = None) -> dict[str, str]:

@@ -41,14 +41,15 @@ def server(monkeypatch):
 
 def test_the_builtin_packs_load_and_every_cmd_is_the_tool_cli():
     cat = catalog([BUILTIN_DIR])
-    assert cat.errors == [] and [p.name for p in cat.packs()] == ["conversation", "github", "jira", "linear",
-                                                                  "resident", "review", "slack"]
+    assert cat.errors == [] and [p.name for p in cat.packs()] == ["conversation", "crashlytics", "github", "jira",
+                                                                  "linear", "resident", "review", "slack"]
     for pack in cat.packs():
         assert pack.builtin and is_builtin(pack.dir)
         for name, adapter in pack.adapters.items():
             assert adapter.cmd == f"armature tool {pack.name}.{name}"
             assert adapter.writes == (name not in {"checkout", "history", "risk", "marked", "pushable", "get-issue",
-                                                        "permission", "pr-diff", "context", "events", "state.get"})
+                                                        "permission", "pr-diff", "context", "events", "state.get",
+                                                        "search", "clusters", "release-contains"})
 
 
 def test_a_tool_posts_its_with_and_prints_only_the_result(server, monkeypatch, capsys):

@@ -1,5 +1,5 @@
-"""Jira tools: read an issue, create one in the project's Jira project, comment, and move an issue to a status with
-ops jira_transition.sh's guards, on REST v3."""
+"""Jira tools: read an issue, search the project's Jira project by label, create an issue there, comment, and move
+an issue to a status with ops jira_transition.sh's guards, on REST v3."""
 from __future__ import annotations
 
 import re
@@ -11,9 +11,17 @@ import httpx
 from armature.server import sanitize
 from armature.server.tools import Call, ToolError
 from armature.server.vendors import VendorError, call, client, json_of
+from armature.server.vendors import jira as vendor
 
 KEY = re.compile(r"[A-Z][A-Z0-9]+-[0-9]+")
 PROJECT_KEY = "jira.project"
+COMPONENTS_KEY = "jira.components"
+BOARD_KEY = "jira.board"
+CRASH_LABEL = re.compile(r"^crashlytics-[A-Za-z0-9]{1,40}$")
+SEARCH_FIELDS = "summary,status,resolution,resolutiondate,labels,created,comment"
+SEARCH_MAX = 100
+MERGED = re.compile(r"\bMerged ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([0-9]+)\b")
+LINK_TYPE = "Relates"
 SUMMARY_MAX = 255
 ISSUE_FIELDS = "summary,description,status,issuetype,components,labels,comment"
 COMMENTS_MAX = 50
@@ -53,13 +61,14 @@ class Jira:
     def __exit__(self, *exc: Any) -> None:
         self._http.close()
 
-    def request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+    def request(self, method: str, path: str, agile: bool = False, **kwargs: Any) -> httpx.Response:
         what = f"Jira {method} {re.sub(KEY, '{key}', path.split('?')[0])}"
-        return call(self._http, method, f"{self.site}/rest/api/3{path}", what, auth=self._auth,
+        base = "/rest/agile/1.0" if agile else "/rest/api/3"
+        return call(self._http, method, f"{self.site}{base}{path}", what, auth=self._auth,
                     headers={"Accept": "application/json"}, **kwargs)
 
-    def json(self, method: str, path: str, **kwargs: Any) -> Any:
-        response = self.request(method, path, **kwargs)
+    def json(self, method: str, path: str, agile: bool = False, **kwargs: Any) -> Any:
+        response = self.request(method, path, agile, **kwargs)
         return json_of(response, f"Jira {method} {re.sub(KEY, '{key}', path.split('?')[0])}") \
             if response.status_code != 204 else {}
 
@@ -99,23 +108,115 @@ def get_issue(ctx: Call, params: dict[str, Any]) -> dict[str, Any]:
             "url": f"{ctx.config['site_url']}/browse/{issue}"}
 
 
-def create(ctx: Call, params: dict[str, Any]) -> dict[str, Any]:
-    """An issue in the project's own Jira project, from an allowlist of fields. The project key is never a param."""
+def _project(ctx: Call) -> str:
     project = ctx.policy.get("project")
     if not isinstance(project, str) or not re.fullmatch(r"[A-Z][A-Z0-9]+", project):
         raise ToolError(409, f"Set the {PROJECT_KEY} setting to this project's Jira project key first.")
+    return project
+
+
+def _issue(site_url: str, issue: dict[str, Any], account: Any) -> dict[str, Any]:
+    """One search hit. Only the connection's own comments, which pr-merged writes, can name a merged fix."""
+    fields = issue.get("fields") if isinstance(issue.get("fields"), dict) else {}
+    key = issue.get("key")
+    if not isinstance(key, str) or not KEY.fullmatch(key):
+        raise VendorError("Jira GET /rest/api/3/search/jql answered with an issue without a key.")
+    status = fields.get("status") if isinstance(fields.get("status"), dict) else {}
+    resolution = fields.get("resolution") if isinstance(fields.get("resolution"), dict) else {}
+    comments = (fields.get("comment") or {}).get("comments") if isinstance(fields.get("comment"), dict) else []
+    merged = []
+    own = [c for c in comments or [] if isinstance(c, dict) and isinstance(c.get("author"), dict)
+           and account and c["author"].get("accountId") == account]
+    for found in (MERGED.finditer(text_of(c.get("body"))) for c in own):
+        merged += [{"repo": m.group(1), "number": int(m.group(2))} for m in found]
+    return {"issue": key, "summary": fields.get("summary") or "", "status": status.get("name") or "",
+            "status_category": (status.get("statusCategory") or {}).get("key") or "",
+            "resolution": resolution.get("name"),
+            "resolved_at": fields.get("resolutiondate"), "created_at": fields.get("created"),
+            "labels": [x for x in fields.get("labels") or [] if isinstance(x, str)], "merged_prs": merged,
+            "url": f"{site_url}/browse/{key}"}
+
+
+def crash_labels(params: dict[str, Any]) -> list[str]:
+    """The crashlytics labels in a step's params, which make a jira.create a crash issue."""
+    return [x for x in params.get("labels") or [] if isinstance(x, str) and CRASH_LABEL.fullmatch(x)]
+
+
+def _by_labels(ctx: Call, project: str, labels: list[str]) -> list[dict[str, Any]]:
+    if not labels:
+        return []
+    quoted = ", ".join(f'"{x}"' for x in labels)
+    jql = f"project = {project} AND labels in ({quoted}) ORDER BY created DESC"
+    found = vendor.issues(ctx.creds, ctx.config, jql, limit=SEARCH_MAX, fields=SEARCH_FIELDS,
+                          transport=ctx.transport)
+    return [_issue(ctx.config["site_url"], issue, ctx.identity.get("account_id")) for issue in found]
+
+
+def search(ctx: Call, params: dict[str, Any]) -> dict[str, Any]:
+    """The issues in the project's own Jira project that carry any of ``labels``. The project is never a param."""
+    labels = list(params.get("labels") or [])
+    if crash_labels(params) != labels:
+        raise ToolError(400, "Each label must be crashlytics- and an issue id.")
+    issues = _by_labels(ctx, _project(ctx), labels)
+    return {"issues": issues, "count": len(issues)}
+
+
+def _active_sprint(jira: Jira, board: int) -> int:
+    found = jira.json("GET", f"/board/{board}/sprint", agile=True, params={"state": "active"})
+    sprints = [s for s in (found.get("values") or []) if isinstance(s, dict)] if isinstance(found, dict) else None
+    if sprints is None:
+        raise VendorError("Jira GET /board/{id}/sprint answered without sprints.")
+    if len(sprints) != 1 or not isinstance(sprints[0].get("id"), int):
+        raise ToolError(409, f"Board {board} has {len(sprints)} active sprints, not one.")
+    return sprints[0]["id"]
+
+
+def create(ctx: Call, params: dict[str, Any]) -> dict[str, Any]:
+    """An issue in the project's own Jira project, from an allowlist of fields. The project key is never a param.
+
+    A crash issue, one with a crashlytics label, files nothing when an open issue already has the label, so a rerun
+    never files the same crash twice. Only a crash issue gets the components and the board's active sprint that
+    project settings name.
+    """
+    project = _project(ctx)
+    crash = crash_labels(params)
+    open_ = [i["issue"] for i in _by_labels(ctx, project, crash) if i["status_category"] != "done"]
+    if open_:
+        return {"issue": None, "created": False, "reason": f"{', '.join(open_)} already tracks this crash"}
     fields: dict[str, Any] = {"project": {"key": project}, "issuetype": {"name": params["type"]},
                               "summary": " ".join(sanitize.plain(params["summary"]).split())[:SUMMARY_MAX]}
     if params.get("description"):
         fields["description"] = adf(params["description"])
     if params.get("labels"):
         fields["labels"] = params["labels"]
+    components = ctx.policy.get("components") if crash else None
+    if components:
+        fields["components"] = [{"name": name} for name in components]
+    if params.get("assign_to_me"):
+        account = ctx.identity.get("account_id")
+        if not isinstance(account, str) or not account:
+            raise ToolError(409, "The Jira connection has no account. Verify it first.")
+        fields["assignee"] = {"accountId": account}
+    body: dict[str, Any] = {"fields": fields}
+    link = params.get("link")
+    if link:
+        if link.rsplit("-", 1)[0] != project:
+            raise ToolError(403, f"A link goes only to an issue in {project}.")
+        body["update"] = {"issuelinks": [{"add": {"type": {"name": LINK_TYPE}, "outwardIssue": {"key": link}}}]}
+    board = ctx.policy.get("board") if crash else None
     with Jira(ctx) as jira:
-        made = jira.json("POST", "/issue", json={"fields": fields})
-    key = made.get("key") if isinstance(made, dict) else None
-    if not isinstance(key, str) or not KEY.fullmatch(key):
-        raise VendorError("Jira POST /issue answered without an issue key.")
-    return {"issue": key, "created": True, "url": f"{ctx.config['site_url']}/browse/{key}"}
+        sprint = _active_sprint(jira, board) if board else None
+        made = jira.json("POST", "/issue", json=body)
+        key = made.get("key") if isinstance(made, dict) else None
+        if not isinstance(key, str) or not KEY.fullmatch(key):
+            raise VendorError("Jira POST /issue answered without an issue key.")
+        if sprint is not None:
+            try:
+                jira.json("POST", f"/sprint/{sprint}/issue", agile=True, json={"issues": [key]})
+            except VendorError as exc:
+                raise VendorError(f"Created {key}, but moving it to sprint {sprint} failed: {exc}") from exc
+    return {"issue": key, "created": True, "url": f"{ctx.config['site_url']}/browse/{key}",
+            **({"sprint": sprint} if sprint is not None else {})}
 
 
 def comment(ctx: Call, params: dict[str, Any]) -> dict[str, Any]:

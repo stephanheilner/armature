@@ -864,3 +864,32 @@ def test_0022_adds_poll_state_and_downgrade_drops_poll_triggers(db_url):
     assert found == {job: "canceled", newer: "queued"}
     assert not names & {"trigger_state", "trigger_seen", "trigger_polls"}
     assert not job_columns & {"concurrency_key", "not_before", "superseded_by"}
+
+
+def test_0028_allows_gcp_connections_and_downgrade_drops_them(db_url):
+    from alembic import command
+
+    from armature.server.db import alembic_config
+    from armature.server.db.schema import connections, projects
+    migrate(db_url)
+    team, project = new_id(), new_id()
+    engine = make_engine(db_url)
+    row = {"id": new_id(), "team_id": team, "project_id": project, "scope": project, "kind": "gcp", "name": "gcp",
+           "state": "unverified", "created_at": utcnow(), "updated_at": utcnow()}
+    try:
+        with engine.begin() as conn:
+            conn.execute(insert(teams).values(id=team, name="own", created_at=utcnow()))
+            conn.execute(insert(projects).values(id=project, team_id=team, name="app", created_at=utcnow()))
+            conn.execute(insert(connections).values(**row))
+            conn.execute(insert(connections).values(**{**row, "id": new_id(), "kind": "slack", "name": "chat"}))
+    finally:
+        engine.dispose()
+    command.downgrade(alembic_config(db_url), "0027")
+    engine = make_engine(db_url)
+    try:
+        with engine.begin() as conn:
+            assert conn.execute(text("SELECT kind FROM connections")).scalars().all() == ["slack"]
+            with pytest.raises(CHECK_FAILED), conn.begin_nested():
+                conn.execute(insert(connections).values(**{**row, "id": new_id(), "name": "again"}))
+    finally:
+        engine.dispose()

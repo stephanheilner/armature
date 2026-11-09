@@ -4287,7 +4287,7 @@ stages:
 
 A pack is a directory with a `pack.yaml` declaring each adapter: a `description`, a static `cmd` (may reference `$PACK_DIR`, the pack's own directory), a JSON Schema for `params` and for `outputs`, and a `timeout`. Parameters reach the script as `ARMATURE_WITH` and `ARMATURE_CONTEXT["with"]` — never interpolated into the command. `with:` is validated against the adapter's `params` schema when the workflow is validated (`INVALID_WITH`, with the field path) and again after it renders; a `pack/name` reference no installed pack provides is `UNKNOWN_PACK_ADAPTER`.
 
-Packs load from `ARMATURE_PACKS_PATH` and then `~/.armature/packs` (first pack under a name wins). The server ships built-in packs — `conversation`, `github`, `jira`, `linear`, `review`, `slack` — that power its review and integration flows.
+Packs load from `ARMATURE_PACKS_PATH` and then `~/.armature/packs` (first pack under a name wins). The server ships built-in packs — `conversation`, `crashlytics`, `github`, `jira`, `linear`, `resident`, `review`, `slack` — that power its review and integration flows.
 
 ```bash
 armature pack list                    # every available adapter + its parameter schema

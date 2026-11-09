@@ -91,6 +91,25 @@ adapters:
         repo: {type: string, pattern: '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$'}
         number: {type: integer, minimum: 1}
         connection: {type: string}
+  release-contains:
+    description: >-
+      Whether each version's release tag (tag_prefix and the version) holds a merged pull request's merge commit,
+      by GitHub's compare. The pull request is pr, else the merged one from branch armature/<issue>. contained is
+      null for a version with no tag, and merged is false when no merged pull request is found.
+    cmd: armature tool github.release-contains
+    writes: false
+    timeout: 120
+    params:
+      type: object
+      required: [repo, versions]
+      additionalProperties: false
+      properties:
+        repo: {type: string, pattern: '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$'}
+        pr: {type: [integer, 'null'], minimum: 1}
+        issue: {type: [string, 'null'], pattern: '^[A-Z][A-Z0-9]+-[0-9]+$'}
+        versions: {type: array, maxItems: 20, items: {type: string, pattern: '^[0-9A-Za-z][0-9A-Za-z._-]{0,39}$'}}
+        tag_prefix: {type: string, pattern: '^[A-Za-z0-9._-]{0,40}$'}
+        connection: {type: string}
   open-pr:
     description: Open a pull request from a branch of the same repository, and request reviews.
     cmd: armature tool github.open-pr

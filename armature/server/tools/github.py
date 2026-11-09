@@ -8,7 +8,7 @@ from __future__ import annotations
 import re
 import threading
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from datetime import datetime, timedelta
 from typing import Any
 from urllib.parse import quote
@@ -112,12 +112,17 @@ def api(call: Call, repo: str, permissions: dict[str, str]) -> Iterator[Api]:
 
 
 @contextmanager
-def pr_lock(repo: str, number: int) -> Iterator[None]:
-    """One writer at a time per pull request in this process, so two runs never post two sticky comments."""
+def key_lock(key: str) -> Iterator[None]:
+    """One holder at a time per key in this process."""
     with _pr_locks_guard:
-        lock = _pr_locks.setdefault(f"{repo.lower()}#{number}", threading.Lock())
+        lock = _pr_locks.setdefault(key, threading.Lock())
     with lock:
         yield
+
+
+def pr_lock(repo: str, number: int) -> AbstractContextManager[None]:
+    """One writer at a time per pull request in this process, so two runs never post two sticky comments."""
+    return key_lock(f"{repo.lower()}#{number}")
 
 
 def me(call: Call) -> str:
@@ -411,6 +416,65 @@ def push_gate(call: Call, params: dict[str, Any]) -> dict[str, Any]:
         return {**refused, "reason": rule}
     return {"approved": True, "repo": repo, "number": number, "branch": branch, "head": head.get("sha"),
             "author": author, "rule": rule, "commit": commit}
+
+
+def _merged_pr(gh: Api, repo: str, pr: int | None, issue: str | None) -> dict[str, Any] | None:
+    """The merged pull request: ``pr``, else the one from the ``armature/<issue>`` branch the development run opens.
+
+    ``pr`` counts only when its head branch or title names the issue, so a comment can't point at an unrelated fix.
+    """
+    if pr:
+        found = gh.request("GET", f"/repos/{repo}/pulls/{int(pr)}")
+        if found.status_code == 404 or not issue:
+            return None
+        made = json_of(found, "GitHub GET /repos/{repo}/pulls/{n}")
+        if not isinstance(made, dict) or not made.get("merged"):
+            return None
+        named = f"{(made.get('head') or {}).get('ref') or ''} {made.get('title') or ''}"
+        return made if re.search(rf"(?<![A-Za-z0-9]){re.escape(issue)}(?![0-9])", named, re.IGNORECASE) else None
+    if not issue:
+        return None
+    prs = gh.json("GET", f"/repos/{repo}/pulls", params={"head": f"{split(repo)[0]}:{NEW_BRANCH_PREFIX}{issue}",
+                                                          "state": "closed", "per_page": PAGE})
+    if not isinstance(prs, list):
+        raise VendorError("GitHub GET /repos/{repo}/pulls did not answer with a list.")
+    merged = [p for p in prs if isinstance(p, dict) and p.get("merged_at")]
+    return max(merged, key=lambda p: str(p["merged_at"])) if merged else None
+
+
+def release_contains(call: Call, params: dict[str, Any]) -> dict[str, Any]:
+    """Whether each version's release tag holds the merged fix, by GitHub's compare. A tag that isn't there is unknown.
+
+    Contained means the tag is not behind the merge commit, so no version ordering is assumed.
+    """
+    repo, prefix = params["repo"], params.get("tag_prefix") or ""
+    versions = list(dict.fromkeys(params.get("versions") or []))
+    with api(call, repo, {"contents": "read", **READ_PR}) as gh:
+        pr = _merged_pr(gh, repo, params.get("pr"), params.get("issue"))
+        sha = pr.get("merge_commit_sha") if pr else None
+        result = {"repo": repo, "issue": params.get("issue"), "pr": pr.get("number") if pr else None,
+                  "merged": bool(sha), "merge_commit_sha": sha, "merged_at": pr.get("merged_at") if pr else None}
+        if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+            return {**result, "merged": False, "versions": []}
+        found = []
+        for version in versions:
+            tag = f"{prefix}{version}"
+            ref = quote(tag, safe="")
+            compared = gh.request("GET", f"/repos/{repo}/compare/{sha}...{ref}")
+            if compared.status_code in (404, 422):
+                found.append({"version": version, "tag": tag, "contained": None, "tag_date": None})
+                continue
+            answer = json_of(compared, "GitHub GET /repos/{repo}/compare")
+            behind = answer.get("behind_by") if isinstance(answer, dict) else None
+            if not isinstance(behind, int):
+                raise VendorError("GitHub GET /repos/{repo}/compare answered without behind_by.")
+            date = None
+            if behind == 0:
+                commit = gh.json("GET", f"/repos/{repo}/commits/{ref}")
+                date = (((commit.get("commit") or {}).get("committer") or {}).get("date")) \
+                    if isinstance(commit, dict) else None
+            found.append({"version": version, "tag": tag, "contained": behind == 0, "tag_date": date})
+    return {**result, "versions": found}
 
 
 def git_token(call: Call, repo: str, write: bool) -> str:

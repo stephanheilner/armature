@@ -47,24 +47,31 @@ def _item(site_url: str, issue: dict[str, Any]) -> Item:
                         "issuetype": _name(fields.get("issuetype"), "name")})
 
 
-def search(creds: dict[str, str], config: dict[str, Any], jql: str, *, limit: int,
-           transport: httpx.BaseTransport | None = None) -> list[Item]:
-    """Up to ``limit`` issues the JQL returns, following at most ``PAGES_MAX`` page tokens."""
+def issues(creds: dict[str, str], config: dict[str, Any], jql: str, *, limit: int, fields: str,
+           transport: httpx.BaseTransport | None = None) -> list[dict[str, Any]]:
+    """Up to ``limit`` raw issues the JQL returns with ``fields``, following at most ``PAGES_MAX`` page tokens."""
     what = "Jira GET /rest/api/3/search/jql"
-    found: list[Item] = []
+    found: list[dict[str, Any]] = []
     token = None
     with client(transport, POLL_TIMEOUT) as http:
         for _ in range(PAGES_MAX):
-            params = {"jql": jql, "fields": SEARCH_FIELDS, "maxResults": limit - len(found),
+            params = {"jql": jql, "fields": fields, "maxResults": limit - len(found),
                       **({"nextPageToken": token} if token else {})}
             page = json_of(call(http, "GET", f"{config['site_url']}/rest/api/3/search/jql", what,
                                 auth=(config["email"], creds["api_token"]), headers={"Accept": "application/json"},
                                 params=params, stream=True), what, POLL_BODY_MAX)
-            issues = page.get("issues") if isinstance(page, dict) else None
-            if not isinstance(issues, list):
+            batch = page.get("issues") if isinstance(page, dict) else None
+            if not isinstance(batch, list):
                 raise VendorError(f"{what} answered without issues.")
-            found += [_item(config["site_url"], issue) for issue in issues if isinstance(issue, dict)]
+            found += [issue for issue in batch if isinstance(issue, dict)]
             token = page.get("nextPageToken")
             if len(found) >= limit or not isinstance(token, str) or not token or page.get("isLast"):
                 break
     return found[:limit]
+
+
+def search(creds: dict[str, str], config: dict[str, Any], jql: str, *, limit: int,
+           transport: httpx.BaseTransport | None = None) -> list[Item]:
+    """Up to ``limit`` issues the JQL returns, as poll items."""
+    return [_item(config["site_url"], issue)
+            for issue in issues(creds, config, jql, limit=limit, fields=SEARCH_FIELDS, transport=transport)]

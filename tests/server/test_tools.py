@@ -288,7 +288,8 @@ def test_every_tool_is_classified_and_only_reads_run_in_a_dry_run():
     from armature.server.tools import registry
     reads = {name for name, spec in registry().items() if spec.reads}
     assert reads == {"github.permission", "github.pr-diff", "jira.get-issue", "review.risk", "review.marked",
-                     "review.pushable", "review.context"}
+                     "review.pushable", "review.context", "github.release-contains", "jira.search",
+                     "crashlytics.clusters"}
 
 
 # Jira and Linear.

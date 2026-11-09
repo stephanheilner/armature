@@ -30,7 +30,8 @@ STEPS = {"review": "github/post-review", "comment": "github/pr-comment", "check"
          "state": "linear/transition", "risk": "review/risk", "marked": "review/marked", "mark": "review/mark",
          "decisions": "review/decisions", "pushable": "review/pushable", "create": "jira/create",
          "read": "jira/get-issue", "permission": "github/permission", "diff": "github/pr-diff",
-         "context": "review/context", "plain": "local/thing"}
+         "context": "review/context", "search": "jira/search", "clusters": "crashlytics/clusters",
+         "contains": "github/release-contains", "plain": "local/thing"}
 BODY = "name: tools\nstages:\n" + "".join(f"  - id: {step}\n    adapter: {ref}\n" for step, ref in STEPS.items())
 
 
@@ -65,10 +66,16 @@ class Vendors:
         self.linear_states = [{"id": "s1", "name": "Todo"}, {"id": "s2", "name": "In Review"}]
         self.next_id = 500
         self.minted = 0
+        self.bigquery: dict = {"jobComplete": True, "schema": {"fields": []}, "rows": []}
+        self.jira_found: list[dict] = []
+        self.sprints: list[dict] = [{"id": 41, "state": "active"}]
+        self.tags: dict[str, dict] = {}
+        self.fix_prs: dict[int, dict] = {}
+        self.branch_fixes: dict[str, list[dict]] = {}
 
     def writes(self, method: str | None = None) -> list[httpx.Request]:
         return [r for r in self.requests if r.method != "GET" and (method is None or r.method == method)
-                and not r.url.path.endswith("/access_tokens")]
+                and not r.url.path.endswith(("/access_tokens", "/queries")) and r.headers.get("host") != "oauth2.googleapis.com"]
 
     def body(self, request: httpx.Request) -> dict:
         return json.loads(request.content or b"{}")
@@ -82,6 +89,32 @@ class Vendors:
         path, method = request.url.path, request.method
         if any(path.endswith(f) for f in self.fail):
             return httpx.Response(502, text="upstream body that must not leak")
+        if path == "/token" and request.headers.get("host") == "oauth2.googleapis.com":
+            return httpx.Response(200, json={"access_token": "ya29.harness", "expires_in": 3599})
+        if re.fullmatch(r"/bigquery/v2/projects/[^/]+/queries", path):
+            return httpx.Response(200, json=self.bigquery)
+        if path == "/rest/api/3/search/jql":
+            asked = set(re.findall(r'"([^"]+)"', self.query(request).get("jql", "")))
+            found = [i for i in self.jira_found if asked & set((i.get("fields") or {}).get("labels") or [])] \
+                if asked else self.jira_found
+            return httpx.Response(200, json={"issues": found, "isLast": True})
+        if re.fullmatch(r"/rest/agile/1\.0/board/\d+/sprint", path):
+            return httpx.Response(200, json={"values": self.sprints})
+        if re.fullmatch(r"/rest/agile/1\.0/sprint/\d+/issue", path):
+            return httpx.Response(204)
+        found = re.fullmatch(r"/repos/[^/]+/[^/]+/compare/[0-9a-f]{40}\.\.\.(.+)", path)
+        if found and not re.fullmatch(r"[0-9a-f]{40}", found.group(1)):
+            tag = self.tags.get(found.group(1))
+            return httpx.Response(200, json={"behind_by": tag["behind_by"]}) if tag else httpx.Response(404)
+        found = re.fullmatch(r"/repos/[^/]+/[^/]+/commits/([^/]+)", path)
+        if found and found.group(1) in self.tags:
+            return httpx.Response(200, json={"commit": {"committer": {"date": self.tags[found.group(1)]["date"]}}})
+        found = re.fullmatch(r"/repos/[^/]+/[^/]+/pulls/(\d+)", path)
+        if found and int(found.group(1)) in self.fix_prs:
+            return httpx.Response(200, json=self.fix_prs[int(found.group(1))])
+        if re.fullmatch(r"/repos/[^/]+/[^/]+/pulls", path) and self.query(request).get("state") == "closed":
+            head = self.query(request).get("head", "").split(":", 1)[-1]
+            return httpx.Response(200, json=self.branch_fixes.get(head, []))
         if path == "/app/installations/7/access_tokens":
             self.minted += 1
             return httpx.Response(201, json={"token": f"ghs_minted{self.minted:032d}",

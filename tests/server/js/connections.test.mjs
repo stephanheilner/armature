@@ -15,7 +15,7 @@ test('connectionBody leaves blank credentials out so the server keeps them', () 
 });
 
 test('every kind names its config and secret fields', () => {
-  assert.deepEqual(Object.keys(KINDS), ['github_app', 'slack', 'jira', 'linear']);
+  assert.deepEqual(Object.keys(KINDS), ['github_app', 'slack', 'jira', 'linear', 'gcp']);
   for (const spec of Object.values(KINDS)) assert.ok(spec.secrets.length && spec.hint);
 });
 

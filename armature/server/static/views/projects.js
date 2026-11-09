@@ -201,7 +201,7 @@ async function detail(root, projectId) {
   root.append(await workflowsCard(projectRecord));
   if (canManageTeam(projectRecord.team_id)) root.append(await webhooksCard(projectRecord));
   root.append(connectionsCard({ listPath: projectConnectionsPath(projectRecord.id), canManage, prefix: `connections-${projectRecord.id}`,
-    kinds: ['slack', 'jira', 'linear'], note: 'A project’s own connection wins over its team’s of the same kind. A GitHub App connection belongs to the team.' }));
+    kinds: ['slack', 'jira', 'linear', 'gcp'], note: 'A project’s own connection wins over its team’s of the same kind. A GitHub App connection belongs to the team.' }));
 }
 
 export async function render(root, { name, args }) {

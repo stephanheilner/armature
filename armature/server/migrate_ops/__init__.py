@@ -128,6 +128,7 @@ def registry() -> dict[str, Callable[[Callable[[str], Any], Any], Rows]]:
     from armature.server.migrate_ops import (
         build_announce,
         code_review,
+        crash_watch,
         development,
         ios_port,
         localization,
@@ -139,7 +140,7 @@ def registry() -> dict[str, Callable[[Callable[[str], Any], Any], Rows]]:
     return {"build-announce": build_announce.rows, "pr-merged": pr_merged.rows, "code-review": code_review.rows,
             "slack-intake": slack_intake.rows, "repo-review": repo_review.rows,
             "pr-fix": pr_fix.rows, "development": development.rows,
-            "ios-port": ios_port.rows, "localization": localization.rows}
+            "ios-port": ios_port.rows, "localization": localization.rows, "crash-watch": crash_watch.rows}
 
 
 def digest(value: Any) -> str:

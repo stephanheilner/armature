@@ -113,6 +113,8 @@ class Vendor:
             return httpx.Response(200, json={"ok": True, "team": "Acme", "team_id": "T0ACME", "user": "bot",
                                              "user_id": "U0BOT", "bot_id": "B0BOT"},
                                   headers={"X-OAuth-Scopes": "chat:write,channels:history"})
+        if path == "/token" and request.headers.get("host") == "oauth2.googleapis.com":
+            return httpx.Response(200, json={"access_token": "ya29.verify", "expires_in": 3599})
         if path == "/rest/api/3/myself":
             return httpx.Response(200, json={"accountId": "abc-123", "displayName": "Armature"})
         if path == "/graphql":
@@ -742,3 +744,27 @@ def test_run_gh_asks_gh_for_the_hosts_token_and_never_echoes_its_output(tmp_path
     monkeypatch.setenv("PATH", str(tmp_path / "none"))
     with pytest.raises(VendorError, match="not installed"):
         github._run_gh("github.com")
+
+
+def test_a_gcp_connection_belongs_to_a_project_and_keeps_only_its_signing_fields(app, sqlite_engine, keyring,
+                                                                                signed_in, world, lead, vendor, pem):
+    plead = signed_in(world.users["plead"])
+    key = json.dumps({"type": "service_account", "private_key": pem, "token_uri": "https://evil.example/token",
+                      "client_email": "crash-watch@proj-1234.iam.gserviceaccount.com", "client_id": "1"})
+    body = {"kind": "gcp", "name": "crashlytics", "service_account_json": key, "project_id": "proj-1234",
+            "dataset": "firebase_crashlytics", "table": "app_IOS"}
+    refused = app.post(f"/api/teams/{world.team}/connections", json=body, headers=lead)
+    assert refused.status_code == 400 and "belongs to a project" in refused.json()["error"]
+    for bad in ({"service_account_json": "{\"type\": \"authorized_user\"}"}, {"table": "app; DROP"},
+                {"project_id": None}):
+        assert plead.post(f"/api/projects/{world.project}/connections", json={**body, **bad}).status_code == 400
+    made = _add(plead, {}, world.project, body, project=True)
+    assert made["config"] == {"project_id": "proj-1234", "dataset": "firebase_crashlytics", "table": "app_IOS"}
+    assert made["credentials"] == {"service_account_json": {"set": True}}
+    with sqlite_engine.connect() as conn:
+        stored = connections.credentials(keyring, connections.get(conn, made["id"]))
+    assert set(json.loads(stored["service_account_json"])) == {"type", "private_key", "client_email"}
+    ok = plead.post(f"/api/connections/{made['id']}/verify").json()["connection"]
+    assert ok["state"] == "ok", ok["last_error"]
+    assert ok["identity"] == {"client_email": "crash-watch@proj-1234.iam.gserviceaccount.com"}
+    assert (vendor.requests[-1].headers["host"], vendor.requests[-1].url.path) == ("oauth2.googleapis.com", "/token")
