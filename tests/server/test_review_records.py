@@ -78,7 +78,8 @@ def boom(monkeypatch):
 def test_the_database_only_tools_resolve_no_connection(app, sqlite_engine, run, vendor, boom):
     assert {name for name, spec in registry().items() if spec.kind == NONE} == {
         "review.decisions", "review.record-risk", "review.record-post", "review.record-mark", "review.is-marked",
-        "insights.fix-context", "insights.fix-patch", "insights.fix-risk", "insights.fix-apply", "workflow.handoff"}
+        "insights.fix-context", "insights.fix-patch", "insights.fix-risk", "insights.fix-apply", "workflow.handoff",
+        "eval.replay-start", "eval.replay-report"}
     _risk(app, run)
     _post(app, run)
     assert _mark(app, run)["marked"] is True

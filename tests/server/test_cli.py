@@ -487,3 +487,37 @@ def test_runs_delete_takes_several_ids(tmp_path, monkeypatch):
     with engine.connect() as conn:
         assert conn.execute(select(func.count()).select_from(runs)).scalar() == 1
         assert conn.execute(select(func.count()).select_from(audit).where(audit.c.action == "run.delete")).scalar() == 5
+
+
+def test_kimi_evaluate_needs_an_admin_and_warns_when_tools_answer_dry(tmp_path, monkeypatch):
+    from sqlalchemy import func, insert
+
+    from armature.server.db import new_id, utcnow
+    from armature.server.db.schema import jobs, projects, settings, teams
+    config, result = _init(tmp_path, monkeypatch)
+    assert result.exit_code == 0, result.output
+    engine = make_engine(load_config(config).database_url)
+    team, project = new_id(), new_id()
+    with engine.begin() as conn:
+        conn.execute(insert(teams).values(id=team, name="Mobile", slug="mobile", created_at=utcnow()))
+        conn.execute(insert(projects).values(id=project, team_id=team, name="android-tree", created_at=utcnow()))
+        conn.execute(insert(users).values(id=new_id(), username="viewer", is_admin=False, disabled=False,
+                                          created_at=utcnow()))
+
+    def start(*args):
+        return CliRunner().invoke(app, ["server", "kimi-evaluate", "--team", "mobile", "--project", "android-tree",
+                                        "--config", str(config), *args])
+
+    def queued():
+        with engine.connect() as conn:
+            return conn.execute(select(func.count()).select_from(jobs)).scalar()
+
+    refused = start("--as", "viewer")
+    assert refused.exit_code == 1 and "not an enabled admin" in refused.output and queued() == 0
+    done = start("--as", "admin", "--max-rounds", "20")
+    assert done.exit_code == 0, done.output
+    assert "Queued kimi-evaluate as job" in done.output and "Warning" not in done.output and queued() == 1
+    with engine.begin() as conn:
+        conn.execute(insert(settings).values(team_id=team, project_id=project, key="tools.dry_run", value=True))
+    dry = start("--as", "admin")
+    assert dry.exit_code == 0 and "tools.dry_run is on" in dry.output

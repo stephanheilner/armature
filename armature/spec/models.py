@@ -196,7 +196,7 @@ class GateApproval(BaseModel):
 
 
 PACK_ADAPTER_CONTEXT = "pack_adapter"
-LOADER_ONLY_ADAPTER_FIELDS = ("pack_dir", "params")
+LOADER_ONLY_ADAPTER_FIELDS = ("pack_dir", "params", "writes")
 
 
 class Adapter(BaseModel):
@@ -209,9 +209,10 @@ class Adapter(BaseModel):
     # When set, stdout is parsed into the stage result instead of returning
     # the {stdout, stderr, exit_code} envelope. Currently "json" only.
     parse: Literal["json"] | None = None
-    # Stamped by the loader for a pack adapter: $PACK_DIR in the child env and the schema for a step's with:.
+    # Stamped by the loader for a pack adapter: $PACK_DIR in the child env, the schema for a step's with:, and writes.
     pack_dir: str | None = None
     params: dict[str, Any] | None = None
+    writes: bool | None = None
 
     @model_validator(mode="before")
     @classmethod

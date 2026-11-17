@@ -536,6 +536,40 @@ the variant's alias. It never adds the variant's model id to the baseline's
 provider. It needs an admin, like any model change, and it refuses when the
 alias names another model than the one compared. See [Provider prices](DESIGN.md#provider-prices).
 
+### Replaying whole reviews on another model
+
+A replay experiment repeats past Claude code review rounds of one project on
+another model, with every stage of the review on that model, and compares the
+two reviews. An admin starts it with `armature server kimi-evaluate --team
+<team> --project <project> --as <admin>`, which queues the built-in, read-only
+`kimi-evaluate` workflow. Its `eval/replay-start` step does the work, and its
+`eval/replay-report` step shows the report so far. Only a run an admin started
+this way can use either tool.
+
+The replay is a partial stub. Each round's job runs at the round's workflow
+version, callee pins, and inputs, and only its `call:` stages and its read-only
+`agent:` stages with the default tools run, on the project's own alias, which
+an admin must have saved. Every other stage answers with the round's recorded
+output, and a step the round skipped stays skipped. A stage with no recorded
+output fails the replay. Nothing reaches GitHub, Jira, or `findings`, and
+replay runs carry `arm_id`, so rounds, insights, and the daily report leave
+them out. A round is skipped, with its reason in the report, when a runner
+registered it, it has no recorded context, any recorded output is truncated,
+or its workflow has a model stage a replay can't run live.
+
+The experiment is one `eval_experiments` row with specialist `panel`, and one
+`variant` arm per round. It is never sampled, matched, judged, scored, or
+recommended as a specialist experiment is. Once every arm has ended, the Arms
+daemon compares each round's team lead decisions with the findings Claude's
+round recorded, has the judge rate the findings only one side raised, and stores
+the report on the experiment and as `kimi-evaluate-<id>.html` in `reports.dir`.
+
+Replays need a runner that reads bundle version 5, which carries the recorded
+outputs as `stubs.json`. Replay jobs require `stubs:v5` and `eval-arm`, and a
+runner that serves them lists both in its capabilities. AWS environments never
+start for them. Every other bundle still says version 4, so older runners keep
+running everything else until you upgrade them.
+
 ### Recommendations
 
 The weekly job reads `eval_scores` and writes recommendations in this form:

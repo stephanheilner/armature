@@ -20,6 +20,7 @@ from typing import Any
 
 from armature.events.sign import ENGINE_FD_ENV, engine_pipe
 from armature.nodes.gate import CHECKPOINT_FILE
+from armature.nodes.stub import LIVE_AGENTS, LIVE_ENV, OUTPUTS_ENV
 from armature.procgroup import signal_group
 from armature.spec.models import ROLE_KEY, SKILL_NAME
 
@@ -32,7 +33,9 @@ CALL_FILE = re.compile(r"^(manifest\.json|[A-Za-z0-9][A-Za-z0-9._-]{0,127}@[1-9]
 # 2 added the call bundle: calls/manifest.json and calls/<workflow>@<version>.yaml.
 # 3 added the checkpoint a run resumes from, and pausing at a gate.
 # 4 added roles/<key>.md, the role documents agent steps name.
-BUNDLE_VERSION = 4
+# 5 added stubs.json, the recorded outputs a replay serves while only its agent steps run.
+BUNDLE_VERSION = 5
+STUBS_FILE = "stubs.json"
 SKILLS_DIR = "skills"
 SKILL_FILE = "SKILL.md"
 ROLES_DIR = "roles"
@@ -104,12 +107,12 @@ def share(workdir: Path, job_id: str, job_user: str, base: Path | None = None) -
     run_dir.mkdir(mode=0o700)
     os.chown(run_dir, -1, group)
     os.chmod(run_dir, 0o2770)
-    checkpoint = workdir / CHECKPOINT_FILE
+    checkpoint, stubs = workdir / CHECKPOINT_FILE, workdir / STUBS_FILE
     for source in [workdir / WORKFLOW_FILE, *sorted(p for p in (workdir / CALLS_DIR).glob("*")
                                                     if CALL_FILE.fullmatch(p.name)),
                    *sorted((workdir / SKILLS_DIR).glob(f"*/{SKILL_FILE}")),
                    *sorted((workdir / ROLES_DIR).glob("*.md")),
-                   *([checkpoint] if checkpoint.is_file() else [])]:
+                   *([checkpoint] if checkpoint.is_file() else []), *([stubs] if stubs.is_file() else [])]:
         target = run_dir / source.relative_to(workdir)
         for parent in reversed(target.parents):
             if parent.is_relative_to(run_dir) and parent != run_dir and not parent.exists():
@@ -178,6 +181,11 @@ def tail(path: Path) -> str:
     return text[-LOG_TAIL:].strip()
 
 
+def stub_env(directory: Path) -> dict[str, str]:
+    """The run env that serves a replay's stubs.json, so only its agent steps run."""
+    return {OUTPUTS_ENV: str(directory / STUBS_FILE), LIVE_ENV: LIVE_AGENTS}
+
+
 def check_bundle_version(version: object) -> None:
     """Refuse a bundle laid out by a newer server than this runner knows. A bundle with no version is 1."""
     if version is None:
@@ -188,14 +196,19 @@ def check_bundle_version(version: object) -> None:
 
 
 def write_bundle(workdir: Path, workflow: str, calls: dict[str, str], skills: dict[str, str] | None = None,
-                 checkpoint: dict[str, Any] | None = None, roles: dict[str, str] | None = None) -> None:
-    """Write a job's workflow, its call bundle into ``calls/``, its skills and roles, and the checkpoint a resumed
-    run reads, into a directory only we can read."""
+                 checkpoint: dict[str, Any] | None = None, roles: dict[str, str] | None = None,
+                 stubs: dict[str, Any] | None = None) -> None:
+    """Write a job's workflow, its call bundle into ``calls/``, its skills and roles, the checkpoint a resumed
+    run reads, and a replay's recorded outputs, into a directory only we can read."""
     workdir.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(workdir, 0o700)
     (workdir / WORKFLOW_FILE).write_text(workflow, encoding="utf-8")
     if checkpoint:
         (workdir / CHECKPOINT_FILE).write_text(json.dumps(checkpoint), encoding="utf-8")
+    if stubs is not None:
+        fd = os.open(workdir / STUBS_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            json.dump(stubs, out)
     if calls:
         children = workdir / CALLS_DIR
         children.mkdir(mode=0o700, exist_ok=True)

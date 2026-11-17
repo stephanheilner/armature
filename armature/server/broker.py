@@ -339,7 +339,7 @@ def _arm_call(engine: Engine, grant: Grant, job: Any, ctx: Call, spec: Any, tool
     elif tool == "review.pushable":
         result = {"pushable": False, "reason": ARM_PUSHES}
     elif tool == "review.decisions":
-        result = {"recorded": len(params.get("decisions") or [])}
+        result = {"recorded": len(params.get("decisions") or []), "dry_run": True}
     else:
         result = {"dry_run": True, "arm": True, "tool": tool, "params": _redacted(params)}
     _record(engine, grant, job, tool, "arm", "ok", target, {"params": _redacted(params)}, now, ip)

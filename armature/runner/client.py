@@ -55,6 +55,7 @@ from armature.runner.process import (
     share,
     stop,
     stop_sessions,
+    stub_env,
     tail,
     unshare,
     write_bundle,
@@ -314,7 +315,7 @@ class Runner:
             try:
                 check_bundle_version(bundle.get("bundle_version"))
                 write_bundle(workdir, bundle["workflow"]["body"], bundle.get("calls") or {}, bundle.get("skills"),
-                             bundle.get("checkpoint"), bundle.get("roles"))
+                             bundle.get("checkpoint"), bundle.get("roles"), bundle.get("stubs"))
                 env = self.env(bundle)
                 if self.job_user:
                     run_dir = share(workdir, job_id, self.job_user)
@@ -326,6 +327,8 @@ class Runner:
                     env[SKILLS_ENV] = str((run_dir or workdir) / SKILLS_DIR)
                 if bundle.get("roles"):
                     env[ROLES_ENV] = str((run_dir or workdir) / ROLES_DIR)
+                if bundle.get("stubs") is not None:
+                    env.update(stub_env(run_dir or workdir))
                 if self.agent_user:
                     agent_dir = Path(tempfile.gettempdir()) / f"{AGENT_PREFIX}{job_id}"
                     env.update({AGENT_USER_ENV: self.agent_user, AGENT_DIR_ENV: str(agent_dir)})

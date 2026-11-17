@@ -290,7 +290,8 @@ def recommend(engine: Engine, team_id: str, now: datetime) -> int:
     written = 0
     with engine.begin() as conn:
         experiments = conn.execute(select(eval_experiments).where(eval_experiments.c.team_id == team_id,
-                                                                  eval_experiments.c.status != "finished")
+                                                                  eval_experiments.c.status != "finished",
+                                                                  eval_experiments.c.specialist != arms.PANEL)
                                    .order_by(eval_experiments.c.created_at, eval_experiments.c.id)).all()
         for experiment in experiments:
             if conn.execute(select(eval_recommendations.c.id).where(
@@ -330,7 +331,8 @@ def summary(row: Any, labels: dict[str, dict[str, Any]] | None, test: dict[str, 
 
 def comparisons(conn: Connection, team_id: str, specialist: str | None = None) -> list[dict[str, Any]]:
     """One row per experiment, newest first: its question, how many pull requests it compared, and the result."""
-    query = select(eval_experiments).where(eval_experiments.c.team_id == team_id)
+    query = select(eval_experiments).where(eval_experiments.c.team_id == team_id,
+                                           eval_experiments.c.specialist != arms.PANEL)
     if specialist is not None:
         query = query.where(eval_experiments.c.specialist == specialist)
     rows = conn.execute(query.order_by(eval_experiments.c.created_at.desc(), eval_experiments.c.id)).all()

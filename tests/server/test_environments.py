@@ -1001,3 +1001,12 @@ def test_comparison_runs_yield_to_reviews_waiting_for_capacity(sqlite_engine, se
     service.tick()
     assert service.reasons[second].startswith("1 environments are running")
     assert service.reasons[arm] == "A comparison run waits while reviews wait for an environment."
+
+
+def test_a_replay_waits_for_a_runner_and_never_starts_or_fails_an_environment(sqlite_engine, service, fake, world,
+                                                                              clock):
+    _arm_type(sqlite_engine, clock, capabilities=("git", "eval-arm", "stubs:v5"))
+    job_id = _job(sqlite_engine, clock, world, requires=["git", "eval-arm", "stubs:v5"])
+    service.tick()
+    assert _row(sqlite_engine, jobs, job_id).status == "queued" and _envs(sqlite_engine, job_id) == []
+    assert fake.calls == []

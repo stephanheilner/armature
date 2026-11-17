@@ -41,8 +41,8 @@ def server(monkeypatch):
 
 def test_the_builtin_packs_load_and_every_cmd_is_the_tool_cli():
     cat = catalog([BUILTIN_DIR])
-    assert cat.errors == [] and [p.name for p in cat.packs()] == ["conversation", "github", "insights", "jira",
-                                                                  "linear", "resident", "review", "slack",
+    assert cat.errors == [] and [p.name for p in cat.packs()] == ["conversation", "eval", "github", "insights",
+                                                                  "jira", "linear", "resident", "review", "slack",
                                                                   "workflow"]
     for pack in cat.packs():
         assert pack.builtin and is_builtin(pack.dir)
@@ -51,7 +51,7 @@ def test_the_builtin_packs_load_and_every_cmd_is_the_tool_cli():
             assert adapter.writes == (name not in {"checkout", "history", "risk", "marked", "pushable", "get-issue",
                                                         "permission", "pr-diff", "context", "events", "state.get",
                                                         "record-risk", "is-marked", "fix-context",
-                                                        "fix-risk"})
+                                                        "fix-risk", "replay-report"})
 
 
 def test_a_tool_posts_its_with_and_prints_only_the_result(server, monkeypatch, capsys):

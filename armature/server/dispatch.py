@@ -185,6 +185,8 @@ def claim(engine: Engine, keyring: Keyring, *, key: Any, runner_id: Any, now: da
     extra = [worker.CALLS_CAPABILITY] if reads_calls else []
     if version >= worker.ROLES_BUNDLE_VERSION:
         extra.append(worker.ROLES_CAPABILITY)
+    if version >= worker.STUBS_BUNDLE_VERSION:
+        extra.append(worker.STUBS_CAPABILITY)
     bound = key.id if key.kind == "ephemeral" else None
     with engine.begin() as conn:
         runner = _runner(conn, key, runner_id)

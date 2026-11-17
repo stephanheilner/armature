@@ -61,7 +61,7 @@ NONE = "none"
 
 
 def registry() -> dict[str, Tool]:
-    from armature.server.insights import fixes
+    from armature.server.insights import fixes, replay
     from armature.server.tools import (
         context,
         github,
@@ -111,4 +111,7 @@ def registry() -> dict[str, Tool]:
         "insights.fix-risk": Tool(NONE, fixes.rate, reads=True),
         "insights.fix-apply": Tool(NONE, fixes.apply),
         "github.delete-branch": Tool("github_app", fixes.delete_branch),
+        # A kimi-evaluate run an admin started: replays of its project's reviews on another model, and their report.
+        "eval.replay-start": Tool(NONE, replay.start),
+        "eval.replay-report": Tool(NONE, replay.report, reads=True),
     }

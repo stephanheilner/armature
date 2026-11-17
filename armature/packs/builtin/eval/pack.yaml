@@ -1,0 +1,37 @@
+name: eval
+version: 1.0.0
+description: >-
+  Replays of Claude's code review rounds on another model, through the server. Only a run of the built-in
+  kimi-evaluate workflow an admin started can use these, and only on its own project's reviews.
+adapters:
+  replay-start:
+    description: >-
+      Arm and queue a replay of every replayable code-review round of the project's open, and optionally merged,
+      pull requests with two or more rounds, on the project's own admin-saved alias. Each replay runs only its agent
+      steps and answers every other step with the round's recorded output. Whole pull requests are taken, most rounds
+      first, up to max_rounds, within budget_usd, and at most max_in_flight run at once. Safe to rerun. Uses no
+      connection.
+    cmd: armature tool eval.replay-start
+    writes: true
+    params:
+      type: object
+      additionalProperties: false
+      properties:
+        alias: {type: string, pattern: '^[a-z][a-z0-9_-]{0,31}$'}
+        include_merged: {type: boolean}
+        budget_usd: {type: number, minimum: 1, maximum: 1000}
+        max_in_flight: {type: integer, minimum: 1, maximum: 20}
+        max_rounds: {type: integer, minimum: 1, maximum: 500}
+        prs: {type: array, maxItems: 200, items: {type: integer, minimum: 1}}
+        connection: {type: string}
+  replay-report:
+    description: >-
+      The replay experiment's comparison report as it stands, with how many replays are still to finish. The full
+      report is also an HTML file in the server's reports folder. Uses no connection.
+    cmd: armature tool eval.replay-report
+    params:
+      type: object
+      additionalProperties: false
+      properties:
+        alias: {type: string, pattern: '^[a-z][a-z0-9_-]{0,31}$'}
+        connection: {type: string}

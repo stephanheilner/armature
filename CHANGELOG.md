@@ -10,6 +10,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **Replaying reviews on another model.** `armature server kimi-evaluate`
+  queues the built-in `kimi-evaluate` workflow, which replays a project's
+  past code review rounds with every model stage on another alias and
+  compares the two reviews in a report on the experiment (migration 0037,
+  `eval_experiments.report`) and in `reports.dir`. Each replay serves the
+  round's recorded outputs to every other stage, so it writes nothing to
+  GitHub, Jira, or findings. Replays need a runner on bundle version 5 that
+  lists `stubs:v5` and `eval-arm`. Every other job still gets a version 4
+  bundle.
 - **Daily report.** Each morning the insights jobs daemon builds what
   Armature learned the day before across every workflow, and what changed
   in Armature and in each workflow's run configuration (migration 0036,
@@ -41,6 +50,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- A comparison run's `review.decisions` now answers `dry_run: true`, so a
+  review-pass skips its post and mark steps in a comparison run. A
+  comparison run also refuses an installed pack adapter marked `writes`.
 - A script stage of a run the server launched now gets the server's run id
   in `ARMATURE_RUN_ID`, where it used to get the engine's local run id.
 - A finding event without a key is now keyed as `github.post-review` keys

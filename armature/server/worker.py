@@ -42,6 +42,7 @@ from armature.nodes.gate import (
     read_gate,
 )
 from armature.nodes.harness import (
+    ARM_RUN_ENV,
     GIT_CONFIG_ENTRIES,
     GIT_CONFIG_ENV,
     GIT_HOSTS_ENV,
@@ -55,6 +56,7 @@ from armature.nodes.harness import (
     SKILLS_ENV,
     host_only,
 )
+from armature.nodes.stub import LIVE_ENV as STUB_LIVE_ENV
 from armature.packs import PACKS_PATH_ENV
 from armature.packs.tool import URL_ENV as TOOLS_URL_ENV
 from armature.runner.process import (
@@ -62,6 +64,7 @@ from armature.runner.process import (
     ROLES_DIR,
     SKILLS_DIR,
     job_path,
+    stub_env,
     write_bundle,
 )
 from armature.server import (
@@ -106,7 +109,7 @@ log = logging.getLogger(__name__)
 
 # Only a host sets these, so a team setting or secret of the same name never reaches a bundle.
 HOST_SET_ENV = (GATE_AUTO_APPROVE_ENV, GIT_VIA_PROXY_ENV, TOOLS_VIA_PROXY_ENV, LOCATION_KIND_ENV, LOCATION_LABEL_ENV,
-                REDACT_ENV, OVERRIDES_ENV, *GIT_CONFIG_ENV, *PROXY_ENV)
+                REDACT_ENV, OVERRIDES_ENV, ARM_RUN_ENV, STUB_LIVE_ENV, *GIT_CONFIG_ENV, *PROXY_ENV)
 
 INTERVAL_S = 2.0
 LEASE = timedelta(minutes=2)
@@ -120,6 +123,8 @@ CLAIM_SCAN = 100
 JOB_KIND = "workflow"
 ENV_PREFIX = "env."
 ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# A replay never gets these, so a session it starts can't reach GitHub or Jira as anyone.
+CREDENTIAL_ENV = re.compile(r"^(GH|GITHUB|JIRA|ATLASSIAN|CONFLUENCE)_")
 # What Worker.id puts in jobs.claimed_by: host:pid:hex. Runners claim as runner:<id> and environments as env:<id>.
 EMBEDDED_CLAIM = re.compile(r"^[^:]{1,150}:\d+:[0-9a-f]{8}$")
 TRIGGER_KIND = "webhook"
@@ -146,6 +151,9 @@ CALLS_BUNDLE_VERSION = 2
 # Required by a job whose agent steps name a role. A runner has it when it reads roles/ (bundle_version 4).
 ROLES_CAPABILITY = "roles:v4"
 ROLES_BUNDLE_VERSION = 4
+# Required by a replay, which serves recorded outputs. A runner has it when it reads stubs.json (bundle_version 5).
+STUBS_CAPABILITY = "stubs:v5"
+STUBS_BUNDLE_VERSION = 5
 # Required by a comparison run, so it runs only where a runner or environment type offers it, away from the review.
 EVAL_ARM = "eval-arm"
 # A runner that reads bundles of this version pauses runs at a gate and resumes them from a checkpoint.
@@ -425,6 +433,8 @@ class Bundle:
     checkpoint: dict[str, Any] | None = None
     # Handed to the engine on a pipe by whatever starts the run, never put in its environment.
     engine_key: str | None = None
+    # A replay's recorded outputs by step key. None for every other run.
+    stubs: dict[str, Any] | None = None
 
     def env(self) -> dict[str, str]:
         """What the run's environment adds to the host's: settings, then secrets, then the event channel."""
@@ -435,13 +445,15 @@ class Bundle:
         return env
 
     def payload(self) -> dict[str, Any]:
-        return {"bundle_version": BUNDLE_VERSION, "job_id": self.job_id, "run_id": self.run_id,
+        # Only a replay's bundle says version 5, so a runner that predates it still reads every other job.
+        version = BUNDLE_VERSION if self.stubs is not None else ROLES_BUNDLE_VERSION
+        return {"bundle_version": version, "job_id": self.job_id, "run_id": self.run_id,
                 "run_token": self.token, "events_url": self.events,
                 "workflow": {"id": self.workflow_id, "name": self.workflow_name, "version": self.workflow_version,
                              "body": self.workflow},
                 "inputs": self.inputs, "args": self.args, "settings": self.settings, "secrets": self.secrets,
                 "calls": self.calls, "skills": self.skills, "roles": self.roles, "thread": self.thread, "checkpoint": self.checkpoint,
-                "engine_key": self.engine_key}
+                "engine_key": self.engine_key, **({"stubs": self.stubs} if self.stubs is not None else {})}
 
 
 def bundle_calls(conn: Connection, job: Any, workflow: Any, body: str) -> dict[str, str]:
@@ -568,6 +580,18 @@ def _arm_overrides(conn: Connection, job: Any) -> dict[str, dict[str, str]]:
     return found if isinstance(found, dict) else {}
 
 
+def _replay_stubs(conn: Connection, job: Any) -> dict[str, Any] | None:
+    """A replay's recorded outputs, from the run it repeats. None for any other job."""
+    if job.arm_id is None:
+        return None
+    # Imported here, since the replay queuer queues its jobs through this module.
+    from armature.server.insights import replay
+    try:
+        return replay.stubs_for(conn, job.arm_id)
+    except replay.ReplayError as exc:
+        raise JobError(exc.message) from exc
+
+
 def _trigger_ref(conn: Connection, job: Any, trigger: Any) -> tuple[str, dict[str, Any]]:
     """What the run records as its start: a webhook delivery, or the issue or schedule of a poll trigger."""
     if trigger is not None and trigger.kind in POLL_RUN_KINDS:
@@ -667,12 +691,15 @@ def build_bundle(conn: Connection, keyring: Keyring, job: Any, *, now: datetime,
                  or n.startswith(GIT_CONFIG_ENTRIES)]:
         secret_values.pop(name)
     overrides = _arm_overrides(conn, job)
+    stubs = _replay_stubs(conn, job)
     secret_values.update(agent_models(conn, keyring, job.team_id, job.project_id,
                                       [a["model"] for a in steps if isinstance(a.get("model"), str)]
                                       + [o["alias"] for o in overrides.values() if o.get("alias")],
                                       instance=instance_secrets))
     if overrides:
         secret_values[OVERRIDES_ENV] = json.dumps(overrides)
+    if job.arm_id is not None:
+        secret_values[ARM_RUN_ENV] = "1"
     if steps:
         secret_values[GIT_HOSTS_ENV] = ",".join(git_hosts(conn, job.team_id, job.project_id))
         repo = None if job.project_id is None else conn.execute(
@@ -682,6 +709,9 @@ def build_bundle(conn: Connection, keyring: Keyring, job: Any, *, now: datetime,
     run_settings = {k: v for k, v in team_env(conn, job.team_id, job.project_id).items()
                     if k not in (MODELS_ENV, GIT_HOSTS_ENV, PROJECT_REPO_ENV, THREAD_ENV, *HOST_SET_ENV)
                     and not k.startswith(GIT_CONFIG_ENTRIES)}
+    if stubs is not None:
+        secret_values = {k: v for k, v in secret_values.items() if not CREDENTIAL_ENV.match(k)}
+        run_settings = {k: v for k, v in run_settings.items() if not CREDENTIAL_ENV.match(k)}
     checkpoint = {} if gated(body) else None
     if job.resume_of_gate is not None:
         checkpoint = gates.resume_checkpoint(conn, job)
@@ -719,7 +749,7 @@ def build_bundle(conn: Connection, keyring: Keyring, job: Any, *, now: datetime,
                   workflow=dryrun.stored_body(body), inputs=dict(job.inputs or {}), args=args,
                   settings=run_settings, secrets=secret_values, calls=call_files,
                   summary=load_summary(conn, run_id), skills=skills, roles=roles, thread=job.thread, checkpoint=checkpoint,
-                  engine_key=runners.engine_env(keyring, run_id))
+                  engine_key=runners.engine_env(keyring, run_id), stubs=stubs)
 
 
 class Worker:
@@ -821,7 +851,8 @@ class Worker:
             capabilities = _instance_setting(conn, CAPABILITIES_KEY)
             capabilities = [c for c in capabilities if c not in AGENT_HARNESSES] \
                 if isinstance(capabilities, list) else []
-            found = claimable(conn, capabilities=[*capabilities, CALLS_CAPABILITY, ROLES_CAPABILITY], now=now)
+            found = claimable(conn, capabilities=[*capabilities, CALLS_CAPABILITY, ROLES_CAPABILITY, STUBS_CAPABILITY],
+                              now=now)
         return next((job_id for job_id in found if self.try_claim(job_id, now)), None)
 
     def try_claim(self, job_id: str, now: datetime) -> bool:
@@ -999,7 +1030,8 @@ class Worker:
             raise JobError("armature executable not found")
         bundle = build_bundle(conn, self.keyring, job, now=self._clock(), lease=self.lease,
                               events=dryrun.events_endpoint(self.hub, self.cfg), location=this_machine())
-        write_bundle(workdir, bundle.workflow, bundle.calls, bundle.skills, bundle.checkpoint, bundle.roles)
+        write_bundle(workdir, bundle.workflow, bundle.calls, bundle.skills, bundle.checkpoint, bundle.roles,
+                     bundle.stubs)
         launch = dryrun.Launch(bundle.run_id, bundle.token, workdir, bundle.summary, bundle.engine_key)
         # The host's PATH, HOME, and packs path go last, so no setting or secret replaces them.
         env = {**{k: v for k, v in bundle.env().items() if not host_only(k)},
@@ -1012,4 +1044,6 @@ class Worker:
             env[ROLES_ENV] = str(workdir / ROLES_DIR)
         if bundle.checkpoint is not None:
             env[GATE_DIR_ENV] = str(workdir)
+        if bundle.stubs is not None:
+            env.update(stub_env(workdir))
         return launch, bundle.args, env

@@ -31,6 +31,8 @@ ESTIMATE_SETTING = "insights.arm_cost_estimate_usd"
 DEFAULT_ESTIMATE = Decimal("1.50")
 ACTIVE = ("queued", "running")
 RISK_STEP = "risk"
+# The specialist of a replay experiment, whose one arm per review repeats the whole review on another model.
+PANEL = "panel"
 
 
 def arm_runs(team_id: str | None = None) -> Select:

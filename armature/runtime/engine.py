@@ -33,7 +33,9 @@ from armature.nodes.gate import (
     kill_descendants,
     write_gate,
 )
+from armature.nodes.harness import ARM_RUN_ENV
 from armature.nodes.stub import StubNode, StubOutputs
+from armature.packs import is_builtin
 from armature.nodes.provider_errors import classify_provider_error
 from armature.registry.registry import ToolRegistry
 from armature.registry.builtins import register_builtins
@@ -667,11 +669,11 @@ class Harness:
                 attributes={"stage": stage.id, "workflow": self._spec.name},
             ) as span:
                 try:
-                    if self._stubs is not None:
+                    if self._stubs is not None and not self._stubs.runs_live(stage):
                         _stage_type = "stub"
                         branch = _FAN_OUT_BRANCH.get()
                         index = branch[2] if branch is not None and branch[:2] == (id(self), stage.id) else None
-                        result = await StubNode(stage, self._stubs, index).execute(context)
+                        result = await StubNode(stage, self._stubs, index, self._event_parent_step).execute(context)
                     elif stage.gate == "human":
                         _stage_type = "gate"
                         node = HumanGateNode(stage=stage)
@@ -783,6 +785,10 @@ class Harness:
                         adapter = self._spec.adapters.get(stage.adapter)
                         if adapter is None:
                             raise ValueError(f"Adapter '{stage.adapter}' not defined in spec")
+                        # A built-in pack's tool goes through the server's broker, which answers a comparison run.
+                        if adapter.writes and os.environ.get(ARM_RUN_ENV) == "1" and not is_builtin(adapter.pack_dir):
+                            raise PermissionError(f"Stage '{stage.id}': a comparison run never runs "
+                                                  f"{stage.adapter}, which writes.")
                         script_env, script_context = self._script_inputs(stage, adapter, context)
                         script_env.update(await self._tool_env(stage, adapter))
                         node = ScriptNode(

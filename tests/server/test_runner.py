@@ -864,3 +864,37 @@ def test_serve_refuses_plain_http_to_another_host(world, tmp_path, monkeypatch):
     with pytest.raises(typer.Exit):
         serve(lambda *args: made.append(args), server="http://runner.example.com", key_env="RUNNER_KEY")
     assert made == []
+
+
+def test_a_replay_bundles_stubs_are_shared_with_the_job_user_unchanged(tmp_path, monkeypatch):
+    monkeypatch.setattr(process.grp, "getgrnam", lambda name: grp.getgrgid(os.getgid()))
+    workdir = tmp_path / "bundle"
+    stubs = {"first/context": {"pr": "# Fix"}, "first/mark": {"_skipped": True}}
+    process.write_bundle(workdir, "name: x\n", {}, stubs=stubs)
+    assert oct((workdir / process.STUBS_FILE).stat().st_mode & 0o777) == "0o600"
+    run_dir = process.share(workdir, "job-1", "armature-job", base=tmp_path)
+    shared = run_dir / process.STUBS_FILE
+    assert json.loads(shared.read_text()) == stubs and oct(shared.stat().st_mode & 0o777) == "0o640"
+
+
+@pytest.mark.parametrize("stubs", [{"first/context": {"pr": "# Fix"}}, None])
+def test_a_runner_serves_stubs_only_to_a_replay(world, tmp_path, monkeypatch, stubs):
+    started = {}
+
+    def popen(binary, workdir, args, env, **kw):
+        started.update(env=env, stubs=(workdir / process.STUBS_FILE).read_text()
+                       if (workdir / process.STUBS_FILE).exists() else None)
+    monkeypatch.setattr(runner_client, "popen", popen)
+    runner = Runner(Client("http://127.0.0.1:9", world["key"]), name="plain", capabilities=[], slots=1,
+                    work_dir=tmp_path / "work", binary="/bin/true")
+    monkeypatch.setattr(runner, "_watch", lambda bundle, proc, workdir: ("succeeded", None))
+    monkeypatch.setattr(runner, "finish", lambda *args: None)
+    bundle = {"job_id": "j1", "workflow": {"body": "name: x\n"}, "args": [], "settings": {}, "secrets": {},
+              "events_url": "https://x/api/events", "run_token": "rt"}
+    runner.run_job({**bundle, **({"stubs": stubs} if stubs is not None else {})})
+    env = started["env"]
+    if stubs is None:
+        assert not {"ARMATURE_STUB_OUTPUTS", "ARMATURE_STUB_LIVE"} & set(env) and started["stubs"] is None
+    else:
+        assert env["ARMATURE_STUB_LIVE"] == "agents" and env["ARMATURE_STUB_OUTPUTS"].endswith("/stubs.json")
+        assert json.loads(started["stubs"]) == stubs

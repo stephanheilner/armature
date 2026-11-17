@@ -26,7 +26,8 @@ PACKS_PATH_ENV = "ARMATURE_PACKS_PATH"
 DEFAULT_PACKS_DIR = Path("~/.armature/packs")
 PACK_FILE = "pack.yaml"
 BUILTIN_DIR = Path(__file__).resolve().parent / "builtin"
-BUILTIN_PACKS = ("conversation", "github", "insights", "jira", "linear", "resident", "review", "slack", "workflow")
+BUILTIN_PACKS = ("conversation", "eval", "github", "insights", "jira", "linear", "resident", "review", "slack",
+                 "workflow")
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
 # A dot separates a tool's group from its leaf name, as resident.state.set does; never two in a row.
@@ -108,7 +109,7 @@ class AdapterDef(BaseModel):
     def to_adapter(self, ref: str, pack_dir: Path) -> Adapter:
         return Adapter.model_validate(
             {"name": ref, "type": "script", "cmd": self.cmd, "timeout": self.timeout, "parse": "json",
-             "pack_dir": str(pack_dir), "params": self.params},
+             "pack_dir": str(pack_dir), "params": self.params, "writes": self.writes or None},
             context={PACK_ADAPTER_CONTEXT: True},
         )
 

@@ -23,6 +23,7 @@ from armature.server.db.schema import (
     people,
 )
 from armature.server.insights import (
+    arms,
     experiments,
     fixes,
     metrics,
@@ -442,7 +443,8 @@ def _choices(conn: Connection, team_id: str, is_admin: bool = False) -> dict[str
 def list_experiments(request: Request, granted: Granted = Depends(require(LEAD, by_team()))) -> dict[str, Any]:
     team_id = granted.target.team_id
     with server(request).engine.connect() as conn:
-        rows = conn.execute(select(eval_experiments).where(eval_experiments.c.team_id == team_id)
+        rows = conn.execute(select(eval_experiments).where(eval_experiments.c.team_id == team_id,
+                                                           eval_experiments.c.specialist != arms.PANEL)
                             .order_by(eval_experiments.c.created_at.desc(), eval_experiments.c.id)).all()
         return {"experiments": [experiments.public(r) for r in rows],
                 **_choices(conn, team_id, granted.access.is_admin)}

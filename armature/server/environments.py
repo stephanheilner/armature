@@ -842,7 +842,8 @@ class EnvironmentService:
         waiting = False
         for job in queued:
             arm = is_arm(job.requires)
-            if llm_only(job.requires) or remote_only(job.requires):
+            # A replay needs a runner that reads stubs.json, which no environment says it does.
+            if llm_only(job.requires) or remote_only(job.requires) or worker.STUBS_CAPABILITY in (job.requires or ()):
                 continue
             if taken(job, found, gated=True):
                 continue

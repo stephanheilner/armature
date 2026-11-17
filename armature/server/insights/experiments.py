@@ -403,13 +403,14 @@ def evaluate(engine: Engine, keyring: Keyring, experiment: Any, now: datetime, c
 
 class Arms:
     """Every ``interval`` seconds: queue the arms of sampled reviews that ended, settle arms that ended, then
-    match, judge, and score them."""
+    match, judge, and score them. A replay experiment is only compared, once all its arms ended."""
 
     def __init__(self, engine: Engine, keyring: Keyring, *, clock: Callable[[], datetime] = utcnow,
-                 interval: float = TICK_S):
+                 interval: float = TICK_S, reports_dir: str | None = None):
         self.engine = engine
         self.keyring = keyring
         self.interval = interval
+        self.reports_dir = reports_dir
         self._clock = clock
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -439,12 +440,13 @@ class Arms:
             listed = conn.execute(select(eval_experiments).order_by(eval_experiments.c.created_at,
                                                                     eval_experiments.c.id)).all()
         for experiment in listed:
+            if experiment.specialist == arms.PANEL:
+                self._replay(experiment, now, experiment.id in changed)
+                continue
             if experiment.status == "finished" and experiment.id not in changed:
                 continue
             # One server works an experiment each tick, so two never queue or judge the same review.
-            slot = f"{insights_jobs.ARM_SLOT_PREFIX}{experiment.id}"
-            if not insights_jobs.claim(self.engine, experiment.team_id, slot, now,
-                                       now + timedelta(seconds=self.interval)):
+            if not self._claim(experiment, now):
                 continue
             try:
                 if experiment.status == "running":
@@ -452,3 +454,21 @@ class Arms:
                 evaluate(self.engine, self.keyring, experiment, now, experiment.id in changed)
             except Exception as exc:
                 log.error("comparison %s failed this tick: %s", experiment.id, type(exc).__name__)
+
+    def _claim(self, experiment: Any, now: datetime) -> bool:
+        slot = f"{insights_jobs.ARM_SLOT_PREFIX}{experiment.id}"
+        return insights_jobs.claim(self.engine, experiment.team_id, slot, now, now + timedelta(seconds=self.interval))
+
+    def _replay(self, experiment: Any, now: datetime, changed: bool) -> None:
+        # Imported here, since the replay queuer reads this module's setting helpers.
+        from armature.server.insights import replay
+        with self.engine.connect() as conn:
+            if not replay.due(conn, experiment, changed):
+                return
+        if not self._claim(experiment, now):
+            return
+        try:
+            replay.compare(self.engine, self.keyring, experiment, now, self.reports_dir)
+        except Exception as exc:
+            log.error("replay comparison %s failed this tick: %s", experiment.id, type(exc).__name__)
+            replay.failed(self.engine, experiment.id, type(exc).__name__)

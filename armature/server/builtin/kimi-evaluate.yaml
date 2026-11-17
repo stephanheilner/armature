@@ -1,0 +1,33 @@
+name: kimi-evaluate
+version: "1.0"
+description: "Replay every replayable Claude code review round of this project on another model, and compare the two reviews in a stored report."
+# Only a runner that reads replay bundles starts the replays' parent, so an older one never claims it.
+requires: [stubs:v5]
+contracts:
+  inputs:
+    - {name: alias, type: string, default: kimi}
+    - {name: include_merged, type: boolean, default: true}
+    - {name: budget_usd, type: number, default: 50}
+    - {name: max_in_flight, type: integer, default: 2}
+    - {name: max_rounds, type: integer, default: 20}
+    - {name: prs, type: array, default: []}
+  timeout_hours: 1
+stages:
+  # Queues one replay per round. A rerun queues only the rounds no earlier run armed.
+  - id: start
+    adapter: eval/replay-start
+    with:
+      alias: "{{ alias }}"
+      include_merged: "{{ include_merged }}"
+      budget_usd: "{{ budget_usd }}"
+      max_in_flight: "{{ max_in_flight }}"
+      max_rounds: "{{ max_rounds }}"
+      prs: "{{ prs }}"
+    depends_on: []
+
+  # The server compares the replays once they all end, so this shows the report so far.
+  - id: report
+    adapter: eval/replay-report
+    with:
+      alias: "{{ alias }}"
+    depends_on: [start]

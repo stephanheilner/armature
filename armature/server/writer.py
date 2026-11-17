@@ -9,7 +9,6 @@ until only the rows that fail are left out, so one bad row never drops others.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import logging
 import time
 from collections.abc import Callable
@@ -21,6 +20,7 @@ from typing import Any
 
 from sqlalchemy import Connection, Engine, delete, func, insert, select, text, update
 
+from armature.events.steps import step_key as step_key
 from armature.events.summary import OUTCOMES, merge_summary
 from armature.server import runners, threads
 from armature.server.db import new_id
@@ -39,15 +39,6 @@ FLUSH_INTERVAL_S = 1.0
 FLUSH_EVENTS = 500
 MAX_BACKLOG = 100_000
 MAX_ATTEMPTS = 5
-STEP_KEY_MAX = 191
-
-
-def step_key(step_id: str, parent_step: str | None) -> str:
-    """The run_steps key: a child's step is filed under its parent, so a reused stage id never merges."""
-    key = f"{parent_step}/{step_id}" if parent_step else step_id
-    if len(key) <= STEP_KEY_MAX:
-        return key
-    return key[:STEP_KEY_MAX - 41] + "#" + hashlib.sha1(key.encode("utf-8", "replace")).hexdigest()
 
 
 @dataclass
@@ -393,15 +384,22 @@ def _apply_run(conn: Connection, run_id: str, change: RunChange) -> None:
         broker.run_ended(run_id)
 
 
+def _arm(conn: Connection, run_id: str) -> bool:
+    ref = conn.execute(select(runs.c.trigger_ref).where(runs.c.id == run_id)).scalar()
+    return isinstance(ref, dict) and isinstance(ref.get("arm_id"), str)
+
+
 def _record_findings(conn: Connection, run_id: str, change: RunChange) -> None:
     # Imported here, since the matcher's module imports ingest, which imports this module.
     from armature.server.insights import candidates
 
     added = candidates.store(conn, run_id, change.candidates) if change.candidates else 0
-    if change.findings:
-        conn.execute(insert(findings), [{"id": new_id(), "run_id": run_id, **f} for f in change.findings])
+    # A comparison run's decisions are the server's own answers, never a review's findings.
+    found = change.findings if change.findings and not _arm(conn, run_id) else []
+    if found:
+        conn.execute(insert(findings), [{"id": new_id(), "run_id": run_id, **f} for f in found])
     # Candidates that arrive after the run's decisions match them now, not only at the next backfill.
-    if change.findings or added:
+    if found or added:
         candidates.rematch(conn, run_id)
 
 

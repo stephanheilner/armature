@@ -76,7 +76,7 @@ def create_app(cfg: ServerConfig, engine: Engine, keyring: Keyring, *, clock: Ca
     syncer = github_sync.SyncService(engine, keyring, clock=clock, transport=lambda: app.state.vendor_transport)
     insights = insights_jobs.Jobs(engine, keyring, clock=clock, transport=lambda: app.state.vendor_transport,
                                   reports=cfg.reports)
-    comparisons = insights_arms.Arms(engine, keyring, clock=clock)
+    comparisons = insights_arms.Arms(engine, keyring, clock=clock, reports_dir=cfg.reports.dir)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:

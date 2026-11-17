@@ -1226,3 +1226,41 @@ def test_0036_adds_daily_reports_and_downgrade_drops_it(db_url):
         assert "daily_reports" not in inspect(engine).get_table_names()
     finally:
         engine.dispose()
+
+
+def test_0037_adds_the_replay_report_and_downgrade_drops_it(db_url):
+    from alembic import command
+
+    from armature.server.db import alembic_config
+    from armature.server.db.schema import eval_experiments
+    migrate(db_url, "0036")
+    team_id, experiment_id = new_id(), new_id()
+    engine = make_engine(db_url)
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("INSERT INTO teams (id, name, created_at) VALUES (:t, 'live', '2026-11-17 12:00:00')"),
+                         {"t": team_id})
+            conn.execute(text("INSERT INTO eval_experiments (id, team_id, specialist, variable, baseline, variant, "
+                              "sample_rate, daily_budget_usd, max_concurrent_arms, status, min_prs, created_at) "
+                              "VALUES (:e, :t, 'panel', 'model', '{}', '{}', 1, 50, 2, 'finished', 30, "
+                              "'2026-11-17 12:00:00')"), {"e": experiment_id, "t": team_id})
+    finally:
+        engine.dispose()
+    migrate(db_url)
+    engine = make_engine(db_url)
+    try:
+        assert {c["name"]: c for c in inspect(engine).get_columns("eval_experiments")}["report"]["nullable"]
+        with engine.begin() as conn:
+            assert conn.execute(select(eval_experiments.c.report)).scalar() is None
+            conn.execute(update(eval_experiments).values(report={"totals": {"rounds": 1}}))
+            assert conn.execute(select(eval_experiments.c.report)).scalar() == {"totals": {"rounds": 1}}
+    finally:
+        engine.dispose()
+    command.downgrade(alembic_config(db_url), "0036")
+    engine = make_engine(db_url)
+    try:
+        assert "report" not in {c["name"] for c in inspect(engine).get_columns("eval_experiments")}
+        with engine.connect() as conn:
+            assert conn.execute(text("SELECT id FROM eval_experiments")).scalars().all() == [experiment_id]
+    finally:
+        engine.dispose()

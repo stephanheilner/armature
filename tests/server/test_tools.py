@@ -301,7 +301,7 @@ def test_every_tool_is_classified_and_only_reads_run_in_a_dry_run():
     reads = {name for name, spec in registry().items() if spec.reads}
     assert reads == {"github.permission", "github.pr-diff", "jira.get-issue", "review.risk", "review.marked",
                      "review.pushable", "review.context", "review.record-risk", "review.is-marked",
-                     "insights.fix-context", "insights.fix-risk"}
+                     "insights.fix-context", "insights.fix-risk", "eval.replay-report"}
 
 
 # Jira and Linear.
@@ -1057,8 +1057,10 @@ def test_a_comparison_run_writes_to_no_vendor_finding_mark_or_outcome(app, sqlit
         response = tool(app, run, step, name, params)
         assert response.status_code == 200, (name, response.text)
         assert response.json()["arm"] is True and response.json()["dry_run"] is True
+    # dry_run skips the post, posted, and mark steps, so a pack adapter that posts never runs.
     assert tool(app, run, "decisions", "review.decisions", {"repo": REPO, "number": NUMBER,
-                                                           "decisions": [DECISION]}).json() == {"recorded": 1}
+                                                           "decisions": [DECISION]}).json() == {"recorded": 1,
+                                                                                                 "dry_run": True}
     assert tool(app, run, "marked", "review.marked", {"repo": REPO, "number": NUMBER}).json() == {
         "valid": False, "head": HEAD, "source": None}
     assert tool(app, run, "risk", "review.risk", {"repo": REPO, "number": NUMBER, "level": "low",
@@ -1111,9 +1113,10 @@ def test_every_tool_is_classified_for_a_comparison_run():
     assert set(broker.ARM_READS) == {"github.permission", "github.pr-diff", "jira.get-issue", "review.context"}
     assert set(broker.ARM_READS) <= {name for name, spec in registry().items() if spec.reads}
     unlisted = set(registry()) - set(broker.ARM_READS) - pinned - answered
-    # Self-heal's tools never run in a review. A comparison run gets the server's dry answer for them.
+    # Self-heal's and replay's tools never run in a review. A comparison run gets the server's dry answer for them.
     assert unlisted == {"github.checkout", "slack.update", "linear.transition", "github.delete-branch",
-                        "insights.fix-context", "insights.fix-patch", "insights.fix-apply", "workflow.handoff"}
+                        "insights.fix-context", "insights.fix-patch", "insights.fix-apply", "workflow.handoff",
+                        "eval.replay-start", "eval.replay-report"}
 
 
 def test_the_tools_the_answer_list_leaves_out_answer_dry_too(app, sqlite_engine, keyring, clock, world, vendor):

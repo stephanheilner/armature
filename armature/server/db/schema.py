@@ -1062,6 +1062,8 @@ eval_experiments = Table(
     Column("min_prs", Integer, nullable=False, default=30),
     _ts("created_at"),
     Column("created_by", String(36)),
+    # A replay experiment's comparison report, which the replay comparer writes. Null for every other experiment.
+    Column("report", JSON),
     Index(None, "team_id", "status"),
     CheckConstraint(_in("variable", EVAL_VARIABLES), name="variable"),
     CheckConstraint(_in("status", EVAL_EXPERIMENT_STATUSES), name="status"),

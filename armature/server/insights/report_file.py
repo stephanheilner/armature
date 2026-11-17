@@ -317,9 +317,14 @@ def folder(directory: str) -> Path:
 
 
 def write(directory: str, day: date, text: str) -> Path:
-    """Write the day's file through a 0600 temporary file and a rename, so a reader never sees half of it."""
+    """Write the day's file."""
+    return write_file(directory, f"{date.fromisoformat(day.isoformat()).isoformat()}.html", text)
+
+
+def write_file(directory: str, name: str, text: str) -> Path:
+    """Write a report file through a 0600 temporary file and a rename, so a reader never sees half of it."""
     where = folder(directory)
-    target = where / f"{date.fromisoformat(day.isoformat()).isoformat()}.html"
+    target = where / name
     tmp = where / f".{target.name}.{secrets.token_hex(8)}.tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:

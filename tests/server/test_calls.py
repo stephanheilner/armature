@@ -166,7 +166,8 @@ def test_enqueue_pins_callees_and_unions_their_requires(world, tmp_path):
     assert set(bundle.calls) == {"manifest.json", "child@1.yaml"}
     assert json.loads(bundle.calls["manifest.json"]) == {"pins": {"child": 1}}
     assert bundle.calls["child@1.yaml"] == f"{STORED_WORKFLOW_HEADER}\n{CHILD}"
-    assert bundle.payload()["bundle_version"] == BUNDLE_VERSION
+    # Only a replay's bundle, which carries stubs, needs a runner that reads the newest version.
+    assert bundle.payload()["bundle_version"] == worker.ROLES_BUNDLE_VERSION and "stubs" not in bundle.payload()
     write_bundle(tmp_path, bundle.workflow, bundle.calls)
     assert BundleCallResolver(tmp_path / "calls").resolve("child", None).version == 1
     assert (tmp_path / "calls" / "child@1.yaml").stat().st_mode & 0o777 == 0o600

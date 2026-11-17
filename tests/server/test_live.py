@@ -1089,3 +1089,16 @@ def test_ops_events_locate_a_running_run_and_a_stated_location_wins(live, world)
     assert stored[run["run_id"]] == {"kind": "aws-linux", "label": "AWS Linux", "instance": "i-0c35"}
     assert stored[other["run_id"]] == {"kind": "aws-linux", "label": "AWS Linux", "instance": "i-0abc",
                                        "instance_type": "m7i.large"}
+
+
+def test_a_finding_event_from_a_comparison_run_writes_no_finding(live, world):
+    http = live.client()
+    run = register(http, world["key"])
+    with live.engine.begin() as conn:
+        conn.execute(update(runs).where(runs.c.id == run["run_id"]).values(trigger_ref={"arm_id": "an-arm"}))
+    post(http, run["token"], line("finding", "decisions", path="a.py", line=3, body="bad", decision="block"),
+         line("candidate", "correctness", ordinal=0, specialist="correctness", path="a.py", line=3, claim="bad"))
+    live.flush()
+    with live.engine.connect() as conn:
+        assert conn.execute(select(func.count()).select_from(findings)).scalar() == 0
+        assert [e.kind for e in _stored(live.engine, run["run_id"])].count("finding") == 1

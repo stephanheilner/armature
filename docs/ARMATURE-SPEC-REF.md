@@ -675,7 +675,7 @@ A `role:` names one role document by its key, never a template. The job's
 bundle carries its text, without front matter, and the session's system prompt
 file opens with it under `# Role`, ahead of the base commit's `CLAUDE.md`. A
 role that no scope has fails the job before it starts, as a missing skill does,
-and only a runner that reads bundle version 4 claims such a job.
+and only a runner that reads bundle version 4 or later claims such a job.
 
 Only `prompt` and `context_files` may hold templates. Inputs never render
 into an `agent:` block at load time, so an input holding `{{ ... }}` renders

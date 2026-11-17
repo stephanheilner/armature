@@ -634,3 +634,17 @@ def test_a_runner_that_cant_pause_never_gets_a_gated_job(sqlite_engine, keyring,
     client.post("/api/runner/hello", json={"name": "far", "capabilities": ["remote:a"]}, headers=_auth(key))
     with sqlite_engine.connect() as conn:
         assert conn.execute(select(dispatch.runners.c.pauses).where(dispatch.runners.c.id == far)).scalar() is True
+
+
+def test_a_runner_before_bundle_version_5_never_gets_a_replay(sqlite_engine, keyring, clock, world, client):
+    replay_job = _job(sqlite_engine, clock, world, requires=[worker.EVAL_ARM, worker.STUBS_CAPABILITY])
+    key = _key(sqlite_engine, keyring, clock, world["team"])
+    runner_id = _hello(client, key, capabilities=[worker.EVAL_ARM])["runner_id"]
+
+    def claim(version):
+        return client.post("/api/runner/claim", json={"runner_id": runner_id, "bundle_version": version},
+                           headers=_auth(key))
+    assert claim(worker.ROLES_BUNDLE_VERSION).status_code == 204
+    assert _get(sqlite_engine, replay_job).status == "queued"
+    claimed = claim(worker.STUBS_BUNDLE_VERSION)
+    assert claimed.status_code == 200 and claimed.json()["job"]["job_id"] == replay_job

@@ -6,6 +6,7 @@ import subprocess
 import sys
 import time
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 from sqlalchemy import func, insert, select, update
@@ -802,6 +803,7 @@ def test_a_comparison_job_bundles_its_overrides_and_opens_its_run_in_arm_mode(sq
     with sqlite_engine.begin() as conn:
         conn.execute(update(providers).values(aliases={"review": "claude-sonnet-5-5", "fast": "claude-haiku-5-5"}))
     forged = '{"review": {"model": "evil"}}'
+    _setting(sqlite_engine, "env.GH_TOKEN", "gh-secret", team_id=world["team"])
     _secret(sqlite_engine, keyring, "ARMATURE_AGENT_OVERRIDES", forged, team_id=world["team"])
     _setting(sqlite_engine, "env.ARMATURE_AGENT_OVERRIDES", forged, team_id=world["team"])
     with sqlite_engine.begin() as conn:
@@ -816,6 +818,9 @@ def test_a_comparison_job_bundles_its_overrides_and_opens_its_run_in_arm_mode(sq
     assert set(json.loads(env["ARMATURE_AGENT_MODELS"])) == {"review", "fast"}
     run = _run(sqlite_engine, _get(sqlite_engine, job_id).run_id)
     assert run.trigger_ref["arm_id"] == arm_id and run.subject is None and run.summary in (None, {})
+    # A specialist arm runs everything for real, with its credentials, and refuses only installed writes adapters.
+    assert env["ARMATURE_ARM_RUN"] == "1" and "ARMATURE_STUB_OUTPUTS" not in env
+    assert "ARMATURE_STUB_LIVE" not in env and env["GH_TOKEN"] == "gh-secret"
     with sqlite_engine.connect() as conn:
         arm = conn.execute(select(eval_arms).where(eval_arms.c.id == arm_id)).one()
     assert (arm.arm_run_id, arm.status) == (run.id, "running")
@@ -897,3 +902,74 @@ def test_a_queued_comparison_run_is_claimable_while_its_review_runs(sqlite_engin
     arm_job = _queue(sqlite_engine, clock, world, key=f"acme/app#7#arm:{arm_id}", arm_id=arm_id)
     _setting(sqlite_engine, worker.CAPABILITIES_KEY, [worker.EVAL_ARM])
     assert _worker(sqlite_engine, keyring, clock, tmp_path).claim(clock()) == arm_job
+
+
+def _replay_arm(engine, clock, world, steps):
+    from armature.server.db.schema import eval_arms, eval_experiments, run_steps
+    primary_run, experiment_id, arm_id = new_id(), new_id(), new_id()
+    with engine.begin() as conn:
+        conn.execute(insert(runs).values(id=primary_run, team_id=world["team"], status="succeeded",
+                                         started_at=clock()))
+        for key, output in steps.items():
+            conn.execute(insert(run_steps).values(run_id=primary_run, step_key=key, step_id=key.rpartition("/")[2],
+                                                  status="succeeded" if output is not None else "skipped",
+                                                  output=output))
+        conn.execute(insert(eval_experiments).values(
+            id=experiment_id, team_id=world["team"], specialist="panel", variable="model", baseline={},
+            variant={"alias": "review", "model": "claude-sonnet-5-5"}, sample_rate=1.0, daily_budget_usd=50,
+            max_concurrent_arms=2, status="finished", min_prs=30, created_at=clock()))
+        conn.execute(insert(eval_arms).values(id=arm_id, team_id=world["team"], experiment_id=experiment_id,
+                                              primary_run_id=primary_run, head_sha="a" * 40, label="variant",
+                                              overrides={"review": {"alias": "review"}}, status="queued",
+                                              created_at=clock()))
+    return arm_id
+
+
+def test_a_replay_job_serves_its_rounds_outputs_with_no_credential(sqlite_engine, keyring, clock, world, tmp_path,
+                                                                   spawned):
+    _agent_world(sqlite_engine, keyring, clock, world)
+    _setting(sqlite_engine, "env.GH_TOKEN", "gh-secret", team_id=world["team"])
+    _setting(sqlite_engine, "env.JIRA_API_TOKEN", "jira-secret", team_id=world["team"])
+    _setting(sqlite_engine, "env.ARMATURE_STUB_LIVE", "nothing", team_id=world["team"])
+    _setting(sqlite_engine, "env.KEPT", "yes", team_id=world["team"])
+    _secret(sqlite_engine, keyring, "GITHUB_TOKEN", "gh-store-secret", team_id=world["team"])
+    with sqlite_engine.begin() as conn:
+        conn.execute(update(triggers).where(triggers.c.id == world["rule"]).values(
+            config={"secrets": ["API_TOKEN", "GITHUB_TOKEN"]}))
+    arm_id = _replay_arm(sqlite_engine, clock, world, {"context": {"pr": "# Fix"}, "post": {"posted": True},
+                                                       "review": {"findings": []}, "mark": None})
+    job_id = _job(sqlite_engine, clock, world, version=2, arm_id=arm_id, dry_run=True,
+                  concurrency_key="kimi-evaluate:x#arm:0")
+    _worker(sqlite_engine, keyring, clock, tmp_path).tick()
+    env = spawned[0]["env"]
+    stubs = Path(env["ARMATURE_STUB_OUTPUTS"])
+    assert json.loads(stubs.read_text()) == {"context": {"pr": "# Fix"}, "post": {"posted": True},
+                                             "review": {"findings": []}, "mark": {"_skipped": True}}
+    assert stubs.stat().st_mode & 0o777 == 0o600 and stubs.parent == spawned[0]["launch"].workdir
+    assert env["ARMATURE_STUB_LIVE"] == "agents" and env["ARMATURE_ARM_RUN"] == "1" and env["KEPT"] == "yes"
+    assert not {"GH_TOKEN", "JIRA_API_TOKEN", "GITHUB_TOKEN"} & set(env) and env["API_TOKEN"] == "t"
+    run = _run(sqlite_engine, _get(sqlite_engine, job_id).run_id)
+    assert run.trigger_ref["arm_id"] == arm_id and run.trigger_ref["dry_run"] is True and run.subject is None
+
+
+def test_a_replay_of_a_truncated_round_never_starts(sqlite_engine, keyring, clock, world, tmp_path, spawned):
+    _agent_world(sqlite_engine, keyring, clock, world)
+    arm_id = _replay_arm(sqlite_engine, clock, world, {"context": {"pr": "# Fix", "_truncated": True}})
+    job_id = _job(sqlite_engine, clock, world, version=2, trigger=False, arm_id=arm_id)
+    _worker(sqlite_engine, keyring, clock, tmp_path).tick()
+    assert "truncated" in _get(sqlite_engine, job_id).error and spawned == []
+
+
+def test_a_replay_bundle_needs_a_runner_that_reads_stubs(sqlite_engine, keyring, clock, world):
+    _agent_world(sqlite_engine, keyring, clock, world)
+    arm_id = _replay_arm(sqlite_engine, clock, world, {"context": {"pr": "# Fix"}})
+    job_id = _job(sqlite_engine, clock, world, version=2, trigger=False, arm_id=arm_id)
+    plain = _job(sqlite_engine, clock, world, version=2)
+    with sqlite_engine.begin() as conn:
+        replayed = worker.build_bundle(conn, keyring, _get(sqlite_engine, job_id), now=clock(), lease=worker.LEASE,
+                                       events="x")
+        other = worker.build_bundle(conn, keyring, _get(sqlite_engine, plain), now=clock(), lease=worker.LEASE,
+                                    events="x")
+    assert replayed.payload()["bundle_version"] == worker.STUBS_BUNDLE_VERSION
+    assert replayed.payload()["stubs"] == {"context": {"pr": "# Fix"}}
+    assert other.payload()["bundle_version"] == worker.ROLES_BUNDLE_VERSION and "stubs" not in other.payload()

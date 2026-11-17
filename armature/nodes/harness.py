@@ -10,6 +10,8 @@ from armature.events.location import LOCATION_KIND_ENV, LOCATION_LABEL_ENV
 MODELS_ENV = "ARMATURE_AGENT_MODELS"
 # A comparison run's per-stage model and effort, set only by the server, as {stage_id: {"model" or "alias", "effort"}}.
 OVERRIDES_ENV = "ARMATURE_AGENT_OVERRIDES"
+# Set only by the server on a comparison run, which then refuses every pack adapter marked writes.
+ARM_RUN_ENV = "ARMATURE_ARM_RUN"
 SKILLS_ENV = "ARMATURE_SKILLS_DIR"
 ROLES_ENV = "ARMATURE_ROLES_DIR"
 AGENT_USER_ENV = "ARMATURE_AGENT_USER"

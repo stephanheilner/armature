@@ -1,5 +1,5 @@
 """`armature server` commands: init, migrate, create-admin, run, export, pack, runs, backfill-locations,
-backfill-candidates, label-findings, and import-ops."""
+backfill-candidates, label-findings, kimi-evaluate, and import-ops."""
 from __future__ import annotations
 
 import getpass
@@ -569,6 +569,60 @@ def runs_delete(
             typer.echo(f"  {name}: {count} row{'' if count == 1 else 's'}")
         for name, count in sorted(plan.cleared.items()):
             typer.echo(f"  {name}: {count} link{'' if count == 1 else 's'} cleared")
+
+
+@server_app.command("kimi-evaluate")
+def kimi_evaluate_cmd(
+    team: str = typer.Option(..., "--team", help="The team, by slug or name"),
+    project: str = typer.Option(..., "--project", help="The project whose code reviews replay, by name"),
+    username: str = typer.Option(..., "--as", help="The admin who starts it, whom the audit log names"),
+    alias: str = typer.Option("kimi", "--alias", help="The project's model alias the replays run on"),
+    merged: bool = typer.Option(True, "--merged/--open-only", help="Replay merged pull requests too"),
+    budget: float = typer.Option(50, "--budget", help="The most the replays and their judge may cost, in USD"),
+    max_in_flight: int = typer.Option(2, "--max-in-flight", help="How many replays run at once"),
+    max_rounds: int = typer.Option(20, "--max-rounds", help="The most rounds to replay, taken as whole pull requests"),
+    prs: list[int] | None = typer.Option(None, "--pr", help="Only this pull request number. Repeat for more"),
+    config: Path | None = ConfigOption,
+):
+    """Queue the built-in kimi-evaluate workflow, which replays the project's Claude code review rounds on another
+    model. The server's job worker or a runner runs it, and the report lands in the reports folder once every replay
+    ends. Safe to rerun: rounds an earlier run queued are never queued again."""
+    from sqlalchemy import or_, select
+
+    from armature.server import broker
+    from armature.server.db import make_engine, utcnow
+    from armature.server.db.schema import projects, teams, users
+    from armature.server.insights import replay
+
+    cfg = _load(config)
+    engine = make_engine(cfg.database_url)
+    try:
+        with engine.begin() as conn:
+            admin = conn.execute(select(users.c.id).where(users.c.username == username, users.c.is_admin.is_(True),
+                                                          users.c.disabled.is_(False))).scalar()
+            if admin is None:
+                _fail(f"--as {username} is not an enabled admin.")
+            found = conn.execute(select(teams.c.id).where(or_(teams.c.slug == team, teams.c.name == team))).all()
+            if len(found) != 1:
+                _fail(f"No one team has the slug or name {team}.")
+            project_id = conn.execute(select(projects.c.id).where(projects.c.team_id == found[0].id,
+                                                                  projects.c.name == project)).scalar()
+            if project_id is None:
+                _fail(f"Team {team} has no project named {project}.")
+            try:
+                job_id = replay.queue(conn, team_id=found[0].id, project_id=project_id, admin_id=admin, now=utcnow(),
+                                      params={"alias": alias, "include_merged": merged, "budget_usd": budget,
+                                              "max_in_flight": max_in_flight, "max_rounds": max_rounds,
+                                              "prs": prs or []})
+            except replay.ReplayError as exc:
+                _fail(exc.message)
+            dry = broker.setting(conn, broker.DRY_KEY, found[0].id, project_id) is True
+    finally:
+        engine.dispose()
+    typer.echo(f"Queued kimi-evaluate as job {job_id}.")
+    if dry:
+        typer.echo(f"Warning: {broker.DRY_KEY} is on for this project, so the run's tools answer dry and it queues "
+                   "no replay. Turn the setting off and run this again.", err=True)
 
 
 @runs_app.command("relink")
