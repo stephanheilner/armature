@@ -65,6 +65,7 @@ def registry() -> dict[str, Tool]:
     from armature.server.tools import (
         context,
         github,
+        handoff,
         jira,
         linear,
         marks,
@@ -101,6 +102,8 @@ def registry() -> dict[str, Tool]:
         "review.record-post": Tool(NONE, marks.record_post),
         "review.record-mark": Tool(NONE, marks.record_mark),
         "review.is-marked": Tool(NONE, marks.is_marked, reads=True),
+        # Queues another stored workflow in the caller's own project, as a trigger would.
+        "workflow.handoff": Tool(NONE, handoff.handoff),
         # A self-heal run's own proposal: its evidence, its stored patch and that patch's rating, and, once approved,
         # the patch to apply.
         "insights.fix-context": Tool(NONE, fixes.context, reads=True),

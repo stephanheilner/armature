@@ -1113,7 +1113,7 @@ def test_every_tool_is_classified_for_a_comparison_run():
     unlisted = set(registry()) - set(broker.ARM_READS) - pinned - answered
     # Self-heal's tools never run in a review. A comparison run gets the server's dry answer for them.
     assert unlisted == {"github.checkout", "slack.update", "linear.transition", "github.delete-branch",
-                        "insights.fix-context", "insights.fix-patch", "insights.fix-apply"}
+                        "insights.fix-context", "insights.fix-patch", "insights.fix-apply", "workflow.handoff"}
 
 
 def test_the_tools_the_answer_list_leaves_out_answer_dry_too(app, sqlite_engine, keyring, clock, world, vendor):

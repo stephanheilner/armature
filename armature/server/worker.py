@@ -125,6 +125,9 @@ EMBEDDED_CLAIM = re.compile(r"^[^:]{1,150}:\d+:[0-9a-f]{8}$")
 TRIGGER_KIND = "webhook"
 # What a run started by a poll or schedule trigger says started it.
 POLL_RUN_KINDS = {"jira_poll": "jira", "linear_poll": "linear", "schedule": "schedule"}
+# A job another run's workflow.handoff step queued keys itself by that run and step, which its run records.
+HANDOFF_KIND = "handoff"
+HANDOFF_KEY = "handoff:"
 SUPERSEDED = "superseded by a newer delivery"
 HELD = ("provisioning", "claimed", "running")
 # A provisioning job's lease is its environment's boot timeout, which the environment reaper enforces.
@@ -580,6 +583,18 @@ def _trigger_ref(conn: Connection, job: Any, trigger: Any) -> tuple[str, dict[st
                                                         ("trigger_id", job.trigger_id)) if value is not None}
 
 
+def handoff_key(run_id: str, step: str) -> str:
+    return f"{HANDOFF_KEY}{run_id}:{step}"
+
+
+def _handoff_ref(job: Any) -> tuple[str, dict[str, Any]] | None:
+    """A handed-off job starts as the run and step that queued it. A trigger's or an arm's job never does."""
+    if job.trigger_id or job.delivery_id or job.arm_id or not (job.concurrency_key or "").startswith(HANDOFF_KEY):
+        return None
+    run_id, _, step = job.concurrency_key[len(HANDOFF_KEY):].partition(":")
+    return HANDOFF_KIND, {"run_id": run_id, "step": step}
+
+
 def _pull_subject(key: str | None) -> str | None:
     """A job keyed by a pull request, such as ``owner/repo#12``, names it as the run's subject, which links it."""
     return key if key and threads.PULL_SUBJECT.fullmatch(key) else None
@@ -677,14 +692,17 @@ def build_bundle(conn: Connection, keyring: Keyring, job: Any, *, now: datetime,
         if run_id is None:
             raise JobError("The run this job resumes is no longer waiting at a gate.")
     else:
-        trigger_kind, trigger_ref = _rerun_ref(conn, job) or _trigger_ref(conn, job, trigger)
+        trigger_kind, trigger_ref = _rerun_ref(conn, job) or _handoff_ref(job) or _trigger_ref(conn, job, trigger)
+        actor = conn.execute(select(runs.c.actor).where(runs.c.id == trigger_ref.get("run_id"),
+                                                        runs.c.team_id == job.team_id)).scalar() \
+            if trigger_kind == HANDOFF_KIND else None
         if job.dry_run:
             trigger_ref["dry_run"] = True
         if job.arm_id is not None:
             trigger_ref["arm_id"] = job.arm_id
         run_row, token = runners.open_run(conn, keyring, team_id=job.team_id, project_id=job.project_id,
                                           workflow_id=workflow.id, workflow_name=workflow.name, now=now,
-                                          workflow_version=job.workflow_version, triggered_by=job.requested_by, actor=None,
+                                          workflow_version=job.workflow_version, triggered_by=job.requested_by, actor=actor,
                                           trigger_kind=trigger_kind, trigger_ref=trigger_ref,
                                           runner_key_id=runner_key_id, thread=job.thread, location=location,
                                           rerun_of=job.rerun_of, subject=_pull_subject(job.concurrency_key),

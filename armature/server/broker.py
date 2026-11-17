@@ -160,6 +160,24 @@ def _load(text: str | None) -> Any:
         return None
 
 
+def step_bodies(conn: Connection, job: Any) -> list[str]:
+    """The job's pinned workflow body and the bodies of the workflows it calls."""
+    from armature.server import worker
+
+    workflow = conn.execute(select(workflows.c.id, workflows.c.name, workflows.c.scope)
+                            .where(workflows.c.id == job.workflow_id)).first()
+    body = defs.body_of(conn, defs.WORKFLOW, job.workflow_id, job.workflow_version) if workflow else None
+    if body is None:
+        return []
+    bodies = [body]
+    try:
+        bodies += [text for name, text in worker.bundle_calls(conn, job, workflow, body).items()
+                   if name.endswith(".yaml")]
+    except worker.JobError:
+        pass
+    return bodies
+
+
 def step_tools(conn: Connection, job: Any, step: str) -> tuple[list[str], int, bool]:
     """The built-in tools ``step`` names in the job's pinned workflow and the workflows it calls, their timeout, and
     whether any of those workflows has an agent stage.
@@ -168,17 +186,9 @@ def step_tools(conn: Connection, job: Any, step: str) -> tuple[list[str], int, b
     """
     from armature.server import worker
 
-    workflow = conn.execute(select(workflows.c.id, workflows.c.name, workflows.c.scope)
-                            .where(workflows.c.id == job.workflow_id)).first()
-    body = defs.body_of(conn, defs.WORKFLOW, job.workflow_id, job.workflow_version) if workflow else None
-    if body is None:
+    bodies = step_bodies(conn, job)
+    if not bodies:
         return [], 0, False
-    bodies = [body]
-    try:
-        bodies += [text for name, text in worker.bundle_calls(conn, job, workflow, body).items()
-                   if name.endswith(".yaml")]
-    except worker.JobError:
-        pass
     found, timeout, agents = set(), 0, False
     for data in map(_load, bodies):
         agents = agents or bool(worker.agent_steps(data))
@@ -343,7 +353,7 @@ def _target(params: dict[str, Any]) -> str | None:
             return f"{repo}#{params['number']}"
         # A push to a new branch, before any pull request exists for it.
         return f"{repo}:{params['branch']}"[:191] if params.get("branch") else repo
-    value = params.get("issue") or params.get("channel")
+    value = params.get("issue") or params.get("channel") or params.get("workflow")
     return str(value)[:191] if value else None
 
 
@@ -353,7 +363,8 @@ def _context(conn: Connection, keyring: Keyring, public_url: str, run: Any, job:
     owner, project_id = None, job.project_id
     if kind == NONE:
         return Call(run_id=run.id, step_id=grant.step, connection=None, creds={}, now=now,
-                    run_url=f"{public_url}/#/run/{run.id}", project_id=_repo_project(conn, job, params["repo"]),
+                    run_url=f"{public_url}/#/run/{run.id}",
+                    project_id=_repo_project(conn, job, params["repo"]) if "repo" in params else job.project_id,
                     transport=transport, team_id=job.team_id)
     if kind == "github_app":
         owner = github_tools.split(params["repo"])[0].lower()

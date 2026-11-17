@@ -42,7 +42,8 @@ def server(monkeypatch):
 def test_the_builtin_packs_load_and_every_cmd_is_the_tool_cli():
     cat = catalog([BUILTIN_DIR])
     assert cat.errors == [] and [p.name for p in cat.packs()] == ["conversation", "github", "insights", "jira",
-                                                                  "linear", "resident", "review", "slack"]
+                                                                  "linear", "resident", "review", "slack",
+                                                                  "workflow"]
     for pack in cat.packs():
         assert pack.builtin and is_builtin(pack.dir)
         for name, adapter in pack.adapters.items():

@@ -1,0 +1,31 @@
+name: workflow
+version: 1.0.0
+description: >-
+  Hand work on to another stored workflow, through the server. A run reaches only the workflows its own project
+  resolves by name, and never its own.
+adapters:
+  handoff:
+    description: >-
+      Queue a run of the named workflow, resolved as a run in this project resolves it, with inputs checked against
+      its contracts.inputs. The step must name its target as a literal with.workflow, never a template. The
+      target's requires decides where it runs, so a run on a runner that can't pause hands its gate to a host that
+      can. A retried step gets the job its first call queued. A refusal fails the step with its reason. Uses no
+      connection.
+    cmd: armature tool workflow.handoff
+    writes: true
+    params:
+      type: object
+      required: [workflow]
+      additionalProperties: false
+      properties:
+        workflow: {type: string, minLength: 1, maxLength: 191}
+        inputs:
+          type: object
+          maxProperties: 64
+          propertyNames: {pattern: '^[A-Za-z_][A-Za-z0-9_]{0,63}$'}
+          additionalProperties:
+            anyOf:
+              - {type: string}
+              - {type: number}
+              - {type: boolean}
+              - {type: array, items: {type: string}}
