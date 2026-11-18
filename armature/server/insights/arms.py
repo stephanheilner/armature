@@ -19,6 +19,7 @@ from armature.server.db.schema import (
     eval_arms,
     eval_experiments,
     eval_judgments,
+    jobs,
     llm_calls,
     run_steps,
     settings,
@@ -36,9 +37,13 @@ PANEL = "panel"
 
 
 def arm_runs(team_id: str | None = None) -> Select:
-    """The ids of every arm's run, the team's only when ``team_id`` is given."""
+    """The ids of every arm's run, an earlier attempt of a replay queued again included, the team's only when
+    ``team_id`` is given."""
     query = select(eval_arms.c.arm_run_id).where(eval_arms.c.arm_run_id.is_not(None))
-    return query.where(eval_arms.c.team_id == team_id) if team_id else query
+    attempts = select(jobs.c.run_id).where(jobs.c.arm_id.is_not(None), jobs.c.run_id.is_not(None))
+    if team_id:
+        query, attempts = query.where(eval_arms.c.team_id == team_id), attempts.where(jobs.c.team_id == team_id)
+    return query.union(attempts)
 
 
 def not_arm(run_id: Any, team_id: str | None = None) -> Any:

@@ -10,6 +10,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **Side-by-side replay reports.** A kimi-evaluate report (version 2) keeps
+  each round's findings, so its HTML file and the new admin-only Insights
+  Replays tab show Claude's and the replay's findings side by side, with
+  severity, blocking, the lead's decision, the judge's verdict on one-sided
+  findings, and Claude's findings the author fixed.
+  `armature server kimi-evaluate-report --experiment <id>` rebuilds a report
+  and its file, reusing stored judgments.
 - **Replaying reviews on another model.** `armature server kimi-evaluate`
   queues the built-in `kimi-evaluate` workflow, which replays a project's
   past code review rounds with every model stage on another alias and
@@ -50,6 +57,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- `eval/replay-start` selects rounds before it locks the experiment, parses
+  each workflow version once, and has a 600-second timeout. A rerun queues
+  again each replay that failed or was canceled, such as one a deploy
+  stopped, on its existing arm, and counts what the failed attempt spent
+  toward the budget.
 - A comparison run's `review.decisions` now answers `dry_run: true`, so a
   review-pass skips its post and mark steps in a comparison run. A
   comparison run also refuses an installed pack adapter marked `writes`.

@@ -1,5 +1,5 @@
 """`armature server` commands: init, migrate, create-admin, run, export, pack, runs, backfill-locations,
-backfill-candidates, label-findings, kimi-evaluate, and import-ops."""
+backfill-candidates, label-findings, kimi-evaluate, kimi-evaluate-report, and import-ops."""
 from __future__ import annotations
 
 import getpass
@@ -623,6 +623,36 @@ def kimi_evaluate_cmd(
     if dry:
         typer.echo(f"Warning: {broker.DRY_KEY} is on for this project, so the run's tools answer dry and it queues "
                    "no replay. Turn the setting off and run this again.", err=True)
+
+
+@server_app.command("kimi-evaluate-report")
+def kimi_evaluate_report_cmd(
+    experiment: str = typer.Option(..., "--experiment", help="The replay experiment's id"),
+    config: Path | None = ConfigOption,
+):
+    """Rebuild a kimi-evaluate report from its finished replays and rewrite its HTML file. Judgments already stored
+    are kept, so the judge runs only for findings it never rated, and only within the experiment's budget."""
+    from sqlalchemy import select
+
+    from armature.server.db import make_engine, utcnow
+    from armature.server.db.schema import eval_experiments
+    from armature.server.insights import arms, replay
+
+    cfg = _load(config)
+    keyring = _keyring(cfg)
+    engine = make_engine(cfg.database_url)
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(select(eval_experiments).where(eval_experiments.c.id == experiment,
+                                                              eval_experiments.c.specialist == arms.PANEL)).first()
+        if row is None:
+            _fail(f"No kimi-evaluate experiment has the id {experiment}.")
+        built = replay.compare(engine, keyring, row, utcnow(), cfg.reports.dir)
+    finally:
+        engine.dispose()
+    if built.get("error"):
+        _fail(built["error"])
+    typer.echo(f"Rebuilt the report of {built['totals']['rounds']} rounds into {cfg.reports.dir}/{built['file']}.")
 
 
 @runs_app.command("relink")

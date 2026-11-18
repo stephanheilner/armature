@@ -1,4 +1,4 @@
-"""The daily report, instance-wide, so only an admin reads it."""
+"""The daily report and the kimi-evaluate replay reports, which cover every team, so only an admin reads them."""
 from __future__ import annotations
 
 from datetime import date
@@ -11,7 +11,7 @@ from armature.server import display
 from armature.server.app.deps import Granted, require, server
 from armature.server.app.http import ApiError
 from armature.server.db.schema import daily_reports
-from armature.server.insights import report
+from armature.server.insights import replay, report
 
 router = APIRouter()
 
@@ -40,3 +40,21 @@ def get_report(day: str, request: Request, granted: Granted = Depends(require("a
     if row is None:
         raise ApiError(404, "No report for that day.")
     return {"day": row.day.isoformat(), "created_at": row.created_at, "data": row.data}
+
+
+REPLAYS = "/api/insights/replays"
+
+
+@router.get(REPLAYS)
+def list_replays(request: Request, granted: Granted = Depends(require("admin"))) -> dict[str, Any]:
+    with server(request).engine.connect() as conn:
+        return {"replays": replay.listed(conn)}
+
+
+@router.get(REPLAYS + "/{experiment_id}")
+def get_replay(experiment_id: str, request: Request, granted: Granted = Depends(require("admin"))) -> dict[str, Any]:
+    with server(request).engine.connect() as conn:
+        found = replay.shown(conn, experiment_id)
+    if found is None:
+        raise ApiError(404, "No such replay comparison.")
+    return found

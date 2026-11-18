@@ -18,9 +18,10 @@ const SCREENS = {
   pr: () => import('./pr.js'),
   prs: () => import('./prs.js'),
   report: () => import('./report.js'),
+  replays: () => import('./replays.js'),
 };
 
-const TAB_OF = { '': 'overview', repo: 'repos', repos: 'repos', people: 'people', person: 'people', findings: 'findings', models: 'models', fixes: 'fixes', report: 'report' };
+const TAB_OF = { '': 'overview', repo: 'repos', repos: 'repos', people: 'people', person: 'people', findings: 'findings', models: 'models', fixes: 'fixes', report: 'report', replays: 'replays' };
 const TEAM_KEY = 'armature-insights-team';
 const REPO_KEY = 'armature-insights-repo';
 export const DAYS = [7, 30, 90];
@@ -88,6 +89,7 @@ export function linker({ team, teams, repos }) {
     models: (params = {}) => make('models', [], params),
     fixes: (params = {}) => make('fixes', [], params),
     report: (params = {}) => make('report', [], params),
+    replays: (params = {}) => make('replays', [], params),
     // By repo and number, so a pull request's address reads like GitHub's. A repo outside the list falls back to the id.
     pr: (pr) => {
       const repo = repoById(pr?.repo_id);
@@ -107,6 +109,7 @@ function tabs(sub, links, { lead, admin, waiting, query }) {
     ['models', 'Models', links.models()],
     lead ? ['fixes', 'Fixes', links.fixes()] : null,
     admin ? ['report', 'Daily report', links.report()] : null,
+    admin ? ['replays', 'Replays', links.replays()] : null,
   ].filter(Boolean);
   return element('nav', { class: 'in-tabs', 'aria-label': 'Insights pages' }, items.map(([id, label, href]) => element('a', {
     class: 'in-tab', href, 'aria-current': id === current ? 'page' : null,
@@ -178,8 +181,8 @@ export async function render(root, { args, query, signal }) {
     root.append(element('div', { class: 'in-head' }, element('h1', { class: 'in-question' }, 'Insights')), errorState('your teams', err, () => location.reload()));
     return;
   }
-  // The daily report covers the whole server, so an admin on no team still reads it.
-  if (!teams.length && sub !== 'report') {
+  // The daily report and the replays cover the whole server, so an admin on no team still reads them.
+  if (!teams.length && sub !== 'report' && sub !== 'replays') {
     root.append(header({ question: 'How is the team doing?', answer: 'You aren’t on a team yet.' }).node,
       emptyState('Insights shows a team’s pull requests, reviews, and findings. Ask an admin to add you to a team.'));
     return;
@@ -217,6 +220,11 @@ export async function render(root, { args, query, signal }) {
       noPermission('Only admins read the daily report.'));
     return;
   }
+  if (sub === 'replays' && !isAdmin()) {
+    body.append(header({ question: 'How does another model review compared with Claude?', answer: 'Replays cover every team.' }).node,
+      noPermission('Only admins read replay reports.'));
+    return;
+  }
   const screen = await loadScreen();
   let currentQuery = new URLSearchParams(query);
   let reload = null;
@@ -239,7 +247,7 @@ export async function render(root, { args, query, signal }) {
     },
   };
   reload = reloader(body, (fresh) => screen.render(fresh, ctx), signal);
-  if (!repos.length && screen.QUESTION && sub !== 'fixes' && sub !== 'models' && sub !== 'report') {
+  if (!repos.length && screen.QUESTION && sub !== 'fixes' && sub !== 'models' && sub !== 'report' && sub !== 'replays') {
     const track = canTrack(team.id) ? element('a', { class: 'in-button', href: '#/repos' }, 'Track a repo') : null;
     const switcher = ctx.teamControl();
     body.append(header({ question: screen.QUESTION, answer: 'No repos are tracked yet.', filterBar: switcher ? filters(switcher) : null }).node,

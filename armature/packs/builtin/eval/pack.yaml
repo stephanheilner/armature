@@ -12,6 +12,8 @@ adapters:
       first, up to max_rounds, within budget_usd, and at most max_in_flight run at once. Safe to rerun. Uses no
       connection.
     cmd: armature tool eval.replay-start
+    # Selecting rounds reads many recorded runs, which outlasts the default minute.
+    timeout: 600
     writes: true
     params:
       type: object
@@ -29,6 +31,7 @@ adapters:
       The replay experiment's comparison report as it stands, with how many replays are still to finish. The full
       report is also an HTML file in the server's reports folder. Uses no connection.
     cmd: armature tool eval.replay-report
+    timeout: 600
     params:
       type: object
       additionalProperties: false

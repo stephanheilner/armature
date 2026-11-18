@@ -364,12 +364,20 @@ def queue_arms(engine: Engine, experiment: Any, now: datetime) -> dict[str, int]
 def settle(engine: Engine, now: datetime) -> set[str]:
     """Move each active arm to its job's state. Returns the experiments with an arm that ended."""
     with engine.begin() as conn:
-        rows = conn.execute(select(eval_arms.c.id, eval_arms.c.experiment_id, eval_arms.c.primary_run_id,
-                                   eval_arms.c.status, jobs.c.status.label("job_status"), jobs.c.error,
-                                   jobs.c.run_id, runs.c.cost_usd, runs.c.started_at, runs.c.finished_at)
-                            .select_from(eval_arms.join(jobs, jobs.c.arm_id == eval_arms.c.id)
-                                         .outerjoin(runs, runs.c.id == jobs.c.run_id))
-                            .where(eval_arms.c.status.in_(ACTIVE))).all()
+        found = conn.execute(select(eval_arms.c.id, eval_arms.c.experiment_id, eval_arms.c.primary_run_id,
+                                    eval_arms.c.status, jobs.c.status.label("job_status"), jobs.c.error,
+                                    jobs.c.run_id, jobs.c.created_at.label("job_created_at"), runs.c.cost_usd,
+                                    runs.c.started_at, runs.c.finished_at)
+                             .select_from(eval_arms.join(jobs, jobs.c.arm_id == eval_arms.c.id)
+                                          .outerjoin(runs, runs.c.id == jobs.c.run_id))
+                             .where(eval_arms.c.status.in_(ACTIVE))).all()
+        # A replay arm queued again keeps its earlier jobs, and only its newest, open one first, says how it stands.
+        newest: dict[str, Any] = {}
+        for row in found:
+            rank = (row.job_created_at, row.job_status not in JOB_ENDED)
+            if row.id not in newest or rank >= newest[row.id][0]:
+                newest[row.id] = (rank, row)
+        rows = [row for _, row in newest.values()]
         ended = set()
         for row in rows:
             status = JOB_ENDED.get(row.job_status)

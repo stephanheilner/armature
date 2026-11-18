@@ -564,6 +564,14 @@ daemon compares each round's team lead decisions with the findings Claude's
 round recorded, has the judge rate the findings only one side raised, and stores
 the report on the experiment and as `kimi-evaluate-<id>.html` in `reports.dir`.
 
+Admins read each report on the Insights Replays tab, and in the HTML file. Each
+round shows both reviews side by side: a finding both raised shares a row, and a
+finding only one side raised leaves the other cell empty, with the judge's
+verdict. `armature server kimi-evaluate-report --experiment <id>` rebuilds a
+report and its file from the finished replays, reusing the judgments it already
+stored. Running kimi-evaluate again queues once more each replay that failed or
+was canceled, such as one a deploy stopped, and counts what it spent.
+
 Replays need a runner that reads bundle version 5, which carries the recorded
 outputs as `stubs.json`. Replay jobs require `stubs:v5` and `eval-arm`, and a
 runner that serves them lists both in its capabilities. AWS environments never

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import re
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -1431,6 +1432,9 @@ def _finished_replay(engine, world, rw, source, lead, *, rate="high", raised=2):
         conn.execute(insert(eval_arms).values(id=arm_id, team_id=world.team, experiment_id=experiment.id,
                                               primary_run_id=source, arm_run_id=arm_run, head_sha="a" * 40,
                                               label="variant", status="done", cost_usd=0.2, created_at=NOW))
+        conn.execute(insert(jobs).values(id=new_id(), team_id=world.team, project_id=world.project,
+                                         workflow_id=world.code_review, workflow_version=2, run_id=arm_run,
+                                         status="succeeded", attempts=1, created_at=NOW, arm_id=arm_id))
         return conn.execute(select(eval_experiments).where(eval_experiments.c.id == experiment.id)).one(), arm_run
 
 
@@ -1477,7 +1481,7 @@ def test_the_comparer_pairs_each_round_judges_the_rest_blind_and_writes_the_repo
     for hidden in ("kimi", "claude", source, arm_run, experiment.id):
         assert hidden not in sent.lower()
     page = reports / f"kimi-evaluate-{experiment.id}.html"
-    assert page.stat().st_mode & 0o777 == 0o600 and "Claude reviews replayed on kimi" in page.read_text()
+    assert page.stat().st_mode & 0o777 == 0o600 and "Claude reviews replayed on Kimi" in page.read_text()
     with sqlite_engine.begin() as conn:
         stored = conn.execute(select(eval_experiments.c.report).where(eval_experiments.c.id == experiment.id)).scalar()
         assert stored["totals"] == built["totals"] and stored["file"] == page.name
@@ -1507,10 +1511,12 @@ def test_the_arms_tick_only_compares_a_replay_once_its_arms_end(sqlite_engine, k
     monkeypatch.setattr(replay, "compare", lambda *args: compared.append(args[2].id) or real(*args))
     with sqlite_engine.begin() as conn:
         conn.execute(update(eval_arms).values(status="running"))
+        conn.execute(update(jobs).where(jobs.c.arm_id.is_not(None)).values(status="running"))
     experiments.Arms(sqlite_engine, keyring, clock=lambda: NOW).tick()
     assert compared == []
     with sqlite_engine.begin() as conn:
         conn.execute(update(eval_arms).values(status="done"))
+        conn.execute(update(jobs).where(jobs.c.arm_id.is_not(None)).values(status="succeeded"))
     experiments.Arms(sqlite_engine, keyring, clock=lambda: NOW + timedelta(minutes=2)).tick()
     experiments.Arms(sqlite_engine, keyring, clock=lambda: NOW + timedelta(minutes=4)).tick()
     assert compared == [experiment.id] and worked == []
@@ -1614,7 +1620,8 @@ def test_the_comparer_reports_what_it_couldnt_compare_and_tries_a_missing_judge_
     model = FakeJudge()
     monkeypatch.setattr(llm, "litellm_completion", model)
     with sqlite_engine.begin() as conn:
-        conn.execute(update(eval_arms).values(cost_usd=1))
+        conn.execute(update(runs).where(runs.c.trigger_ref.is_not(None), runs.c.workflow_version.is_(None))
+                     .values(cost_usd=1))
         conn.execute(update(eval_experiments).values(daily_budget_usd=2))
     experiment = replay.find(sqlite_engine.connect(), world.team, world.project, "kimi")
     built = replay.compare(sqlite_engine, keyring, experiment, NOW)
@@ -1746,3 +1753,283 @@ def test_a_replay_runs_from_start_through_its_bundle_and_settle_to_the_stored_re
     with sqlite_engine.connect() as conn:
         assert conn.execute(select(func.count()).select_from(findings)).scalar() == findings_before
         assert conn.execute(select(func.count()).select_from(eval_matches)).scalar() == 0
+
+
+# The side-by-side report, its admin view, its rebuild, and a faster, retrying start.
+
+HOSTILE = '<script>alert("x")</script>'
+
+
+def _side_by_side(engine, world, rw, monkeypatch, keyring):
+    from armature.server.insights import replay
+    source = _round(engine, world, 7, 1, found=((LOCK, "A.kt", 4, "block", "l1"),
+                                                (HOSTILE, "B.kt", 10, "suggest", "l2")),
+                    comments=({"claim": LOCK, "path": "A.kt", "line": 4, "severity": "high", "blocking": True,
+                               "body": "The lock leaks when parse throws."},))
+    _round(engine, world, 7, 2, found=((LOCK, "A.kt", 4, "block", "l1"),))
+    lead = {"verdict": "approve", "decisions": [
+        {"claim": LOCK, "path": "A.kt", "line": 5, "raised_by": ["correctness"], "decision": "drop", "reason": "r"},
+        {"claim": BLOCKS_UI, "path": "D.kt", "line": 9, "raised_by": ["performance"], "decision": "block",
+         "reason": "Seen in the diff."}],
+        "comments": [{"claim": BLOCKS_UI, "path": "D.kt", "line": 9, "severity": "high", "blocking": True,
+                      "body": "Move it off the main thread."}]}
+    experiment, _ = _finished_replay(engine, world, rw, source, lead)
+    model = FakeJudge(lambda item: True)
+    monkeypatch.setattr(llm, "litellm_completion", model)
+    return replay.compare(engine, keyring, experiment, NOW), experiment, model
+
+
+def test_the_report_keeps_each_rounds_findings_and_renders_them_side_by_side_escaped(sqlite_engine, keyring, world,
+                                                                                    monkeypatch, tmp_path):
+    from armature.server.insights import replay_html
+    rw = _replay_world(sqlite_engine, world)
+    built, _, _ = _side_by_side(sqlite_engine, world, rw, monkeypatch, keyring)
+    assert built["version"] == 2
+    [result] = built["prs"][0]["rounds"]
+    found = result["findings"]
+    [pair] = found["pairs"]
+    assert (pair["claude"]["severity"], pair["claude"]["blocking"], pair["claude"]["decision"]) == (
+        "high", True, "block")
+    assert pair["claude"]["body"] == "The lock leaks when parse throws." and pair["kimi"]["decision"] == "drop"
+    [claude_only] = found["claude_only"]
+    assert (claude_only["claim"], claude_only["fixed"], claude_only["verdict"]) == (HOSTILE, True, "valid")
+    [kimi_only] = found["kimi_only"]
+    assert (kimi_only["severity"], kimi_only["verdict"], kimi_only["reason"]) == ("high", "valid", "Seen in the diff.")
+    assert result["verdict"] == {"claude": "comment", "kimi": "approve"} and result["head"] == "a" * 40
+    assert result["kimi_run"]["minutes"] == 5.0 and built["totals"]["verdict_agrees"] == 0
+    assert (result["both"]["total"], result["claude_only"]["total"], result["kimi_only"]["total"]) == (1, 1, 1)
+    page = replay_html.render(built)
+    assert "<script" not in page.lower() and "&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;" in page
+    assert f'href="https://github.com/acme/app/blob/{"a" * 40}/A.kt#L4"' in page
+    assert 'href="https://github.com/acme/app/pull/7"' in page
+    for words in ("Not raised by Claude", "Not raised by Kimi", "Fixed by author", "Judged valid", "Lead: block", "Verdict agreement",
+                  "Claude cost per round", "Kimi minutes per round", "Move it off the main thread.",
+                  "prefers-color-scheme: dark", "max-width: 640px"):
+        assert words in page, words
+    assert page.count('class="card"') == 4 and page.count('class="card none"') == 2
+
+
+def test_a_version_1_report_still_renders_its_counts():
+    from armature.server.insights import replay_html
+    old = {"version": 1, "alias": "kimi", "compared_at": "2026-11-17T12:00:00+00:00",
+           "totals": {"rounds": 1, "both": {"total": 2}, "claude_only": {"total": 1}, "kimi_only": {"total": 0},
+                      "claude_run": {"cost_usd": 4.0, "wall_s": 600}, "kimi_run": {"cost_usd": 1.0}},
+           "prs": [{"subject": "acme/app#7", "totals": {"rounds": 1, "both": {"total": 2}},
+                    "rounds": [{"subject": "acme/app#7", "round": 1, "both": {"total": 2}}]}],
+           "skipped": [{"subject": "acme/app#8", "round": 1, "reason": HOSTILE}]}
+    page = replay_html.render(old)
+    assert "This report predates side-by-side findings" in page and "Found by both" in page
+    assert "<script" not in page.lower() and "$4.00" in page
+
+
+def test_only_an_admin_reads_replay_reports(sqlite_engine, keyring, clock, world, users, monkeypatch):
+    rw = _replay_world(sqlite_engine, world)
+    _, experiment, _ = _side_by_side(sqlite_engine, world, rw, monkeypatch, keyring)
+    lead = _client(sqlite_engine, keyring, clock, users["lead"])
+    assert lead.client.get("/api/insights/replays").status_code == 403
+    assert lead.client.get(f"/api/insights/replays/{experiment.id}").status_code == 403
+    admin = _client(sqlite_engine, keyring, clock, users["admin"])
+    [listed] = admin.client.get("/api/insights/replays").json()["replays"]
+    assert (listed["id"], listed["alias"], listed["rounds"], listed["arms"]) == (experiment.id, "kimi", 1, {"done": 1})
+    shown = admin.client.get(f"/api/insights/replays/{experiment.id}").json()
+    assert shown["report"]["version"] == 2 and "judgments" not in shown["report"]
+    assert admin.client.get("/api/insights/replays/nope").status_code == 404
+
+
+def test_a_rebuild_reuses_stored_judgments_and_judges_only_what_is_missing(sqlite_engine, keyring, world,
+                                                                          monkeypatch, tmp_path):
+    from armature.server.insights import replay
+    rw = _replay_world(sqlite_engine, world)
+    built, _, model = _side_by_side(sqlite_engine, world, rw, monkeypatch, keyring)
+    assert len(model.calls) == 1
+    reports = tmp_path / "reports"
+    reports.mkdir(mode=0o700)
+    experiment = replay.find(sqlite_engine.connect(), world.team, world.project, "kimi")
+    again = replay.compare(sqlite_engine, keyring, experiment, NOW, str(reports))
+    assert len(model.calls) == 1 and again["judgments"] == built["judgments"]
+    page = reports / again["file"]
+    assert page.stat().st_mode & 0o777 == 0o600 and "Claude reviews replayed on Kimi" in page.read_text()
+    kept = dict(list(built["judgments"].items())[:1])
+    with sqlite_engine.begin() as conn:
+        conn.execute(update(eval_experiments).values(report={**again, "judgments": kept}))
+    experiment = replay.find(sqlite_engine.connect(), world.team, world.project, "kimi")
+    replay.compare(sqlite_engine, keyring, experiment, NOW)
+    [_, second] = model.calls
+    assert len(json.loads(second["messages"][-1]["content"])["items"]) == 1
+
+
+def test_start_selects_rounds_before_it_locks_the_experiment_and_parses_each_workflow_once(sqlite_engine, world,
+                                                                                          monkeypatch):
+    import time as clock_time
+
+    from armature.server.insights import replay
+    rw = _replay_world(sqlite_engine, world)
+    for number in range(100, 130):
+        _pr(sqlite_engine, world, rw, number)
+        for n in (1, 2):
+            _round(sqlite_engine, world, number, n)
+    replay.start(rw.call, {"max_rounds": 2})
+    parsed = []
+    real_bundle, real_select = worker.bundle_calls, replay.select_rounds
+    monkeypatch.setattr(worker, "bundle_calls", lambda *args: parsed.append(1) or real_bundle(*args))
+
+    def select_while_another_writes(conn, *args, **kwargs):
+        # SQLite's WAL lets this write through only when start holds no write transaction of its own.
+        with sqlite_engine.begin() as other:
+            other.execute(update(eval_experiments).values(min_prs=31))
+        return real_select(conn, *args, **kwargs)
+    monkeypatch.setattr(replay, "select_rounds", select_while_another_writes)
+    began = clock_time.monotonic()
+    out = replay.start(rw.call, {"max_rounds": 60})
+    assert out["queued"] == 58 and len(parsed) == 1 and clock_time.monotonic() - began < 10
+
+
+def test_a_rerun_queues_a_failed_replay_again_on_its_arm_within_the_budget_but_never_a_done_one(sqlite_engine, world):
+    from armature.server.insights import replay
+    rw = _replay_world(sqlite_engine, world)
+    for number in (7, 8):
+        _pr(sqlite_engine, world, rw, number)
+    seven = [_round(sqlite_engine, world, 7, n, cost=1.0) for n in (1, 2)]
+    [_round(sqlite_engine, world, 8, n, cost=1.0) for n in (1, 2)]
+    replay.start(rw.call, {"prs": [7], "budget_usd": 5})
+    experiment = replay.find(sqlite_engine.connect(), world.team, world.project, "kimi")
+    armed = _replay_arms(sqlite_engine, experiment.id)
+    failed_arm, done_arm = armed[seven[0]], armed[seven[1]]
+    failed_run = new_id()
+    with sqlite_engine.begin() as conn:
+        conn.execute(insert(runs).values(id=failed_run, team_id=world.team, project_id=world.project,
+                                         status="failed", started_at=NOW, cost_usd=2.5,
+                                         trigger_ref={"arm_id": failed_arm.id}))
+        conn.execute(update(jobs).where(jobs.c.arm_id == failed_arm.id).values(status="canceled", run_id=failed_run))
+        conn.execute(update(eval_arms).where(eval_arms.c.id == failed_arm.id).values(arm_run_id=failed_run,
+                                                                                     status="running"))
+        conn.execute(update(jobs).where(jobs.c.arm_id == done_arm.id).values(status="succeeded"))
+    experiments.settle(sqlite_engine, NOW)
+    assert _replay_arms(sqlite_engine, experiment.id)[seven[0]].status == "failed"
+    # Spent 2.5 on the failed attempt, so 4 covers the retry at 1 and leaves no room for #8's two rounds.
+    out = replay.start(rw.call, {"prs": [7, 8], "budget_usd": 4})
+    assert (out["queued"], out["retried"], out["over_budget"]) == (1, 1, 2)
+    after = _replay_arms(sqlite_engine, experiment.id)
+    assert (after[seven[0]].id, after[seven[0]].status, after[seven[0]].arm_run_id) == (failed_arm.id, "queued", None)
+    assert after[seven[1]].status == "done" and set(after) == set(seven)
+    retry_jobs = {j.status: j for j in _jobs_of_arm(sqlite_engine, failed_arm.id)}
+    assert set(retry_jobs) == {"canceled", "queued"}
+    assert retry_jobs["queued"].concurrency_key.startswith(f"kimi-evaluate:{experiment.id}#arm:")
+    assert retry_jobs["queued"].dry_run is True and retry_jobs["queued"].call_pins == {"review-pass": 1}
+    experiments.settle(sqlite_engine, NOW)
+    assert _replay_arms(sqlite_engine, experiment.id)[seven[0]].status == "queued"
+    with sqlite_engine.connect() as conn:
+        assert failed_run not in set(conn.execute(select(runs.c.id).where(arms.not_arm(runs.c.id))).scalars())
+
+
+def _jobs_of_arm(engine, arm_id):
+    with engine.connect() as conn:
+        return conn.execute(select(jobs).where(jobs.c.arm_id == arm_id).order_by(jobs.c.created_at, jobs.c.id)).all()
+
+
+@pytest.mark.parametrize(("subject", "head", "path"), [
+    ("acme/app#7", "a" * 40, "../etc/passwd"),
+    ("acme/app#7", "a" * 40, "src/../../etc/passwd"),
+    ("acme/app#7", "a" * 39, "A.kt"),
+    ("acme/app#7", "A" * 40, "A.kt"),
+    ("acme/app#7", "main", "A.kt"),
+    ("acme/a b#7", "a" * 40, "A.kt"),
+    ("acme#7", "a" * 40, "A.kt"),
+    ("acme/app#7", "a" * 40, "/etc/passwd"),
+    ("acme/app#7", "a" * 40, 'A"b.kt'),
+    ("acme/app#7", "a" * 40, "A'b.kt"),
+])
+def test_a_file_link_needs_a_checked_repository_commit_and_path(subject, head, path):
+    from armature.server.insights import replay_html
+    assert replay_html.file_link(subject, head, path, 4) is None
+
+
+def test_a_quote_in_a_path_never_breaks_out_of_a_file_link(sqlite_engine, keyring, world, monkeypatch):
+    from armature.server.insights import replay_html
+    rw = _replay_world(sqlite_engine, world)
+    built, _, _ = _side_by_side(sqlite_engine, world, rw, monkeypatch, keyring)
+    [result] = built["prs"][0]["rounds"]
+    result["findings"]["claude_only"][0]["path"] = '../etc/passwd" x="'
+    page = replay_html.render(built)
+    assert '" x="' not in page and "etc/passwd" not in "".join(re.findall(r'href="[^"]*"', page))
+    assert "../etc/passwd&quot; x=&quot;" in page
+
+
+def test_a_replay_canceled_before_it_was_claimed_is_queued_again_on_its_arm(sqlite_engine, world):
+    from armature.server.insights import replay
+    rw = _replay_world(sqlite_engine, world)
+    _pr(sqlite_engine, world, rw, 7)
+    first, _ = (_round(sqlite_engine, world, 7, n) for n in (1, 2))
+    replay.start(rw.call, {"prs": [7]})
+    experiment = replay.find(sqlite_engine.connect(), world.team, world.project, "kimi")
+    arm = _replay_arms(sqlite_engine, experiment.id)[first]
+    with sqlite_engine.begin() as conn:
+        conn.execute(update(jobs).where(jobs.c.arm_id == arm.id).values(status="canceled"))
+    experiments.settle(sqlite_engine, NOW)
+    assert _replay_arms(sqlite_engine, experiment.id)[first].status == "skipped"
+    out = replay.start(rw.call, {"prs": [7]})
+    assert (out["queued"], out["retried"]) == (1, 1)
+    again = _replay_arms(sqlite_engine, experiment.id)[first]
+    assert (again.id, again.status) == (arm.id, "queued")
+    assert {j.status for j in _jobs_of_arm(sqlite_engine, arm.id)} == {"canceled", "queued"}
+
+
+def test_retrying_an_arm_another_start_already_reset_queues_nothing(sqlite_engine, world):
+    from armature.server.insights import replay
+    rw = _replay_world(sqlite_engine, world)
+    _pr(sqlite_engine, world, rw, 7)
+    first, _ = (_round(sqlite_engine, world, 7, n) for n in (1, 2))
+    replay.start(rw.call, {"prs": [7]})
+    experiment = replay.find(sqlite_engine.connect(), world.team, world.project, "kimi")
+    arm = _replay_arms(sqlite_engine, experiment.id)[first]
+    assert arm.status == "queued"
+    with sqlite_engine.begin() as conn:
+        chosen, _, _ = replay.select_rounds(conn, world.team, world.project, include_merged=True, prs=[7],
+                                            max_rounds=20)
+        source, texts = next((s, t) for s, t in chosen if s.id == first)
+        before = conn.execute(select(func.count()).select_from(jobs)).scalar()
+        assert replay._queue(conn, experiment, source, texts, "kimi", 0, NOW, retry=arm.id) is False
+        assert conn.execute(select(func.count()).select_from(jobs)).scalar() == before
+
+
+def test_verdicts_agree_only_when_both_sides_gave_the_same_one():
+    from armature.server.insights import replay
+    zero = {k: {} if k in ("both", "claude_only", "kimi_only", "lead", "claude_run", "kimi_run") else 0
+            for k in replay.TOTALLED}
+
+    def result(claude, kimi):
+        return {**zero, "rate": {"kimi": "low", "claude": "low", "risk": "low"},
+                "verdict": {"claude": claude, "kimi": kimi}}
+    assert replay._totals([result("approve", "approve")])["verdict_agrees"] == 1
+    assert replay._totals([result(None, None)])["verdict_agrees"] == 0
+    assert replay._totals([result("approve", "approve"), result(None, None),
+                           result("comment", "approve")])["verdict_agrees"] == 1
+
+
+def test_a_finding_body_is_stored_cut_to_the_text_cap():
+    from armature.server.insights import replay
+    found = SimpleNamespace(path="A.kt", line=1, severity="high", blocking=True, decision="block", reason="r",
+                            claim="c", body="x" * 2500, finding_key="k", fixed=False, key="k")
+    assert len(replay._card(found)["body"]) == replay.TEXT_CAP == 2000
+
+
+def test_the_judge_budget_counts_what_judging_cost_in_earlier_compares(sqlite_engine, keyring, world, monkeypatch):
+    from armature.server.insights import replay
+    rw = _replay_world(sqlite_engine, world)
+    built, _, model = _side_by_side(sqlite_engine, world, rw, monkeypatch, keyring)
+    assert built["judge"]["total_cost_usd"] == 0.03
+    experiment = replay.find(sqlite_engine.connect(), world.team, world.project, "kimi")
+    kept = dict(list(built["judgments"].items())[:1])
+    with sqlite_engine.begin() as conn:
+        conn.execute(update(eval_experiments).values(report={**built, "judgments": kept}))
+    again = replay.compare(sqlite_engine, keyring, replay.find(sqlite_engine.connect(), world.team, world.project,
+                                                               "kimi"), NOW)
+    assert len(model.calls) == 2 and again["judge"]["total_cost_usd"] == 0.06
+    # The replay cost 0.2 and judging 0.06, so a 0.25 budget leaves nothing for the judge.
+    with sqlite_engine.begin() as conn:
+        conn.execute(update(eval_experiments).where(eval_experiments.c.id == experiment.id).values(
+            daily_budget_usd=0.25, report={**again, "judgments": kept}))
+    last = replay.compare(sqlite_engine, keyring, replay.find(sqlite_engine.connect(), world.team, world.project,
+                                                              "kimi"), NOW)
+    assert len(model.calls) == 2 and "budget ran out" in last["judge"]["stopped"]
+    assert last["judge"]["total_cost_usd"] == 0.06

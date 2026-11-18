@@ -12,6 +12,7 @@ recommended as a specialist experiment is.
 """
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import random
@@ -45,9 +46,11 @@ from armature.server.db.schema import (
     findings,
     gh_pull_requests,
     jobs,
+    projects,
     run_steps,
     runs,
     settings,
+    teams,
     users,
     workflows,
 )
@@ -57,6 +60,7 @@ from armature.server.insights import (
     experiments,
     judge,
     labeling,
+    replay_html,
     report_file,
 )
 from armature.server.tools import Call, ToolError, marks, review
@@ -84,6 +88,8 @@ NO_RUNNER = (f"No runner online offers {worker.EVAL_ARM} and {worker.STUBS_CAPAB
 NO_LEAD = "The replay's team lead output is missing or truncated."
 SEVERITIES = ("high", "medium", "low")
 SKIPPED = {"_skipped": True}
+# An arm whose replay a restart or cancel ended. A rerun queues it again, never one that finished.
+RETRIED = ("failed", "skipped")
 
 
 class ReplayError(ToolError):
@@ -101,6 +107,11 @@ def _stages(text: str | None) -> list[dict[str, Any]]:
 
 def model_stages(texts: list[str]) -> tuple[list[str], list[str]]:
     """The agent stages a replay runs on its alias, and the model stages it can't run live, by id."""
+    return _model_stages(tuple(texts))
+
+
+@functools.lru_cache(maxsize=32)
+def _model_stages(texts: tuple[str, ...]) -> tuple[list[str], list[str]]:
     found, refused = set(), set()
     for raw in (stage for text in texts for stage in _stages(text)):
         if raw.get("agent") is None and raw.get("role") is None:
@@ -159,22 +170,28 @@ def _bodies(conn: Connection, source: Any) -> list[str]:
 
 # Which rounds a replay repeats
 
-def _why_not(conn: Connection, source: Any) -> tuple[str | None, list[str]]:
-    """Why the round can't be replayed, or None, with its workflow bodies when it can."""
+def _why_not(conn: Connection, source: Any, parsed: dict[tuple[Any, ...], Any]) -> tuple[str | None, list[str]]:
+    """Why the round can't be replayed, or None, with its workflow bodies when it can. ``parsed`` caches each
+    workflow version's bodies, and stored outputs are read only once every cheaper check passed."""
     if source.job_id is None or source.workflow_version is None:
         return RUNNER, []
-    steps = conn.execute(select(run_steps.c.step_key, run_steps.c.step_id, run_steps.c.status, run_steps.c.output)
-                         .where(run_steps.c.run_id == source.id)).all()
-    if not any(s.step_id == CONTEXT and s.status == "succeeded" for s in steps):
+    if conn.execute(select(run_steps.c.step_id).where(run_steps.c.run_id == source.id, run_steps.c.step_id == CONTEXT,
+                                                      run_steps.c.status == "succeeded").limit(1)).first() is None:
         return NO_CONTEXT, []
-    try:
-        texts = _bodies(conn, source)
-    except ReplayError as exc:
-        return exc.message, []
-    refused = model_stages(texts)[1]
-    if refused:
-        return f"Its workflow has a model step a replay can't run on another model: {', '.join(refused)}.", []
-    cut = sorted(s.step_key for s in steps if _cut(s.output))
+    key = (source.workflow_id, source.workflow_version, json.dumps(source.call_pins or {}, sort_keys=True))
+    if key not in parsed:
+        try:
+            texts = _bodies(conn, source)
+            refused = model_stages(texts)[1]
+            parsed[key] = (texts, f"Its workflow has a model step a replay can't run on another model: "
+                                  f"{', '.join(refused)}." if refused else None)
+        except ReplayError as exc:
+            parsed[key] = ([], exc.message)
+    texts, reason = parsed[key]
+    if reason:
+        return reason, []
+    cut = sorted(r.step_key for r in conn.execute(select(run_steps.c.step_key, run_steps.c.output).where(
+        run_steps.c.run_id == source.id, run_steps.c.output.is_not(None))) if _cut(r.output))
     if cut:
         return f"A recorded output is truncated: {', '.join(cut)}.", []
     return None, texts
@@ -212,6 +229,7 @@ def select_rounds(conn: Connection, team_id: str, project_id: str, *, include_me
         by_pr.setdefault(row.subject.lower(), {}).setdefault(row.review_round, row)
     states = ("open", "merged") if include_merged else ("open",)
     wanted = set(prs or ())
+    parsed: dict[tuple[Any, ...], Any] = {}
     found: list[tuple[str, list[Any], list[dict[str, Any]]]] = []
     for subject, by_round in by_pr.items():
         if max(by_round) < 2 or (wanted and _number(subject) not in wanted):
@@ -225,7 +243,7 @@ def select_rounds(conn: Connection, team_id: str, project_id: str, *, include_me
         chosen, skipped = [], []
         for number in sorted(by_round):
             source = by_round[number]
-            reason, texts = _why_not(conn, source)
+            reason, texts = _why_not(conn, source, parsed)
             if reason:
                 skipped.append({"subject": source.subject, "round": number, "run_id": source.id, "reason": reason})
             else:
@@ -326,6 +344,23 @@ def _experiment(conn: Connection, job: Any, alias: str, model: str, given: dict[
     return conn.execute(select(eval_experiments).where(eval_experiments.c.id == experiment_id)).one()
 
 
+def _spent(conn: Connection, experiment_id: str) -> Decimal:
+    """What every replay run of the experiment cost, a failed attempt's included."""
+    total = conn.execute(select(func.coalesce(func.sum(runs.c.cost_usd), 0))
+                         .select_from(jobs.join(runs, runs.c.id == jobs.c.run_id)
+                                      .join(eval_arms, eval_arms.c.id == jobs.c.arm_id))
+                         .where(eval_arms.c.experiment_id == experiment_id)).scalar_one()
+    return Decimal(str(total))
+
+
+def _judge_spent(stored: Any) -> Decimal:
+    """What the judge cost over every earlier compare of the experiment, as its stored report carries it."""
+    found = (stored or {}).get("judge") if isinstance(stored, dict) else None
+    found = found if isinstance(found, dict) else {}
+    value = found.get("total_cost_usd", found.get("cost_usd"))
+    return Decimal(str(value)) if isinstance(value, int | float) and not isinstance(value, bool) else Decimal(0)
+
+
 def _arm_costs(conn: Connection, experiment_id: str) -> list[Any]:
     return conn.execute(select(eval_arms.c.status, eval_arms.c.cost_usd).where(
         eval_arms.c.experiment_id == experiment_id)).all()
@@ -344,30 +379,42 @@ def _estimate(conn: Connection, experiment: Any, cost: Any) -> Decimal:
 
 
 def _requires(texts: list[str]) -> list[str]:
+    return list(_requirements(tuple(texts)))
+
+
+@functools.lru_cache(maxsize=32)
+def _requirements(texts: tuple[str, ...]) -> tuple[str, ...]:
     found = worker.requirements_with_calls(texts[0], texts[1:]) or []
-    return sorted({*(r for r in found if r in RUNS_WITH), worker.EVAL_ARM, worker.STUBS_CAPABILITY})
+    return tuple(sorted({*(r for r in found if r in RUNS_WITH), worker.EVAL_ARM, worker.STUBS_CAPABILITY}))
 
 
 def _queue(conn: Connection, experiment: Any, source: Any, texts: list[str], alias: str, slot: int,
-           now: datetime) -> bool:
-    """Arm the round and queue its replay. False when another start armed it first."""
-    arm_id = new_id()
+           now: datetime, retry: str | None = None) -> bool:
+    """Arm the round, or reset its ``retry`` arm whose replay failed, and queue its replay. False when another start
+    armed or reset it first."""
     overrides = {stage: {"alias": alias} for stage in model_stages(texts)[0]}
-    head = str((source.inputs or {}).get("ref") or "")[:40]
-    try:
-        with conn.begin_nested():
-            conn.execute(insert(eval_arms).values(
-                id=arm_id, team_id=experiment.team_id, experiment_id=experiment.id, primary_run_id=source.id,
-                head_sha=head, label=LABEL, overrides=overrides, status="queued", created_at=now))
-    except IntegrityError:
-        return False
+    if retry is not None:
+        arm_id = retry
+        if conn.execute(update(eval_arms).where(eval_arms.c.id == retry, eval_arms.c.status.in_(RETRIED)).values(
+                status="queued", arm_run_id=None, reason=None, cost_usd=None, latency_s=None,
+                overrides=overrides)).rowcount != 1:
+            return False
+    else:
+        arm_id = new_id()
+        head = str((source.inputs or {}).get("ref") or "")[:40]
+        try:
+            with conn.begin_nested():
+                conn.execute(insert(eval_arms).values(
+                    id=arm_id, team_id=experiment.team_id, experiment_id=experiment.id, primary_run_id=source.id,
+                    head_sha=head, label=LABEL, overrides=overrides, status="queued", created_at=now))
+        except IntegrityError:
+            return False
     # The replay's own key, never the review's, with one key per slot so at most max_in_flight run at once.
-    job_id = worker.queue_job(conn, team_id=experiment.team_id, project_id=experiment.project_id,
-                              workflow_id=source.workflow_id, workflow_version=source.workflow_version,
-                              inputs=source.inputs, now=now, key=f"{KEY}{experiment.id}#arm:{slot}", arm_id=arm_id,
-                              dry_run=True)
-    conn.execute(update(jobs).where(jobs.c.id == job_id).values(call_pins=source.call_pins,
-                                                                requires=_requires(texts)))
+    worker.queue_job(conn, team_id=experiment.team_id, project_id=experiment.project_id,
+                     workflow_id=source.workflow_id, inputs=source.inputs, now=now,
+                     key=f"{KEY}{experiment.id}#arm:{slot}", arm_id=arm_id,
+                     pinned={"workflow_version": source.workflow_version, "call_pins": source.call_pins,
+                             "requires": _requires(texts), "dry_run": True})
     return True
 
 
@@ -385,46 +432,57 @@ def _takers(conn: Connection, now: datetime) -> list[Any]:
 
 
 def start(call: Call, params: dict[str, Any]) -> dict[str, Any]:
-    """eval.replay-start: arm and queue every replayable round not armed yet, within the budget. Safe to rerun."""
+    """eval.replay-start: arm and queue every replayable round not armed yet, and again each whose replay failed,
+    within the budget. Safe to rerun."""
     given = _inputs(params)
     alias = given["alias"]
-    with _engine(call).begin() as conn:
+    engine = _engine(call)
+    # Selecting reads many runs, so it runs before the transaction that locks the experiment's row.
+    with engine.connect() as conn:
         job = _authorized(conn, call)
         _, model = _variant(conn, job.team_id, job.project_id, alias)
-        experiment = _experiment(conn, job, alias, model, given, call.now)
         chosen, skipped, left_out = select_rounds(conn, job.team_id, job.project_id,
                                                   include_merged=given["include_merged"], prs=given["prs"],
                                                   max_rounds=given["max_rounds"])
-        armed = set(conn.execute(select(eval_arms.c.primary_run_id).where(
-            eval_arms.c.experiment_id == experiment.id)).scalars())
+    with engine.begin() as conn:
+        job = _authorized(conn, call)
+        experiment = _experiment(conn, job, alias, model, given, call.now)
+        armed = dict(conn.execute(select(eval_arms.c.primary_run_id, eval_arms.c.id).where(
+            eval_arms.c.experiment_id == experiment.id, eval_arms.c.status.not_in(RETRIED))).all())
+        retry = dict(conn.execute(select(eval_arms.c.primary_run_id, eval_arms.c.id).where(
+            eval_arms.c.experiment_id == experiment.id, eval_arms.c.status.in_(RETRIED))).all())
         new = [(source, texts) for source, texts in chosen if source.id not in armed]
         if new and not environments.taken(SimpleNamespace(team_id=job.team_id, requires=_requires(new[0][1])),
                                           _takers(conn, call.now)):
             raise ReplayError(409, NO_RUNNER)
-        costs = _arm_costs(conn, experiment.id)
-        active = sum(1 for r in costs if r.status in arms.ACTIVE)
-        committed = sum((Decimal(str(r.cost_usd)) for r in costs if r.cost_usd is not None), Decimal(0))
+        active = sum(1 for r in _arm_costs(conn, experiment.id) if r.status in arms.ACTIVE)
+        stored = conn.execute(select(eval_experiments.c.report).where(eval_experiments.c.id == experiment.id)
+                              .with_for_update()).scalar()
+        committed = _spent(conn, experiment.id) + _judge_spent(stored)
         if active:
             committed += active * _estimate(conn, experiment, None)
         budget = Decimal(str(given["budget_usd"]))
-        queued, over = 0, []
+        queued, retried, over = 0, 0, []
         for i, (source, texts) in enumerate(new):
             cost = _estimate(conn, experiment, source.cost_usd)
             if committed + cost > budget:
                 over = [{"subject": s.subject, "round": s.review_round, "run_id": s.id} for s, _ in new[i:]]
                 break
-            if _queue(conn, experiment, source, texts, alias, (active + queued) % given["max_in_flight"], call.now):
+            if _queue(conn, experiment, source, texts, alias, (active + queued) % given["max_in_flight"], call.now,
+                      retry.get(source.id)):
                 committed += cost
                 queued += 1
+                retried += source.id in retry
         selection = {"skipped": skipped, "left_out": left_out, "over_budget": over, "max_rounds": given["max_rounds"],
                      "include_merged": given["include_merged"], "prs": given["prs"]}
         conn.execute(update(eval_experiments).where(eval_experiments.c.id == experiment.id).values(
-            report={**(experiment.report or {}), "selection": selection}))
+            report={**(stored or {}), "selection": selection}))
         audit.record(conn, action="insights.replay.start", actor_id=job.requested_by, team_id=job.team_id,
                      target_kind="experiment", target_id=experiment.id,
-                     detail={"alias": alias, "queued": queued, "rounds": len(chosen), "over_budget": len(over),
+                     detail={"alias": alias, "queued": queued, "retried": retried, "rounds": len(chosen),
+                             "over_budget": len(over),
                              **{k: given[k] for k in ("budget_usd", "max_in_flight", "max_rounds")}})
-    return {"experiment": experiment.id, "queued": queued, "already": len(chosen) - len(new),
+    return {"experiment": experiment.id, "queued": queued, "retried": retried, "already": len(chosen) - len(new),
             "skipped": len(skipped), "over_budget": len(over), "left_out": len(left_out),
             "pending": active + queued}
 
@@ -463,6 +521,38 @@ def report(call: Call, params: dict[str, Any]) -> dict[str, Any]:
             "report": shown if stored.get("compared_at") else None}
 
 
+# What admins read
+
+def listed(conn: Connection) -> list[dict[str, Any]]:
+    """Every replay experiment, newest first, with how far it got."""
+    rows = conn.execute(select(eval_experiments.c.id, eval_experiments.c.variant, eval_experiments.c.report,
+                               eval_experiments.c.created_at, teams.c.name.label("team"),
+                               projects.c.name.label("project"))
+                        .join(teams, teams.c.id == eval_experiments.c.team_id)
+                        .outerjoin(projects, projects.c.id == eval_experiments.c.project_id)
+                        .where(eval_experiments.c.specialist == arms.PANEL)
+                        .order_by(eval_experiments.c.created_at.desc(), eval_experiments.c.id)).all()
+    statuses: dict[str, Counter] = {}
+    for arm in conn.execute(select(eval_arms.c.experiment_id, eval_arms.c.status).where(
+            eval_arms.c.experiment_id.in_([r.id for r in rows]))):
+        statuses.setdefault(arm.experiment_id, Counter())[arm.status] += 1
+    return [{"id": r.id, "team": r.team, "project": r.project, "alias": (r.variant or {}).get("alias"),
+             "model": (r.variant or {}).get("model"), "created_at": r.created_at.isoformat(),
+             "compared_at": (r.report or {}).get("compared_at"),
+             "rounds": ((r.report or {}).get("totals") or {}).get("rounds"),
+             "arms": dict(statuses.get(r.id, {}))} for r in rows]
+
+
+def shown(conn: Connection, experiment_id: str) -> dict[str, Any] | None:
+    """A replay experiment's report as the admin view draws it, without the judge's raw answers."""
+    found = next((r for r in listed(conn) if r["id"] == experiment_id), None)
+    if found is None:
+        return None
+    stored = conn.execute(select(eval_experiments.c.report).where(eval_experiments.c.id == experiment_id)).scalar()
+    report_data = {k: v for k, v in (stored or {}).items() if k != "judgments"}
+    return {**found, "report": report_data if report_data.get("compared_at") else None}
+
+
 # Comparing
 
 def due(conn: Connection, experiment: Any, changed: bool) -> bool:
@@ -487,7 +577,7 @@ def failed(engine: Engine, experiment_id: str, error: str) -> None:
 def _finding(row: dict[str, Any]) -> SimpleNamespace:
     return SimpleNamespace(finding_key=row.get("finding_key"), path=row.get("path"), line=row.get("line"),
                            claim=row.get("title") or row.get("body"), body=row.get("body"), suggestion=None,
-                           severity=None, blocking=None, decision=row.get("decision"),
+                           severity=None, blocking=None, decision=row.get("decision"), reason=row.get("reason"),
                            lineage_key=row.get("lineage_key") or row.get("finding_key"))
 
 
@@ -508,6 +598,7 @@ def _graded(found: list[SimpleNamespace], lead: Any) -> list[SimpleNamespace]:
                         or review.finding_key(c) == f.finding_key), {})
         f.severity = comment.get("severity") if comment.get("severity") in SEVERITIES else None
         f.blocking = comment.get("blocking") if isinstance(comment.get("blocking"), bool) else None
+        f.body = comment["body"] if isinstance(comment.get("body"), str) and comment["body"] else f.body
     return found
 
 
@@ -531,7 +622,8 @@ def _run(conn: Connection, run_id: str) -> dict[str, Any]:
         return {}
     wall = (row.finished_at - row.started_at).total_seconds() if row.finished_at and row.started_at else None
     return {"cost_usd": float(row.cost_usd) if row.cost_usd is not None else None,
-            "input_tokens": row.input_tokens, "output_tokens": row.output_tokens, "wall_s": wall}
+            "input_tokens": row.input_tokens, "output_tokens": row.output_tokens, "wall_s": wall,
+            "minutes": round(wall / 60, 1) if wall is not None else None}
 
 
 def _later_lineages(conn: Connection, experiment: Any, subject: str) -> dict[int, set[str]]:
@@ -551,7 +643,7 @@ def _later_lineages(conn: Connection, experiment: Any, subject: str) -> dict[int
 def _rounds(conn: Connection, experiment: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Each replay that finished with its two sides paired, and each that didn't with why."""
     rows = conn.execute(select(eval_arms.c.primary_run_id, eval_arms.c.arm_run_id, eval_arms.c.status,
-                               eval_arms.c.reason, runs.c.subject, runs.c.review_round)
+                               eval_arms.c.reason, eval_arms.c.head_sha, runs.c.subject, runs.c.review_round)
                         .join(runs, runs.c.id == eval_arms.c.primary_run_id)
                         .where(eval_arms.c.experiment_id == experiment.id)
                         .order_by(runs.c.subject, runs.c.review_round, runs.c.id)).all()
@@ -573,7 +665,7 @@ def _rounds(conn: Connection, experiment: Any) -> tuple[list[dict[str, Any]], li
             run_steps.c.run_id == arm.primary_run_id)).all()
         claude = _graded([_finding(dict(r._mapping)) for r in conn.execute(
             select(findings.c.finding_key, findings.c.path, findings.c.line, findings.c.decision,
-                   findings.c.lineage_key, findings.c.title, findings.c.body)
+                   findings.c.reason, findings.c.lineage_key, findings.c.title, findings.c.body)
             .where(findings.c.run_id == arm.primary_run_id).order_by(findings.c.created_at, findings.c.id))],
             _output(source, LEAD))
         by_round = lineages.setdefault(arm.subject.lower(), _later_lineages(conn, experiment, arm.subject))
@@ -582,7 +674,10 @@ def _rounds(conn: Connection, experiment: Any) -> tuple[list[dict[str, Any]], li
         for f in claude:
             f.fixed = bool(later_rounds) and f.decision in KEPT and f.lineage_key not in later
         rate, claude_rate, claude_risk = (_output(replayed, RATE), _output(source, RATE), _output(source, RISK))
-        done.append({**where, "claude": claude, "kimi": _graded(_lead_findings(lead), lead),
+        claude_lead = _output(source, LEAD)
+        done.append({**where, "claude": claude, "kimi": _graded(_lead_findings(lead), lead), "head": arm.head_sha,
+                     "verdict": {"claude": claude_lead.get("verdict") if isinstance(claude_lead, dict) else None,
+                                 "kimi": lead.get("verdict")},
                      "raised": {"claude": _raised(source), "kimi": _raised(replayed)},
                      "rate": {"kimi": (rate or {}).get("level"), "claude": (claude_rate or {}).get("level"),
                               "risk": (claude_risk or {}).get("level"), "panel": (claude_risk or {}).get("panel")},
@@ -605,7 +700,8 @@ def pair(done: list[dict[str, Any]]) -> None:
 def _judge(engine: Engine, keyring: Any, experiment: Any, done: list[dict[str, Any]], known: dict[str, bool],
            now: datetime) -> dict[str, Any]:
     """Rate every finding only one side raised as valid or not, blinded and shuffled per round, within the budget.
-    Judgments an earlier report made are kept."""
+    Judgments an earlier report made are kept, and so is the running total of what judging cost."""
+    earlier = _judge_spent(experiment.report)
     work = []
     for entry in done:
         items = [(f.key, f) for side in ("claude", "kimi") for f in entry[side] if not f.matched]
@@ -614,15 +710,15 @@ def _judge(engine: Engine, keyring: Any, experiment: Any, done: list[dict[str, A
     totals = labeling.Totals()
     info: dict[str, Any] = {}
     if not any(work):
-        return {"judgments": known, "alias": None, **info}
+        return {"judgments": known, "alias": None, "total_cost_usd": float(earlier), **info}
     with engine.connect() as conn:
         try:
             alias = judge.judge_alias(conn, experiment.team_id)[0]
             model = llm.prepare(conn, keyring, experiment.team_id, alias)
         except llm.LLMError as exc:
-            return {"judgments": known, "alias": None, "unavailable": exc.message}
-        spent = sum((Decimal(str(r.cost_usd)) for r in _arm_costs(conn, experiment.id) if r.cost_usd is not None),
-                    Decimal(0))
+            return {"judgments": known, "alias": None, "unavailable": exc.message,
+                    "total_cost_usd": float(earlier)}
+        spent = _spent(conn, experiment.id) + earlier
     budget = Decimal(str(experiment.daily_budget_usd))
     judged = dict(known)
     chunks = [items[i:i + judge.BATCH] for items in work for i in range(0, len(items), judge.BATCH)]
@@ -643,7 +739,8 @@ def _judge(engine: Engine, keyring: Any, experiment: Any, done: list[dict[str, A
         info["stopped"] = f"The judge stopped: {exc.message}"
     return {"judgments": judged, "alias": totals.labeler or alias, "calls": totals.calls,
             "cost_usd": round(totals.cost_usd, 6), "input_tokens": totals.input_tokens,
-            "output_tokens": totals.output_tokens, **info}
+            "output_tokens": totals.output_tokens,
+            "total_cost_usd": round(float(earlier) + totals.cost_usd, 6), **info}
 
 
 def _split(items: list[Any]) -> dict[str, Any]:
@@ -653,6 +750,21 @@ def _split(items: list[Any]) -> dict[str, Any]:
             "blocking": {"blocking": sum(1 for f in items if f.blocking is True),
                          "non_blocking": sum(1 for f in items if f.blocking is False),
                          "unknown": sum(1 for f in items if f.blocking is None)}}
+
+
+TEXT_CAP = 2000
+
+
+def _card(f: Any, judged: dict[str, bool] | None = None, side: str = "kimi") -> dict[str, Any]:
+    """One finding as the report shows it. Its text is review content, so every renderer escapes it."""
+    card = {"path": f.path, "line": f.line, "severity": f.severity, "blocking": f.blocking, "decision": f.decision,
+            "reason": (f.reason or "")[:TEXT_CAP] or None, "claim": (f.claim or "")[:TEXT_CAP],
+            "body": (f.body or "")[:TEXT_CAP], "finding_key": f.finding_key}
+    if side == "claude":
+        card["fixed"] = bool(f.fixed)
+    if judged is not None:
+        card["verdict"] = "valid" if judged.get(f.key) is True else "not_valid" if f.key in judged else "not_judged"
+    return card
 
 
 def _round_result(entry: dict[str, Any], judged: dict[str, bool]) -> dict[str, Any]:
@@ -676,7 +788,12 @@ def _round_result(entry: dict[str, Any], judged: dict[str, bool]) -> dict[str, A
                      "claude_keep_kimi_drop": sum(1 for c, k in keeps if c and not k),
                      "claude_drop_kimi_keep": sum(1 for c, k in keeps if k and not c)},
             "raised": entry["raised"], "rate": entry["rate"],
-            "claude_run": entry["runs"]["claude"], "kimi_run": entry["runs"]["kimi"]}
+            "claude_run": entry["runs"]["claude"], "kimi_run": entry["runs"]["kimi"],
+            "head": entry["head"], "verdict": entry["verdict"],
+            "findings": {"pairs": [{"claude": _card(left, side="claude"), "kimi": _card(right)}
+                                   for left, right in both],
+                         "claude_only": [_card(f, judged, "claude") for f in claude_only],
+                         "kimi_only": [_card(f, judged) for f in kimi_only]}}
 
 
 def _add(total: dict[str, Any], part: dict[str, Any]) -> dict[str, Any]:
@@ -695,7 +812,10 @@ TOTALLED = ("both", "claude_only", "kimi_only", "fixed", "fixed_missed", "claude
 def _totals(results: list[dict[str, Any]]) -> dict[str, Any]:
     total: dict[str, Any] = {"rounds": len(results),
                              "rate_agrees": sum(1 for r in results if r["rate"]["kimi"] == r["rate"]["claude"]),
-                             "rate_matches_risk": sum(1 for r in results if r["rate"]["kimi"] == r["rate"]["risk"])}
+                             "rate_matches_risk": sum(1 for r in results if r["rate"]["kimi"] == r["rate"]["risk"]),
+                             "verdict_agrees": sum(1 for r in results if (r.get("verdict") or {}).get("kimi")
+                                                   and (r.get("verdict") or {}).get("kimi")
+                                                   == (r.get("verdict") or {}).get("claude"))}
     for result in results:
         _add(total, {k: result[k] for k in TOTALLED})
     return total
@@ -709,7 +829,7 @@ def build(done: list[dict[str, Any]], skipped: list[dict[str, Any]], judged: dic
     prs: dict[str, list[dict[str, Any]]] = {}
     for result in results:
         prs.setdefault(result["subject"], []).append(result)
-    return {"version": 1, "experiment": experiment.id, "alias": (experiment.variant or {}).get("alias"),
+    return {"version": 2, "experiment": experiment.id, "alias": (experiment.variant or {}).get("alias"),
             "model": (experiment.variant or {}).get("model"), "compared_at": now.isoformat(),
             "judge": {k: v for k, v in judged.items() if k != "judgments"},
             "totals": _totals(results),
@@ -733,7 +853,7 @@ def compare(engine: Engine, keyring: Any, experiment: Any, now: datetime, report
         built = build(done, skipped, judged, experiment, now, (stored or {}).get("selection") or {})
         if reports_dir is not None:
             try:
-                report_file.write_file(reports_dir, name, render(built))
+                report_file.write_file(reports_dir, name, replay_html.render(built))
                 built["file"] = name
             except (OSError, report_file.Unsafe) as exc:
                 log.error("the replay report of %s is stored but its file wasn't written: %s", experiment.id, exc)
@@ -745,81 +865,3 @@ def compare(engine: Engine, keyring: Any, experiment: Any, now: datetime, report
                          detail={k: judged.get(k) for k in ("alias", "calls", "cost_usd", "input_tokens",
                                                             "output_tokens")})
     return built
-
-
-# The HTML file
-
-def _count_row(label: str, t: dict[str, Any]) -> list[str]:
-    esc = report_file.esc
-    cells = [esc(label)]
-    for side in ("both", "claude_only", "kimi_only"):
-        split = t.get(side) or {}
-        sev = split.get("severity") or {}
-        block = split.get("blocking") or {}
-        cells.append(esc(f"{split.get('total', 0)} (H{sev.get('high', 0)} M{sev.get('medium', 0)} "
-                         f"L{sev.get('low', 0)} ?{sev.get('unknown', 0)}; blocking {block.get('blocking', 0)})"))
-    lead = t.get("lead") or {}
-    cells += [esc(t.get("fixed_missed", 0)), esc(t.get("kimi_only_valid", 0)),
-              esc(f"{lead.get('agree', 0)} / {lead.get('claude_keep_kimi_drop', 0)} / "
-                  f"{lead.get('claude_drop_kimi_keep', 0)}")]
-    return cells
-
-
-COUNT_HEADERS = [("", False), ("Both raised", False), ("Claude only", False), ("Kimi only", False),
-                 ("Fixed, Kimi missed", True), ("Kimi only, valid", True),
-                 ("Lead agree / Claude kept only / Kimi kept only", False)]
-
-
-def render(data: dict[str, Any]) -> str:
-    esc, money, took = report_file.esc, report_file.money, report_file.took
-    totals = data.get("totals") or {}
-    claude, kimi = totals.get("claude_run") or {}, totals.get("kimi_run") or {}
-    tiles = "".join((
-        report_file._tile("Rounds compared", str(totals.get("rounds", 0)),
-                          f"{len(data.get('skipped') or [])} skipped"),
-        report_file._tile("Both raised", str((totals.get("both") or {}).get("total", 0))),
-        report_file._tile("Kimi only, judged valid", str(totals.get("kimi_only_valid", 0)),
-                          f"of {(totals.get('kimi_only') or {}).get('total', 0)}"),
-        report_file._tile("Fixed by the author, Kimi missed", str(totals.get("fixed_missed", 0)),
-                          f"of {totals.get('fixed', 0)} fixed"),
-    ))
-    summary = report_file._table(COUNT_HEADERS, [_count_row("All", totals)] + [
-        _count_row(pr["subject"], pr["totals"]) for pr in data.get("prs") or []])
-    rounds = []
-    for pr in data.get("prs") or []:
-        for r in pr["rounds"]:
-            rate = r.get("rate") or {}
-            c, k = r.get("claude_run") or {}, r.get("kimi_run") or {}
-            rounds.append([esc(r["subject"]), esc(r["round"]),
-                           esc(f"{rate.get('kimi')} vs {rate.get('claude')} (risk {rate.get('risk')}, "
-                               f"panel {', '.join(rate.get('panel') or [])})"),
-                           esc(f"{sum((r.get('raised') or {}).get('kimi', {}).values())} vs "
-                               f"{sum((r.get('raised') or {}).get('claude', {}).values())}"),
-                           esc(f"{money(k.get('cost_usd'))} vs {money(c.get('cost_usd'))}"),
-                           esc(f"{k.get('input_tokens') or 0:,}/{k.get('output_tokens') or 0:,} vs "
-                               f"{c.get('input_tokens') or 0:,}/{c.get('output_tokens') or 0:,}"),
-                           esc(f"{took(k.get('wall_s'))} vs {took(c.get('wall_s'))}")])
-    round_table = report_file._table(
-        [("Pull request", False), ("Round", True), ("Rate, Kimi vs Claude", False),
-         ("Specialist findings, Kimi vs Claude", False), ("Cost", False), ("Tokens in/out", False),
-         ("Wall time", False)], rounds) if rounds else report_file._empty("No replay finished.")
-    skipped = data.get("skipped") or []
-    skipped_table = report_file._table(
-        [("Pull request", False), ("Round", True), ("Why", False)],
-        [[esc(s.get("subject")), esc(s.get("round")), esc(s.get("reason"))] for s in skipped]) \
-        if skipped else report_file._empty("No round was skipped.")
-    judge_info = data.get("judge") or {}
-    note = (f"Judge {judge_info.get('alias') or 'unavailable'}, {judge_info.get('calls', 0)} calls, "
-            f"{money(judge_info.get('cost_usd'))}. {judge_info.get('unavailable') or judge_info.get('stopped') or ''}")
-    return (f'<!doctype html>\n<html lang="en"><head><meta charset="utf-8">'
-            f'<meta name="viewport" content="width=device-width, initial-scale=1">'
-            f'<title>Kimi evaluation {esc(data.get("experiment"))}</title><style>{report_file.CSS}</style></head>'
-            f'<body><main><h1>Claude reviews replayed on {esc(data.get("alias"))}</h1>'
-            f'<p class="sub">Model {esc(data.get("model"))}. Compared {esc(data.get("compared_at"))}. '
-            f'Kimi cost {esc(money(kimi.get("cost_usd")))} against Claude\'s {esc(money(claude.get("cost_usd")))}.'
-            f'</p><div class="tiles">{tiles}</div>'
-            + report_file._section("Findings by pull request", summary,
-                                   "Counts split by severity (high, medium, low, unknown) and blocking.")
-            + report_file._section("Rounds", round_table)
-            + report_file._section("Skipped rounds", skipped_table)
-            + f'<footer>{esc(note)}</footer></main></body></html>\n')

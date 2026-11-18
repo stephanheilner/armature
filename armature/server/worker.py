@@ -221,7 +221,8 @@ def queue_job(conn: Connection, *, team_id: str, project_id: str | None, workflo
               key: str | None = None, not_before: datetime | None = None, supersede: bool = False,
               cancel_running: bool = False, sticky: Iterable[str] = (), rerun_of: str | None = None,
               requested_by: str | None = None, kind: str = "workflow", resident_id: str | None = None,
-              workflow_version: int | None = None, arm_id: str | None = None) -> str:
+              workflow_version: int | None = None, arm_id: str | None = None,
+              pinned: dict[str, Any] | None = None) -> str:
     """Queue a workflow job at the workflow's current version, with its callees pinned. Returns the job id.
 
     ``resume`` is a gate id and the job that paused there: the new job continues that job's run, at the version,
@@ -233,12 +234,17 @@ def queue_job(conn: Connection, *, team_id: str, project_id: str | None, workflo
 
     ``arm_id`` makes the job that comparison run: it requires EVAL_ARM and its run is in arm mode.
 
+    ``pinned`` gives the version, callee pins, requires, and dry flag already worked out, so a caller queuing many
+    jobs of one workflow version parses its bodies once.
+
     Jobs of the workflow with the same ``key`` run one at a time. With ``supersede`` the new job replaces the key's
     queued ones and keeps any ``sticky`` input one of them set. With ``cancel_running`` it also asks the key's
     running job to stop. A job with ``not_before`` waits until then to be claimed. The run a job with ``rerun_of``
     opens links back to that run, with its trigger, and names ``requested_by`` as who triggered it.
     """
-    if resume is not None:
+    if pinned is not None:
+        pinned = {k: pinned[k] for k in ("workflow_version", "call_pins", "requires", "dry_run")}
+    elif resume is not None:
         gate_id, paused = resume
         pinned = {"workflow_version": paused.workflow_version, "call_pins": paused.call_pins,
                   "requires": paused.requires, "run_id": paused.run_id, "resume_of_gate": gate_id,

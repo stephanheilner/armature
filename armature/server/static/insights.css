@@ -585,6 +585,39 @@
   .insights .in-drawer { animation: none; }
   .insights .in-tile::before, .insights .in-stale { transition: none; }
 }
+/* Replays: Claude's findings and the replay's, side by side. */
+.insights .rp-round { border-top: 1px solid var(--in-rule); padding: var(--in-space-3) 0; }
+.insights .rp-round > summary { cursor: pointer; list-style: none; display: flex; flex-wrap: wrap; gap: var(--in-space-1) var(--in-space-3); align-items: baseline; }
+.insights .rp-round > summary::-webkit-details-marker { display: none; }
+.insights .rp-round > summary::before { content: "▸"; color: var(--in-muted); }
+.insights .rp-round[open] > summary::before { content: "▾"; }
+.insights .rp-round-name { font-weight: var(--in-weight-medium); }
+.insights .rp-facts, .insights .rp-runs { color: var(--in-muted); font-size: var(--in-text-sm); }
+.insights .rp-runs { margin: var(--in-space-2) 0; }
+.insights .rp-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: var(--in-space-2) var(--in-space-3); }
+.insights .rp-col { font-size: var(--in-text-xs); font-weight: var(--in-weight-medium); letter-spacing: 0.04em; text-transform: uppercase; color: var(--in-muted); }
+.insights .rp-card { min-width: 0; border: 1px solid var(--in-rule); border-radius: var(--in-radius-md); padding: var(--in-space-2) var(--in-space-3); }
+.insights .rp-card.is-none { border-style: dashed; color: var(--in-muted); font-size: var(--in-text-sm); display: flex; align-items: center; justify-content: center; min-height: 48px; }
+.insights .rp-side { display: none; font-size: var(--in-text-2xs); font-weight: var(--in-weight-medium); text-transform: uppercase; color: var(--in-muted); }
+.insights .rp-badges { display: flex; flex-wrap: wrap; gap: var(--in-space-1); margin-bottom: var(--in-space-1); }
+.insights .rp-badge { font-size: var(--in-text-2xs); padding: 0 8px; border-radius: var(--in-radius-full); border: 1px solid var(--in-rule); color: var(--in-muted); white-space: nowrap; }
+.insights .rp-badge.is-bad, .insights .rp-badge.is-high { color: var(--in-bad); border-color: var(--in-bad); }
+.insights .rp-badge.is-medium { color: var(--in-warn); border-color: var(--in-warn); }
+.insights .rp-badge.is-ok { color: var(--in-good); border-color: var(--in-good); }
+.insights .rp-badge.is-accent { color: var(--in-accent); border-color: var(--in-accent); }
+.insights .rp-where { font-family: var(--in-mono); font-size: var(--in-text-xs); overflow-wrap: anywhere; }
+.insights .rp-claim { margin: var(--in-space-1) 0 2px; font-weight: var(--in-weight-medium); overflow-wrap: anywhere; }
+.insights .rp-reason { margin: 2px 0; color: var(--in-muted); font-size: var(--in-text-sm); overflow-wrap: anywhere; }
+.insights .rp-more { display: inline-block; cursor: pointer; color: var(--in-accent); font-size: var(--in-text-sm); font-weight: var(--in-weight-medium); list-style: none; border-radius: 4px; }
+.insights .rp-more::-webkit-details-marker { display: none; }
+.insights .rp-more:hover { text-decoration: underline; text-underline-offset: 3px; }
+.insights .rp-body { white-space: pre-wrap; overflow-wrap: anywhere; font-size: var(--in-text-sm); margin: var(--in-space-1) 0 0; }
+@media (max-width: 760px) {
+  .insights .rp-grid { grid-template-columns: minmax(0, 1fr); }
+  .insights .rp-col { display: none; }
+  .insights .rp-side { display: block; }
+}
+
 @media (forced-colors: active) {
   .insights .in-key, .insights .in-mix, .insights .in-mix span, .insights .in-dot { forced-color-adjust: none; }
   .insights .in-tile[aria-selected="true"]::before { background: Highlight; }

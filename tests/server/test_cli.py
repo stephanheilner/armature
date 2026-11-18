@@ -521,3 +521,54 @@ def test_kimi_evaluate_needs_an_admin_and_warns_when_tools_answer_dry(tmp_path, 
         conn.execute(insert(settings).values(team_id=team, project_id=project, key="tools.dry_run", value=True))
     dry = start("--as", "admin")
     assert dry.exit_code == 0 and "tools.dry_run is on" in dry.output
+
+
+def test_kimi_evaluate_report_rebuilds_only_a_replay_experiment(tmp_path, monkeypatch):
+    config, result = _init(tmp_path, monkeypatch)
+    assert result.exit_code == 0, result.output
+    missing = CliRunner().invoke(app, ["server", "kimi-evaluate-report", "--experiment", "nope", "--config",
+                                       str(config)])
+    assert missing.exit_code == 1 and "No kimi-evaluate experiment has the id nope." in missing.output
+
+
+def test_kimi_evaluate_report_refuses_a_specialist_experiment_and_writes_a_finished_replays_file(tmp_path,
+                                                                                                monkeypatch):
+    from types import SimpleNamespace
+
+    from ruamel.yaml import YAML
+    from sqlalchemy import insert, update
+
+    from armature.server.db import new_id, utcnow
+    from armature.server.db.schema import eval_experiments, projects, teams
+    from armature.server.insights import replay
+    config, result = _init(tmp_path, monkeypatch)
+    assert result.exit_code == 0, result.output
+    reports = tmp_path / "reports"
+    data = YAML(typ="safe").load(config.read_text())
+    data["reports"] = {**(data.get("reports") or {}), "dir": str(reports)}
+    with config.open("w") as out:
+        YAML(typ="safe", pure=True).dump(data, out)
+    engine = make_engine(load_config(config).database_url)
+    team, project, second = new_id(), new_id(), new_id()
+    with engine.begin() as conn:
+        conn.execute(insert(teams).values(id=team, name="Mobile", slug="mobile", created_at=utcnow()))
+        conn.execute(insert(projects).values(id=project, team_id=team, name="android-tree", created_at=utcnow()))
+        conn.execute(insert(projects).values(id=second, team_id=team, name="ios-tree", created_at=utcnow()))
+        admin = conn.execute(select(users.c.id).where(users.c.username == "admin")).scalar()
+        job = SimpleNamespace(team_id=team, project_id=project, requested_by=admin)
+        finished = replay._experiment(conn, job, "kimi", "moonshotai/kimi-k2.6", {"budget_usd": 50,
+                                                                                "max_in_flight": 2}, utcnow())
+        other = replay._experiment(conn, SimpleNamespace(team_id=team, project_id=second, requested_by=admin),
+                                   "kimi", "moonshotai/kimi-k2.6", {"budget_usd": 50, "max_in_flight": 2}, utcnow())
+        conn.execute(update(eval_experiments).where(eval_experiments.c.id == other.id).values(specialist="correctness"))
+    engine.dispose()
+
+    def rebuild(experiment_id):
+        return CliRunner().invoke(app, ["server", "kimi-evaluate-report", "--experiment", experiment_id, "--config",
+                                        str(config)])
+    refused = rebuild(other.id)
+    assert refused.exit_code == 1 and f"No kimi-evaluate experiment has the id {other.id}." in refused.output
+    done = rebuild(finished.id)
+    assert done.exit_code == 0, done.output
+    page = reports / f"kimi-evaluate-{finished.id}.html"
+    assert os.stat(page).st_mode & 0o777 == 0o600 and "Claude reviews replayed on Kimi" in page.read_text()

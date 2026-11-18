@@ -439,3 +439,71 @@ test('a tile can compare with a named period instead of a number of days', () =>
   assert.ok(words(node).includes('vs the day before'));
   assert.ok(words(node).includes('compared with the day before'));
 });
+
+const replaysScreen = await import(new URL('views/insights/replays.js', STATIC));
+const HOSTILE = '<img src=x onerror=alert(1)>';
+const REPLAY = {
+  id: 'exp-1', team: 'Mobile', project: 'android-tree', alias: 'kimi', model: 'moonshot.kimi-k2', arms: { done: 1 },
+  report: {
+    version: 2, alias: 'kimi', compared_at: '2026-11-18T10:00:00+00:00',
+    totals: { rounds: 1, both: { total: 1 }, claude_only: { total: 1 }, kimi_only: { total: 1 }, fixed: 1, fixed_missed: 1, kimi_only_valid: 1, verdict_agrees: 0,
+      claude_run: { cost_usd: 6, minutes: 20 }, kimi_run: { cost_usd: 1.5, minutes: 30 } },
+    prs: [{ subject: 'acme/app#12', totals: { rounds: 1, both: { total: 1 }, claude_only: { total: 1 }, kimi_only: { total: 1 } }, rounds: [{
+      subject: 'acme/app#12', round: 2, head: 'a'.repeat(40), verdict: { claude: 'comment', kimi: 'approve' }, rate: { kimi: 'high', risk: 'medium' },
+      both: { total: 1 }, claude_only: { total: 1 }, kimi_only: { total: 1 },
+      claude_run: { cost_usd: 6, input_tokens: 1000, output_tokens: 200, minutes: 20 }, kimi_run: { cost_usd: 1.5, input_tokens: 900, output_tokens: 100, minutes: 30 },
+      findings: {
+        pairs: [{ claude: { path: 'src/A.kt', line: 4, severity: 'high', blocking: true, decision: 'block', claim: 'The lock leaks.', body: 'Longer text.', fixed: false },
+          kimi: { path: 'src/A.kt', line: 5, severity: 'medium', blocking: false, decision: 'drop', claim: 'Lock never released.', body: 'Lock never released.' } }],
+        claude_only: [{ path: '../etc/passwd', line: 1, severity: 'low', decision: 'suggest', claim: HOSTILE, body: HOSTILE, fixed: true, verdict: 'valid' }],
+        kimi_only: [{ path: 'src/D.kt', line: 9, severity: 'high', blocking: true, decision: 'block', claim: 'Network on the UI thread.', verdict: 'not_judged' }],
+      },
+    }] }],
+    skipped: [{ subject: 'acme/app#13', round: 1, reason: 'A recorded output is truncated: first/context.' }],
+  },
+};
+
+test('a replay report shows each round side by side, with one-sided findings marked and text kept as text', async () => {
+  const { ctx, asked } = reportContext({
+    '/api/insights/replays': { replays: [{ id: 'exp-1', team: 'Mobile', project: 'android-tree', alias: 'kimi', created_at: '2026-11-18T09:00:00+00:00' }] },
+    '/api/insights/replays/exp-1': REPLAY,
+  });
+  const body = new FakeElement('div');
+  await replaysScreen.render(body, ctx);
+  assert.deepEqual(asked, ['/api/insights/replays', '/api/insights/replays/exp-1']);
+  const text = words(body);
+  assert.ok(text.includes('1 round compared: 1 found by both, 1 by Claude only, 1 by Kimi only.'));
+  for (const line of ['Fixed by author, Kimi missed', 'Verdict agreement', '0 of 1', '$6.00', '$1.50', '20.0 min', 'Round 2',
+    'Fixed by author', 'Judged valid', 'Not judged', 'Not raised by Claude', 'Not raised by Kimi', 'Lead: block', HOSTILE, 'A recorded output is truncated: first/context.']) {
+    assert.ok(text.includes(line), line);
+  }
+  const links = tagged(body, 'a').map((node) => node.attributes.href);
+  assert.ok(links.includes(`https://github.com/acme/app/blob/${'a'.repeat(40)}/src/A.kt#L4`));
+  assert.ok(links.includes('https://github.com/acme/app/pull/12'));
+  assert.ok(!links.some((href) => /passwd/.test(href || '')));
+  assert.ok(!tagged(body, 'img').length);
+  assert.ok(tagged(body, 'summary').some((node) => node.className === 'rp-more'));
+});
+
+test('a replay with no project or team is still named in the picker', async () => {
+  const { ctx } = reportContext({
+    '/api/insights/replays': { replays: [{ id: 'exp-1', alias: 'kimi', created_at: '2026-11-18T09:00:00+00:00' }] },
+    '/api/insights/replays/exp-1': REPLAY,
+  });
+  const body = new FakeElement('div');
+  await replaysScreen.render(body, ctx);
+  const text = words(body);
+  assert.ok(!text.includes('undefined') && text.includes('Unknown on Kimi, 2026-11-18'));
+});
+
+test('a replay report from before side-by-side findings still shows its counts', () => {
+  const old = { ...REPLAY, report: { version: 1, compared_at: 'x', totals: { rounds: 1, both: { total: 2 } }, prs: [{ subject: 'acme/app#12', totals: {}, rounds: [{ round: 1, both: { total: 2 } }] }] } };
+  const holder = new FakeElement('div');
+  holder.append(...replaysScreen.draw(old));
+  const text = words(holder);
+  assert.ok(text.includes('This report predates side-by-side findings. Rebuild it to see them.'));
+  assert.ok(text.includes('Found by both') && text.includes('—'));
+  assert.equal(replaysScreen.fileHref('acme/app#1', 'b'.repeat(40), 'a/../b', 1), null);
+  assert.equal(replaysScreen.fileHref('acme/app#1', 'not-a-sha', 'a.kt', 1), null);
+  assert.equal(replaysScreen.answer({ report: null, arms: { running: 2 } }), '2 replays still running.');
+});
