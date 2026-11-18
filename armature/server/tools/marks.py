@@ -186,7 +186,7 @@ def _status_mark(gh: Api, call: Call, conn: Connection, repo: str, head: str) ->
     newest = max(ours, key=lambda s: (str(s.get("created_at") or ""), s["id"]))
     return newest.get("state") == "success" and conn.execute(select(review_marks.c.id).where(
         review_marks.c.project_id == call.project_id, review_marks.c.app_id.is_(None),
-        review_marks.c.check_run_id == newest["id"])).first() is not None
+        review_marks.c.head_sha == head, review_marks.c.check_run_id == newest["id"])).first() is not None
 
 
 def marked(call: Call, params: dict[str, Any]) -> dict[str, Any]:
@@ -346,6 +346,80 @@ def record_mark(call: Call, params: dict[str, Any]) -> dict[str, Any]:
             if attempt:
                 return {"marked": False, "head": head, "reason": "another run is marking this head"}
     return {"marked": True, "head": head, "check_run_id": stored, "outcome": outcome}
+
+
+def _branch_target(repo: str, branch: str) -> str:
+    return f"{repo.lower()}:{branch}"[:191]
+
+
+def record_branch_review(call: Call, params: dict[str, Any]) -> dict[str, Any]:
+    """The lead's verdict on a pushed branch. The server decides whether it approved, as review-pass's post does:
+    an approve verdict with nothing blocking, here also a complete panel on the head the run rated. A comment blocks
+    unless its blocking is false, and a decision unless it is suggest or drop."""
+    with _engine(call).connect() as conn:
+        rated = conn.execute(select(runs.c.head_sha).where(runs.c.id == call.run_id)).scalar()
+    blocking = sum(1 for c in params.get("comments") or [] if c.get("blocking", True) is not False) \
+        + sum(1 for d in params["decisions"] if d.get("decision") not in ("suggest", "drop"))
+    complete = params["complete"] is True
+    approved = params["verdict"] == "approve" and not blocking and complete and params["head"] == rated
+    return {"recorded": True, "head": params["head"], "branch": params["branch"], "base": params["base"],
+            "round": params["round"], "complete": complete, "blocking": blocking, "approved": approved}
+
+
+def _branch_refusal(conn: Connection, call: Call, params: dict[str, Any]) -> str | None:
+    """Why the run may not mark a branch's head: it must be the run's rated head, and the run's last branch review
+    of that branch must approve that head against that base, after the run's latest rating."""
+    head = params["head"]
+    rated = conn.execute(select(runs.c.head_sha).where(runs.c.id == call.run_id)).scalar()
+    if not rated:
+        return "the run has no rated head"
+    if head != rated:
+        return f"this run rated {rated[:12]}, not {head[:12]}"
+    risked = conn.execute(select(func.max(tool_calls.c.created_at)).where(
+        tool_calls.c.run_id == call.run_id, tool_calls.c.tool.in_(RISK_TOOLS), tool_calls.c.mode == "live",
+        tool_calls.c.outcome == "ok")).scalar()
+    review = conn.execute(select(tool_calls.c.detail, tool_calls.c.created_at).where(
+        tool_calls.c.run_id == call.run_id, tool_calls.c.tool == "review.record-branch-review",
+        tool_calls.c.mode == "live", tool_calls.c.target == _branch_target(params["repo"], params["branch"]))
+        .order_by(tool_calls.c.created_at.desc())).first()
+    detail = review.detail if review is not None and isinstance(review.detail, dict) else {}
+    if detail.get("head") != head or detail.get("base") != params["base"] or detail.get("approved") is not True:
+        return f"this run recorded no approving review of {head[:12]} against {params['base']}"
+    if risked is None or review.created_at <= risked:
+        return "this run rated its head again after its last branch review"
+    return None
+
+
+def record_branch_mark(call: Call, params: dict[str, Any]) -> dict[str, Any]:
+    """review.record-mark for a pushed branch before its pull request exists, so the pull request's review honors
+    it. A refusal fails the step."""
+    repo, head, status_id = params["repo"], params["head"], params.get("status_id")
+    with _engine(call).connect() as conn:
+        refusal = _branch_refusal(conn, call, params)
+    if refusal:
+        raise ToolError(422, refusal)
+    values = {"team_id": call.team_id, "repo": repo.lower(), "pr_number": None, "run_id": call.run_id,
+              "check_run_id": status_id, "conclusion": "success", "created_at": call.now, "app_id": None}
+    replaceable = review_marks.c.check_run_id.is_(None) if status_id is None else or_(
+        review_marks.c.check_run_id.is_(None), review_marks.c.check_run_id < status_id)
+    for attempt in range(2):
+        try:
+            with _engine(call).begin() as conn:
+                existing = mark_of(conn, call.project_id, head)
+                if existing is None:
+                    conn.execute(insert(review_marks).values(id=new_id(), project_id=call.project_id,
+                                                             head_sha=head, **values))
+                else:
+                    conn.execute(update(review_marks).where(
+                        review_marks.c.id == existing.id, review_marks.c.app_id.is_(None), replaceable)
+                        .values(**values))
+                stored = mark_of(conn, call.project_id, head).check_run_id
+            break
+        except IntegrityError:
+            # Another run marked the same head first, so the second pass updates its row.
+            if attempt:
+                raise ToolError(409, "another run is marking this head") from None
+    return {"marked": True, "head": head, "check_run_id": stored}
 
 
 def pushable(call: Call, params: dict[str, Any]) -> dict[str, Any]:

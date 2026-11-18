@@ -75,7 +75,8 @@ TOKEN_MAX = 4096
 STEP = re.compile(r"^[^\x00-\x1f]{1,191}$")
 # A lost run's grants and tokens are revoked as an ended run's are.
 RUN_OPEN = ("queued", "running")
-WRITE_TOOLS = ("github.push",)
+# A run with an agent stage gets these only when its sessions can't reach the runner's own user.
+WRITE_TOOLS = ("github.push", "review.record-branch-review", "review.record-branch-mark")
 # Reads a step may make of another project's repository, so long as the project is in the job's team.
 TEAM_READS = ("github.pr-diff",)
 # Tools whose call can change the run's risk or outcome, which open run pages show.
@@ -265,8 +266,8 @@ def issue_grant(conn: Connection, keyring: Keyring, *, run_token: Any, body: dic
         raise BrokerError(403, f"Step {step} names {', '.join(tools)} in the job's workflow.")
     if agents and body.get("agent_user") is not True and any(t in WRITE_TOOLS for t in tools) \
             and not _same_user_runner(conn, job):
-        raise BrokerError(403, "A workflow with an agent stage pushes only from a runner whose sessions run as a "
-                               "separate agent user, or one started with --same-user.")
+        raise BrokerError(403, "A workflow with an agent stage pushes or marks only from a runner whose sessions "
+                               "run as a separate agent user, or one started with --same-user.")
     # A self-heal session works unattended on flagged code, so it never runs as the runner's own user.
     if body.get("agent_user") is not True and fixes.is_self_heal(conn, job.workflow_id):
         raise BrokerError(403, "A self-heal run needs a runner whose agent sessions run as a separate agent user.")
@@ -610,6 +611,8 @@ def call_tool(engine: Engine, keyring: Keyring, *, public_url: str, token: Any, 
         elif tool == "review.record-post":
             outcome, detail = "ok", marks.post_detail(params)
             marks.reviewed(conn, grant.run_id, detail)
+        elif tool == "review.record-branch-review":
+            outcome, detail = "ok", {k: v for k, v in result.items() if k != "recorded"}
         elif tool == "github.open-pr":
             marks.opened(conn, grant.run_id, result)
             if proposal is not None:

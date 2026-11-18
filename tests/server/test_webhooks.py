@@ -233,24 +233,26 @@ def test_github_delivery_queues_a_job_pinned_to_the_version(sqlite_engine, lead,
     assert "x-hub-signature-256" not in delivery.headers and delivery.headers["x-github-event"] == "pull_request"
 
 
-def _mark(sqlite_engine, keyring, clock, world, head):
+def _mark(sqlite_engine, keyring, clock, world, head, pr_number=7):
     from armature.server import runners
     from armature.server.db.schema import review_marks
     with sqlite_engine.begin() as conn:
         row, _ = runners.open_run(conn, keyring, team_id=world.team, project_id=world.project, workflow_id=world.wf,
                                   workflow_name="code-review", now=clock())
         conn.execute(insert(review_marks).values(id=new_id(), team_id=world.team, project_id=world.project,
-                                                 repo="acme/app", pr_number=7, head_sha=head, run_id=row["id"],
-                                                 conclusion="success", created_at=clock()))
+                                                 repo="acme/app", pr_number=pr_number, head_sha=head,
+                                                 run_id=row["id"], conclusion="success", created_at=clock()))
 
 
+# A branch reviewed before its pull request existed carries a mark with no pull request number.
+@pytest.mark.parametrize("pr_number", [7, None])
 @pytest.mark.parametrize("kind,queued", [("review", 0), ("fix", 1)])
 def test_a_review_of_a_head_that_carries_a_mark_is_not_queued(sqlite_engine, keyring, clock, lead, world, kind,
-                                                              queued):
+                                                              queued, pr_number):
     head = "a" * 40
     with sqlite_engine.begin() as conn:
         conn.execute(workflows.update().where(workflows.c.id == world.wf).values(kind=kind))
-    _mark(sqlite_engine, keyring, clock, world, head)
+    _mark(sqlite_engine, keyring, clock, world, head, pr_number)
     hook = _hook(lead, world)
     _rule(lead, hook, world.wf, events=["pull_request"], project_from="repository.full_name")
     raw = _body({"repository": {"full_name": "Acme/App"}, "pull_request": {"head": {"sha": head}}})

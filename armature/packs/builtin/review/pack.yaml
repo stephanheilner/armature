@@ -109,14 +109,21 @@ adapters:
       the model calls small, of at most 50 lines and 5 files, runs the reviewer alone.
       Given triggers and since_paths, the paths changed since the last full review, the panel follows those paths
       while the recorded level still covers the whole pull request.
+      Give number for a pull request, or branch and base for a pushed branch before any pull request exists.
     cmd: armature tool review.record-risk
     params:
       type: object
-      required: [repo, number, head, level, total]
+      required: [repo, head, level, total]
+      oneOf:
+        - required: [number]
+        - required: [branch, base]
+      dependentRequired: {branch: [base], base: [branch]}
       additionalProperties: false
       properties:
         repo: {type: string, pattern: '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$'}
         number: {type: integer, minimum: 1}
+        branch: {type: string, pattern: '^[A-Za-z0-9._/-]{1,200}$'}
+        base: {type: string, pattern: '^[A-Za-z0-9._/-]{1,200}$'}
         head: {type: string, pattern: '^[0-9a-f]{40}$'}
         level: {enum: [low, medium, high]}
         reasons: {type: array, items: {type: string}, maxItems: 20}
@@ -162,6 +169,51 @@ adapters:
         number: {type: integer, minimum: 1}
         head: {type: string, pattern: '^[0-9a-f]{40}$'}
         status_id: {type: integer, minimum: 1}
+  record-branch-review:
+    description: >-
+      For a run that reviewed a pushed branch before any pull request exists. Record the team lead's verdict,
+      decisions, and comments on head, with the base the step says it reviewed against. The server never reads
+      the diff, so it checks no base. The server decides whether it approved: an approve verdict, no decision that
+      blocks, no comment whose blocking isn't false, a complete panel, and head the run's own rated head. Uses no
+      connection.
+    cmd: armature tool review.record-branch-review
+    writes: true
+    params:
+      type: object
+      required: [repo, branch, base, head, verdict, decisions, complete, round]
+      additionalProperties: false
+      properties:
+        repo: {type: string, pattern: '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$'}
+        branch: {type: string, pattern: '^[A-Za-z0-9._/-]{1,200}$'}
+        base: {type: string, pattern: '^[A-Za-z0-9._/-]{1,200}$'}
+        head: {type: string, pattern: '^[0-9a-f]{40}$'}
+        verdict: {enum: [approve, comment]}
+        decisions: {type: array, items: {type: object}, maxItems: 200}
+        comments:
+          type: array
+          maxItems: 200
+          items: {type: object, required: [blocking], properties: {blocking: {type: boolean}}}
+        complete: {type: boolean}
+        round: {type: integer, minimum: 1}
+  record-branch-mark:
+    description: >-
+      For a pack that sets its own GitHub status on a pushed branch's head. Record the review mark the server
+      trusts for head, which a later pull request with that head honors. Only the head this run rated, whose
+      branch review this run recorded as an approval after its latest rating, is marked, and any other call fails
+      the step. base must match the base that review named, which only keeps the workflow consistent with itself,
+      since the server never read either. Uses no connection.
+    cmd: armature tool review.record-branch-mark
+    writes: true
+    params:
+      type: object
+      required: [repo, branch, base, head]
+      additionalProperties: false
+      properties:
+        repo: {type: string, pattern: '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$'}
+        branch: {type: string, pattern: '^[A-Za-z0-9._/-]{1,200}$'}
+        base: {type: string, pattern: '^[A-Za-z0-9._/-]{1,200}$'}
+        head: {type: string, pattern: '^[0-9a-f]{40}$'}
+        status_id: {type: [integer, 'null'], minimum: 1}
   is-marked:
     description: >-
       For a pack that reads the pull request's head from GitHub itself. Whether the server recorded a review mark

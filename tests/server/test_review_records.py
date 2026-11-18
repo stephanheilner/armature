@@ -78,8 +78,8 @@ def boom(monkeypatch):
 def test_the_database_only_tools_resolve_no_connection(app, sqlite_engine, run, vendor, boom):
     assert {name for name, spec in registry().items() if spec.kind == NONE} == {
         "review.decisions", "review.record-risk", "review.record-post", "review.record-mark", "review.is-marked",
-        "insights.fix-context", "insights.fix-patch", "insights.fix-risk", "insights.fix-apply", "workflow.handoff",
-        "eval.replay-start", "eval.replay-report"}
+        "review.record-branch-review", "review.record-branch-mark", "insights.fix-context", "insights.fix-patch",
+        "insights.fix-risk", "insights.fix-apply", "workflow.handoff", "eval.replay-start", "eval.replay-report"}
     _risk(app, run)
     _post(app, run)
     assert _mark(app, run)["marked"] is True
@@ -386,6 +386,229 @@ def test_a_record_risk_counts_as_the_re_review_after_a_push(app, sqlite_engine, 
     _risk(app, run, head=NEW)
     with sqlite_engine.connect() as conn:
         assert marks.push_refusal(conn, run.id, to_pr=True) is None
+
+
+# review.record-branch-review and review.record-branch-mark
+
+BRANCH = {"repo": REPO, "branch": "armature/MOB-1", "base": "dev"}
+BLOCK = {"claim": "The lock leaks", "path": "src/a.kt", "raised_by": ["concurrency"], "decision": "block",
+         "reason": "It leaks."}
+COMMENT = {"path": "src/a.kt", "line": 3, "severity": "high", "blocking": True, "body": "It leaks.",
+           "claim": "The lock leaks"}
+
+
+def _branch_risk(app, run, head=HEAD, **params):
+    return _ok(tool(app, run, "record_risk", "review.record-risk",
+                    {**BRANCH, "head": head, "level": "low", "total": 1, "paths": ["src/a.kt"], **params}))
+
+
+def _branch_review(app, run, head=HEAD, verdict="approve", decisions=(), complete=True, **params):
+    return _ok(tool(app, run, "branch_review", "review.record-branch-review",
+                    {**BRANCH, "head": head, "verdict": verdict, "decisions": list(decisions), "complete": complete,
+                     "round": 1, **params}))
+
+
+def _branch_mark(app, run, head=HEAD, status_id=900, **params):
+    return tool(app, run, "branch_mark", "review.record-branch-mark",
+                {**BRANCH, "head": head, "status_id": status_id, **params})
+
+
+def _reviewed(app, run, clock, head=HEAD, **params):
+    _branch_risk(app, run, head=head)
+    clock.advance(seconds=1)
+    return _branch_review(app, run, head=head, **params)
+
+
+def _refused(response, reason):
+    assert response.status_code == 422, response.text
+    assert reason in response.json()["error"]
+
+
+def test_record_risk_rates_a_branch_and_sets_the_runs_head(app, sqlite_engine, run):
+    out = _branch_risk(app, run)
+    assert (out["level"], out["head"]) == ("low", HEAD)
+    stored = _row(sqlite_engine, run.id)
+    assert (stored.risk, stored.head_sha) == ("low", HEAD)
+    [row] = [c for c in calls(sqlite_engine) if c.tool == "review.record-risk"]
+    assert (row.outcome, row.target) == ("ok", f"{REPO.lower()}:armature/MOB-1")
+
+
+@pytest.mark.parametrize("form", [{**PR, "branch": "x", "base": "dev"}, {**PR, "branch": "x"}, {"repo": REPO},
+                                  {"repo": REPO, "branch": "x"}, {"repo": REPO, "base": "dev"}])
+def test_record_risk_takes_exactly_one_of_number_or_branch_and_base(app, sqlite_engine, run, form):
+    response = tool(app, run, "record_risk", "review.record-risk", {**form, "head": HEAD, "level": "low", "total": 0})
+    assert response.status_code == 400, response.text
+    assert _row(sqlite_engine, run.id).head_sha is None
+
+
+def test_the_server_decides_whether_a_branch_review_approved(app, sqlite_engine, run, clock):
+    assert _reviewed(app, run, clock)["approved"] is True
+    for given in ({"verdict": "comment"}, {"decisions": [BLOCK]}, {"decisions": [{**BLOCK, "decision": None}]},
+                  {"complete": False}, {"head": NEW}, {"comments": [COMMENT]}):
+        assert _branch_review(app, run, **given)["approved"] is False, given
+    assert _branch_review(app, run, decisions=[{**BLOCK, "decision": "suggest"}, {**BLOCK, "decision": "drop"}])[
+        "approved"] is True
+    assert _branch_review(app, run, comments=[{**COMMENT, "blocking": False}])["approved"] is True
+    rows = [c for c in calls(sqlite_engine) if c.tool == "review.record-branch-review"]
+    assert {(r.outcome, r.target) for r in rows} == {("ok", f"{REPO.lower()}:armature/MOB-1")}
+    assert rows[0].detail == {"head": HEAD, "branch": "armature/MOB-1", "base": "dev", "round": 1, "complete": True,
+                              "blocking": 0, "approved": True}
+    assert rows[2].detail["blocking"] == 1
+    assert rows[6].detail["blocking"] == 1
+
+
+def test_a_branch_review_comment_must_say_whether_it_blocks(app, run):
+    unsaid = {key: value for key, value in COMMENT.items() if key != "blocking"}
+    for comments in ([unsaid], [{**COMMENT, "blocking": "false"}]):
+        response = tool(app, run, "branch_review", "review.record-branch-review",
+                        {**BRANCH, "head": HEAD, "verdict": "approve", "decisions": [], "complete": True, "round": 1,
+                         "comments": comments})
+        assert response.status_code == 400, response.text
+
+
+def test_a_branch_review_needs_a_rated_head(app, run):
+    assert _branch_review(app, run)["approved"] is False
+
+
+def test_an_approved_branch_head_gets_a_mark_with_no_pull_request(app, sqlite_engine, world, run, clock):
+    _reviewed(app, run, clock)
+    assert _ok(_branch_mark(app, run)) == {"marked": True, "head": HEAD, "check_run_id": 900}
+    [mark] = _marks(sqlite_engine)
+    assert (mark.project_id, mark.repo, mark.pr_number, mark.head_sha, mark.run_id, mark.check_run_id, mark.app_id,
+            mark.conclusion) == (world.project, REPO.lower(), None, HEAD, run.id, 900, None, "success")
+    assert _row(sqlite_engine, run.id).outcome is None
+
+
+def test_a_branch_mark_takes_no_status_id(app, sqlite_engine, run, clock):
+    _reviewed(app, run, clock)
+    assert _ok(_branch_mark(app, run, status_id=None))["check_run_id"] is None
+    assert _ok(_branch_mark(app, run, status_id=901))["check_run_id"] == 901
+
+
+def test_a_branch_mark_needs_a_rated_head(app, sqlite_engine, run):
+    _branch_review(app, run)
+    _refused(_branch_mark(app, run), "the run has no rated head")
+    assert _marks(sqlite_engine) == []
+
+
+def test_a_branch_mark_refuses_a_head_other_than_the_rated_one(app, sqlite_engine, run, clock):
+    _reviewed(app, run, clock)
+    _refused(_branch_mark(app, run, head=NEW), "this run rated aaaaaaaaaaaa, not bbbbbbbbbbbb")
+    assert _marks(sqlite_engine) == []
+
+
+def test_a_branch_mark_refuses_a_head_that_isnt_a_full_sha(app, sqlite_engine, run, clock):
+    _reviewed(app, run, clock)
+    assert _branch_mark(app, run, head=HEAD[:12]).status_code == 400
+    assert _marks(sqlite_engine) == []
+
+
+def test_an_approval_of_an_earlier_head_never_marks_a_later_one(app, sqlite_engine, run, clock):
+    _reviewed(app, run, clock, head=NEW)
+    clock.advance(seconds=1)
+    _branch_risk(app, run, head=HEAD)
+    _refused(_branch_mark(app, run), "recorded no approving review of aaaaaaaaaaaa against dev")
+    assert _marks(sqlite_engine) == []
+
+
+def test_a_branch_review_older_than_the_latest_rating_never_marks(app, sqlite_engine, run, clock):
+    _reviewed(app, run, clock)
+    clock.advance(seconds=1)
+    _branch_risk(app, run)
+    _refused(_branch_mark(app, run), "rated its head again after its last branch review")
+    assert _marks(sqlite_engine) == []
+
+
+def test_a_branch_review_at_the_same_moment_as_its_rating_never_marks(app, sqlite_engine, run):
+    _branch_risk(app, run)
+    _branch_review(app, run)
+    _refused(_branch_mark(app, run), "rated its head again after its last branch review")
+
+
+@pytest.mark.parametrize("given", [{"verdict": "comment"}, {"decisions": [BLOCK]}, {"complete": False},
+                                   {"comments": [COMMENT]}])
+def test_a_branch_review_that_didnt_approve_never_marks(app, sqlite_engine, run, clock, given):
+    _reviewed(app, run, clock, **given)
+    _refused(_branch_mark(app, run), "recorded no approving review")
+    assert _marks(sqlite_engine) == []
+
+
+def test_only_the_last_branch_review_counts(app, sqlite_engine, run, clock):
+    _reviewed(app, run, clock)
+    clock.advance(seconds=1)
+    _branch_review(app, run, verdict="comment")
+    _refused(_branch_mark(app, run), "recorded no approving review")
+    assert _marks(sqlite_engine) == []
+
+
+@pytest.mark.parametrize("given", [{"base": "main"}, {"branch": "armature/MOB-2"}])
+def test_a_branch_mark_needs_a_review_of_the_same_branch_and_base(app, sqlite_engine, run, clock, given):
+    _reviewed(app, run, clock)
+    _refused(_branch_mark(app, run, **given), "recorded no approving review")
+    assert _marks(sqlite_engine) == []
+
+
+def test_another_runs_branch_review_never_marks(app, sqlite_engine, keyring, clock, world, run):
+    _branch_risk(app, run)
+    other = start_run(sqlite_engine, keyring, clock, world, risk=None)
+    _reviewed(app, other, clock)
+    _refused(_branch_mark(app, run), "recorded no approving review")
+    assert _marks(sqlite_engine) == []
+
+
+def test_a_second_branch_mark_of_the_same_head_is_idempotent(app, sqlite_engine, run, clock):
+    _reviewed(app, run, clock)
+    assert _ok(_branch_mark(app, run))["check_run_id"] == 900
+    assert _ok(_branch_mark(app, run)) == {"marked": True, "head": HEAD, "check_run_id": 900}
+    assert _ok(_branch_mark(app, run, status_id=800))["check_run_id"] == 900
+    assert _ok(_branch_mark(app, run, status_id=None))["check_run_id"] == 900
+    assert [(m.check_run_id, m.pr_number) for m in _marks(sqlite_engine)] == [(900, None)]
+
+
+def test_a_branch_mark_never_overwrites_an_app_check_runs_mark(app, sqlite_engine, world, run, clock):
+    _reviewed(app, run, clock)
+    with sqlite_engine.begin() as conn:
+        conn.execute(insert(review_marks).values(id=new_id(), team_id=world.team, project_id=world.project,
+                                                 repo=REPO.lower(), pr_number=NUMBER, head_sha=HEAD, run_id=run.id,
+                                                 conclusion="success", check_run_id=5, app_id=4242,
+                                                 created_at=clock()))
+    assert _ok(_branch_mark(app, run))["check_run_id"] == 5
+    assert [(m.check_run_id, m.app_id, m.pr_number) for m in _marks(sqlite_engine)] == [(5, 4242, NUMBER)]
+
+
+def test_a_branch_mark_another_run_inserted_first_is_updated_cleanly(app, sqlite_engine, world, run, clock,
+                                                                      monkeypatch):
+    _reviewed(app, run, clock)
+    with sqlite_engine.begin() as conn:
+        conn.execute(insert(review_marks).values(id=new_id(), team_id=world.team, project_id=world.project,
+                                                 repo=REPO.lower(), pr_number=NUMBER, head_sha=HEAD, run_id=run.id,
+                                                 conclusion="success", check_run_id=5, created_at=clock()))
+    real, seen = marks.mark_of, []
+
+    def stale(conn, project_id, head):
+        seen.append(head)
+        return None if len(seen) == 1 else real(conn, project_id, head)
+    monkeypatch.setattr(marks, "mark_of", stale)
+    assert _ok(_branch_mark(app, run))["marked"] is True
+    assert [(m.check_run_id, m.pr_number) for m in _marks(sqlite_engine)] == [(900, None)]
+
+
+def test_a_dry_run_records_a_branch_mark_without_writing_one(app, sqlite_engine, keyring, clock, world):
+    run = start_run(sqlite_engine, keyring, clock, world, trigger_ref={"dry_run": True}, risk=None)
+    _reviewed(app, run, clock)
+    assert _ok(_branch_mark(app, run))["dry_run"] is True
+    assert _marks(sqlite_engine) == []
+
+
+def test_a_pull_request_with_a_branch_marked_head_is_marked(app, sqlite_engine, keyring, clock, world, run):
+    _reviewed(app, run, clock)
+    _ok(_branch_mark(app, run))
+    review = start_run(sqlite_engine, keyring, clock, world, risk=None)
+    assert _is_marked(app, review) == {"valid": True, "head": HEAD}
+    pr_mode = start_run(sqlite_engine, keyring, clock, world, risk=None)
+    assert _ok(tool(app, pr_mode, "marked", "review.marked", PR)) == {"valid": True, "head": HEAD,
+                                                                       "source": "database"}
+    assert _row(sqlite_engine, pr_mode.id).outcome == "noop"
 
 
 # review.is-marked

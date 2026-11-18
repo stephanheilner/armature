@@ -101,6 +101,9 @@ def registry() -> dict[str, Tool]:
         "review.record-risk": Tool(NONE, marks.record_risk, reads=True),
         "review.record-post": Tool(NONE, marks.record_post),
         "review.record-mark": Tool(NONE, marks.record_mark),
+        # A branch reviewed before its pull request exists. The server decides the approval and checks it to mark.
+        "review.record-branch-review": Tool(NONE, marks.record_branch_review),
+        "review.record-branch-mark": Tool(NONE, marks.record_branch_mark),
         "review.is-marked": Tool(NONE, marks.is_marked, reads=True),
         # Queues another stored workflow in the caller's own project, as a trigger would.
         "workflow.handoff": Tool(NONE, handoff.handoff),

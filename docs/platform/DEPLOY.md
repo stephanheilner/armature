@@ -279,7 +279,8 @@ Other options:
   Runners page and each run's location chip show "same user".
   `--capability claude-code` or `codex` needs `--job-user` and
   `--agent-user`, or `--same-user`, and the server's own worker never runs
-  agent jobs. A workflow with an `agent:` stage pushes only from a runner
+  agent jobs. A workflow with an `agent:` stage pushes, or records and marks
+  a branch review, only from a runner
   with `--agent-user`, or from a runner that registered with `--same-user`
   and still holds the run's job. The server checks what the runner reported
   when it connected, never what the run says about itself.

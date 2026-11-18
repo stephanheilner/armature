@@ -31,7 +31,8 @@ STEPS = {"review": "github/post-review", "comment": "github/pr-comment", "check"
          "decisions": "review/decisions", "pushable": "review/pushable", "create": "jira/create",
          "read": "jira/get-issue", "permission": "github/permission", "diff": "github/pr-diff",
          "context": "review/context", "record_risk": "review/record-risk", "record_post": "review/record-post",
-         "record_mark": "review/record-mark", "is_marked": "review/is-marked", "plain": "local/thing"}
+         "record_mark": "review/record-mark", "is_marked": "review/is-marked", "plain": "local/thing",
+         "branch_review": "review/record-branch-review", "branch_mark": "review/record-branch-mark"}
 BODY = "name: tools\nstages:\n" + "".join(f"  - id: {step}\n    adapter: {ref}\n" for step, ref in STEPS.items())
 
 

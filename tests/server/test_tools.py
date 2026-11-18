@@ -826,6 +826,37 @@ def test_the_runner_holding_the_job_must_have_registered_same_user_for_a_push(ap
     assert ask_grant(app, run, "push").status_code == 403
 
 
+def test_a_branch_review_and_mark_need_a_separate_agent_user_or_an_instance_same_user_runner(app, sqlite_engine,
+                                                                                              keyring, clock, world):
+    from armature.server import defs
+    from armature.server.db.schema import runner_keys, runners
+    body = ("name: tools\nstages:\n  - id: fix\n    agent: {model: sonnet, prompt: Fix it., access: write}\n"
+            "  - id: branch_review\n    adapter: review/record-branch-review\n"
+            "  - id: branch_mark\n    adapter: review/record-branch-mark\n")
+    with sqlite_engine.begin() as conn:
+        defs._add_version(conn, defs.WORKFLOW, world.workflow, 2, body, "agent", None, clock())
+        conn.execute(insert(runner_keys).values(id="k0", team_id=None, name="host", key_hmac="h0",
+                                                created_at=clock()))
+        conn.execute(insert(runner_keys).values(id="k1", team_id=world.team, scope=world.team, name="mac",
+                                                key_hmac="h1", created_at=clock()))
+        for runner_id, key in (("mine", "k0"), ("team", "k1")):
+            conn.execute(insert(runners).values(id=runner_id, runner_key_id=key, name=runner_id,
+                                                platform={"kind": "local", "same_user": True}, created_at=clock(),
+                                                last_seen_at=clock()))
+    run = start_run(sqlite_engine, keyring, clock, world, version=2)
+
+    def held_by(runner_id):
+        with sqlite_engine.begin() as conn:
+            conn.execute(update(jobs).where(jobs.c.id == run.job).values(runner_id=runner_id, status="running"))
+    for step in ("branch_review", "branch_mark"):
+        held_by("team")
+        refused = ask_grant(app, run, step)
+        assert refused.status_code == 403 and "separate agent user" in refused.json()["error"]
+        assert ask_grant(app, run, step, agent_user=True).status_code == 200
+        held_by("mine")
+        assert ask_grant(app, run, step).status_code == 200
+
+
 def _credential(app, token, access, path=f"/{REPO}.git", host="github.com"):
     return app.post("/api/tools/git-credential", json={"access": access, "host": host, "path": path},
                     headers={"Authorization": f"Bearer {token}"})
@@ -1026,6 +1057,11 @@ ARM_ANSWERED = [
     ("record_post", "review.record-post", {"repo": REPO, "number": NUMBER, "head": HEAD, "posted": True,
                                            "approved": True}),
     ("record_mark", "review.record-mark", {"repo": REPO, "number": NUMBER, "head": HEAD, "status_id": 900}),
+    ("branch_review", "review.record-branch-review", {"repo": REPO, "branch": "armature/MOB-1", "base": "dev",
+                                                      "head": HEAD, "verdict": "approve", "decisions": [],
+                                                      "complete": True, "round": 1}),
+    ("branch_mark", "review.record-branch-mark", {"repo": REPO, "branch": "armature/MOB-1", "base": "dev",
+                                                  "head": HEAD, "status_id": 900}),
 ]
 
 

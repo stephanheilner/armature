@@ -224,10 +224,15 @@ def _status(vendor, login=GH_LOGIN, state="success", head=HEAD, context="Armatur
 
 
 def test_a_gh_cli_status_counts_only_from_its_own_login_when_review_mark_made_it(app, sqlite_engine, world, vendor,
-                                                                                    run, gh_cli):
+                                                                                    run, gh_cli, monkeypatch):
+    from armature.server.tools import marks
+    # Without the database's own match, as when another run's mark lands between the two reads.
+    monkeypatch.setattr(marks, "mark_of", lambda conn, project_id, head: None)
     ours = _status(vendor)
     assert _marked(app, run)["valid"] is False
     _mark_row(sqlite_engine, world, head=NEW, check_run_id=ours)
+    assert _marked(app, run)["valid"] is False
+    _mark_row(sqlite_engine, world, check_run_id=ours)
     assert _marked(app, run)["source"] == "check"
     _status(vendor, login="someone-else", state="failure")
     assert _marked(app, run)["source"] == "check"
@@ -259,7 +264,8 @@ def _mark(app, run):
 
 
 def test_a_gh_cli_mark_is_a_status_from_its_login_that_reads_back(app, sqlite_engine, vendor, world, run, clock,
-                                                                   gh_cli):
+                                                                   gh_cli, monkeypatch):
+    from armature.server.tools import marks
     _risk(app, run)
     _post(app, run)
     clock.advance(seconds=1)
@@ -271,9 +277,11 @@ def test_a_gh_cli_mark_is_a_status_from_its_login_that_reads_back(app, sqlite_en
     with sqlite_engine.connect() as conn:
         mark = conn.execute(select(review_marks)).one()
     assert (mark.check_run_id, mark.app_id) == (status["id"], None)
+    monkeypatch.setattr(marks, "mark_of", lambda conn, project_id, head: None)
+    assert _marked(app, run)["source"] == "check"
     with sqlite_engine.begin() as conn:
         conn.execute(update(review_marks).values(head_sha=NEW))
-    assert _marked(app, run)["source"] == "check"
+    assert _marked(app, run)["valid"] is False
 
 
 def test_an_approved_head_is_marked_with_a_check_and_a_row(app, sqlite_engine, vendor, world, run, clock):
