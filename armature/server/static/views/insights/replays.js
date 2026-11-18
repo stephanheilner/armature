@@ -7,8 +7,8 @@ import { emptyLine, emptyState, events, filters, section, select, skeletonRows }
 
 export const QUESTION = 'How does another model review compared with Claude?';
 const LIST = '/api/insights/replays';
-const GITHUB_PR = /^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)#([1-9][0-9]{0,9})$/;
-const SHA = /^[0-9a-f]{40}$/;
+const GITHUB_PR = /^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pull\/[0-9]{1,10}$/;
+const GITHUB_FILE = /^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/blob\/[0-9a-f]{40}\/[A-Za-z0-9_.~%\/-]+(#L[1-9][0-9]*)?$/;
 const SEVERITIES = ['high', 'medium', 'low'];
 const VERDICTS = { valid: ['Judged valid', 'ok'], not_valid: ['Judged not valid', 'bad'], not_judged: ['Not judged', ''] };
 const DECISIONS = { block: 'Lead: block', suggest: 'Lead: suggest', drop: 'Lead: drop', fixed: 'Lead: fixed' };
@@ -21,17 +21,15 @@ const minutes = (value) => (Number.isFinite(value) ? `${fixed(value, 1)} min` : 
 const per = (amount, rounds) => (Number.isFinite(amount) && rounds ? amount / rounds : null);
 const named = (alias) => (alias ? alias.charAt(0).toUpperCase() + alias.slice(1) : 'Replay');
 
-export function prHref(subject) {
-  const found = GITHUB_PR.exec(String(subject || ''));
-  return found ? `https://github.com/${found[1]}/pull/${found[2]}` : null;
+// The server builds and checks every link. These checks only refuse anything that isn't one.
+export function prHref(pr) {
+  const { url } = obj(pr);
+  return typeof url === 'string' && GITHUB_PR.test(url) ? url : null;
 }
 
-// Only a checked repository, commit, and path make a link, as the HTML report builds it.
-export function fileHref(subject, head, path, line) {
-  const found = GITHUB_PR.exec(String(subject || ''));
-  if (!found || typeof head !== 'string' || !SHA.test(head) || typeof path !== 'string' || !path || path.startsWith('/') || path.split('/').includes('..')) return null;
-  const anchor = Number.isInteger(line) && line > 0 ? `#L${line}` : '';
-  return `https://github.com/${found[1]}/blob/${head}/${path.split('/').map(encodeURIComponent).join('/')}${anchor}`;
+export function fileHref(found) {
+  const { url } = obj(found);
+  return typeof url === 'string' && GITHUB_FILE.test(url) && !url.split('#')[0].split('/').includes('..') ? url : null;
 }
 
 const badge = (text, tone = '') => element('span', { class: `rp-badge${tone ? ` is-${tone}` : ''}` }, text);
@@ -46,7 +44,7 @@ export function card(found, { side, subject, head, oneSided, alias }) {
   if (oneSided && VERDICTS[found.verdict]) badges.push(badge(...VERDICTS[found.verdict]));
   if (side === 'claude' && found.fixed) badges.push(badge('Fixed by author', 'accent'));
   const where = `${found.path || '(no file)'}${Number.isInteger(found.line) ? `:${found.line}` : ''}`;
-  const href = fileHref(subject, head, found.path, found.line);
+  const href = fileHref(found);
   const body = typeof found.body === 'string' && found.body && found.body !== found.claim
     ? element('details', {}, element('summary', { class: 'rp-more' }, 'Details'), element('p', { class: 'rp-body' }, found.body)) : null;
   return element('div', { class: 'rp-card' },
@@ -107,7 +105,7 @@ function prTable(prs, alias) {
   const head = ['Pull request', 'Rounds', 'Both', 'Claude only', `${alias} only`, `Fixed, ${alias} missed`, `${alias} only, valid`, 'Verdicts agree', `Cost, ${alias} vs Claude`];
   const rows = prs.map((pr) => {
     const t = obj(pr.totals);
-    const href = prHref(pr.subject);
+    const href = prHref(pr);
     return element('tr', {},
       element('td', {}, href ? element('a', { class: 'in-link', href }, pr.subject) : pr.subject || 'Unknown'),
       [count(t.rounds), total(t.both), total(t.claude_only), total(t.kimi_only), count(t.fixed_missed), count(t.kimi_only_valid),
@@ -127,7 +125,7 @@ export function draw(found) {
   return [
     tiles(obj(data.totals), skipped.length, alias),
     section({ title: 'Pull requests', takeaway: 'Counts of the lead’s findings on each side.' }, prTable(prs, alias)),
-    ...prs.map((pr) => section({ title: pr.subject || 'Unknown pull request', link: prHref(pr.subject) ? element('a', { class: 'in-link', href: prHref(pr.subject) }, 'On GitHub') : null },
+    ...prs.map((pr) => section({ title: pr.subject || 'Unknown pull request', link: prHref(pr) ? element('a', { class: 'in-link', href: prHref(pr) }, 'On GitHub') : null },
       list(pr.rounds).filter((entry) => entry && typeof entry === 'object').map((entry) => round({ ...entry, subject: entry.subject || pr.subject }, alias)))),
     section({ title: 'Skipped rounds', count: skipped.length || null }, skipped.length
       ? events(skipped.map((row) => [`${row.subject || 'Unknown'} round ${row.round ?? '?'}`, row.reason || 'No reason recorded.']))

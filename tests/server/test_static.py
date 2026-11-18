@@ -180,6 +180,8 @@ CONTRACT = [
     "GET /api/teams/{id}/insights/models/experiments",
     "GET /api/insights/daily-reports",
     "GET /api/insights/daily-reports/{day}",
+    "GET /api/insights/replays",
+    "GET /api/insights/replays/{experiment_id}",
     "POST /api/teams/{id}/insights/models/experiments",
     "POST /api/teams/{id}/insights/models/experiments/{eid}/{action}",
     "POST /api/teams/{id}/repos",

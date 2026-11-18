@@ -2033,3 +2033,17 @@ def test_the_judge_budget_counts_what_judging_cost_in_earlier_compares(sqlite_en
                                                               "kimi"), NOW)
     assert len(model.calls) == 2 and "budget ran out" in last["judge"]["stopped"]
     assert last["judge"]["total_cost_usd"] == 0.06
+
+
+def test_the_admin_view_gets_links_the_server_built_and_none_for_a_hostile_path():
+    from armature.server.insights import replay
+    head = "a" * 40
+    linked = replay._linked({"prs": [{"subject": "acme/app#7", "rounds": [{"head": head, "findings": {
+        "pairs": [{"claude": {"path": "src/A.kt", "line": 4}, "kimi": {"path": "src/A.kt", "line": 5}}],
+        "claude_only": [{"path": '../etc/passwd" x="', "line": 1}], "kimi_only": [{"path": "src/B.kt", "line": None}]}}]}]})
+    pr = linked["prs"][0]
+    found = pr["rounds"][0]["findings"]
+    assert pr["url"] == "https://github.com/acme/app/pull/7"
+    assert found["pairs"][0]["claude"]["url"] == f"https://github.com/acme/app/blob/{head}/src/A.kt#L4"
+    assert found["claude_only"][0]["url"] is None
+    assert found["kimi_only"][0]["url"] == f"https://github.com/acme/app/blob/{head}/src/B.kt"

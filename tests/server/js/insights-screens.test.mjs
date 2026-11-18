@@ -448,14 +448,14 @@ const REPLAY = {
     version: 2, alias: 'kimi', compared_at: '2026-11-18T10:00:00+00:00',
     totals: { rounds: 1, both: { total: 1 }, claude_only: { total: 1 }, kimi_only: { total: 1 }, fixed: 1, fixed_missed: 1, kimi_only_valid: 1, verdict_agrees: 0,
       claude_run: { cost_usd: 6, minutes: 20 }, kimi_run: { cost_usd: 1.5, minutes: 30 } },
-    prs: [{ subject: 'acme/app#12', totals: { rounds: 1, both: { total: 1 }, claude_only: { total: 1 }, kimi_only: { total: 1 } }, rounds: [{
+    prs: [{ subject: 'acme/app#12', url: 'https://github.com/acme/app/pull/12', totals: { rounds: 1, both: { total: 1 }, claude_only: { total: 1 }, kimi_only: { total: 1 } }, rounds: [{
       subject: 'acme/app#12', round: 2, head: 'a'.repeat(40), verdict: { claude: 'comment', kimi: 'approve' }, rate: { kimi: 'high', risk: 'medium' },
       both: { total: 1 }, claude_only: { total: 1 }, kimi_only: { total: 1 },
       claude_run: { cost_usd: 6, input_tokens: 1000, output_tokens: 200, minutes: 20 }, kimi_run: { cost_usd: 1.5, input_tokens: 900, output_tokens: 100, minutes: 30 },
       findings: {
-        pairs: [{ claude: { path: 'src/A.kt', line: 4, severity: 'high', blocking: true, decision: 'block', claim: 'The lock leaks.', body: 'Longer text.', fixed: false },
+        pairs: [{ claude: { path: 'src/A.kt', line: 4, severity: 'high', blocking: true, decision: 'block', claim: 'The lock leaks.', body: 'Longer text.', fixed: false, url: `https://github.com/acme/app/blob/${'a'.repeat(40)}/src/A.kt#L4` },
           kimi: { path: 'src/A.kt', line: 5, severity: 'medium', blocking: false, decision: 'drop', claim: 'Lock never released.', body: 'Lock never released.' } }],
-        claude_only: [{ path: '../etc/passwd', line: 1, severity: 'low', decision: 'suggest', claim: HOSTILE, body: HOSTILE, fixed: true, verdict: 'valid' }],
+        claude_only: [{ path: '../etc/passwd', line: 1, severity: 'low', decision: 'suggest', claim: HOSTILE, body: HOSTILE, fixed: true, verdict: 'valid', url: `https://github.com/acme/app/blob/${'a'.repeat(40)}/../etc/passwd#L1` }],
         kimi_only: [{ path: 'src/D.kt', line: 9, severity: 'high', blocking: true, decision: 'block', claim: 'Network on the UI thread.', verdict: 'not_judged' }],
       },
     }] }],
@@ -503,7 +503,9 @@ test('a replay report from before side-by-side findings still shows its counts',
   const text = words(holder);
   assert.ok(text.includes('This report predates side-by-side findings. Rebuild it to see them.'));
   assert.ok(text.includes('Found by both') && text.includes('—'));
-  assert.equal(replaysScreen.fileHref('acme/app#1', 'b'.repeat(40), 'a/../b', 1), null);
-  assert.equal(replaysScreen.fileHref('acme/app#1', 'not-a-sha', 'a.kt', 1), null);
+  assert.equal(replaysScreen.fileHref({ url: `https://github.com/acme/app/blob/${'b'.repeat(40)}/a/../b#L1` }), null);
+  assert.equal(replaysScreen.fileHref({ url: 'https://github.com/acme/app/blob/not-a-sha/a.kt#L1' }), null);
+  assert.equal(replaysScreen.fileHref({ url: `https://github.com.evil.test/acme/app/blob/${'b'.repeat(40)}/a.kt` }), null);
+  assert.equal(replaysScreen.prHref({ url: 'javascript:alert(1)' }), null);
   assert.equal(replaysScreen.answer({ report: null, arms: { running: 2 } }), '2 replays still running.');
 });

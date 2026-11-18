@@ -63,6 +63,7 @@ from armature.server.insights import (
     replay_html,
     report_file,
 )
+from armature.server.insights.report import pr_link
 from armature.server.tools import Call, ToolError, marks, review
 from armature.spec.models import AGENT_HARNESSES, Stage
 
@@ -550,7 +551,38 @@ def shown(conn: Connection, experiment_id: str) -> dict[str, Any] | None:
         return None
     stored = conn.execute(select(eval_experiments.c.report).where(eval_experiments.c.id == experiment_id)).scalar()
     report_data = {k: v for k, v in (stored or {}).items() if k != "judgments"}
-    return {**found, "report": report_data if report_data.get("compared_at") else None}
+    if not report_data.get("compared_at"):
+        return {**found, "report": None}
+    return {**found, "report": _linked(report_data)}
+
+
+def _linked(report_data: dict[str, Any]) -> dict[str, Any]:
+    """The report with GitHub links the server built and checked, because static files carry no external URLs."""
+    def card(found: Any, subject: Any, head: Any) -> Any:
+        if not isinstance(found, dict):
+            return found
+        return {**found, "url": replay_html.file_link(subject, head, found.get("path"), found.get("line"))}
+
+    def entry(row: Any, subject: Any) -> Any:
+        if not isinstance(row, dict) or not isinstance(row.get("findings"), dict):
+            return row
+        head, found = row.get("head"), row["findings"]
+        return {**row, "findings": {
+            **found,
+            "pairs": [{**pair, "claude": card(pair.get("claude"), subject, head),
+                       "kimi": card(pair.get("kimi"), subject, head)} if isinstance(pair, dict) else pair
+                      for pair in found.get("pairs") or []],
+            "claude_only": [card(f, subject, head) for f in found.get("claude_only") or []],
+            "kimi_only": [card(f, subject, head) for f in found.get("kimi_only") or []]}}
+
+    prs = []
+    for pr in report_data.get("prs") or []:
+        if not isinstance(pr, dict):
+            continue
+        subject = pr.get("subject")
+        prs.append({**pr, "url": (pr_link(subject if isinstance(subject, str) else None) or {}).get("url"),
+                    "rounds": [entry(row, subject) for row in pr.get("rounds") or []]})
+    return {**report_data, "prs": prs}
 
 
 # Comparing
