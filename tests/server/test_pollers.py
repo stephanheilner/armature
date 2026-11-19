@@ -157,6 +157,7 @@ def test_first_poll_seeds_then_each_new_key_queues_once_ever(sqlite_engine, keyr
     assert _run(sqlite_engine, keyring, clock, trigger, jira)["new_keys"] == ["ENG-3"]
     [job] = _jobs(sqlite_engine)
     assert job.inputs == {"issue": "ENG-3"} and job.trigger_id == trigger.id and job.status == "queued"
+    assert job.thread == "ENG-3"
     seen = _seen(sqlite_engine, trigger.id)
     assert seen["ENG-3"].outcome == "queued" and seen["ENG-3"].job_id == job.id
     assert seen["ENG-1"].last_seen_at == clock() and seen["ENG-1"].first_seen_at < clock()
@@ -247,7 +248,8 @@ def test_linear_polls_a_team_filter(sqlite_engine, keyring, clock, world, jira):
                                            "state": {"type": {"in": ["unstarted", "started"]}},
                                            "assignee": {"isMe": {"eq": True}}}
     assert jira.requests[0].headers["authorization"] == "lin_key"
-    assert _jobs(sqlite_engine)[0].inputs == {"issue": "ENG-12"}
+    [job] = _jobs(sqlite_engine)
+    assert job.inputs == {"issue": "ENG-12"} and job.thread == "ENG-12"
 
 
 @pytest.mark.parametrize(("expr", "after", "expected"), [
@@ -280,7 +282,7 @@ def test_a_schedule_fires_once_after_missed_runs(sqlite_engine, keyring, clock, 
     result = pollers.run(sqlite_engine, keyring, trigger.id, now=clock(), due=due)
     assert result["status"] == "ok"
     [job] = _jobs(sqlite_engine)
-    assert job.inputs == {"mode": "daily"}
+    assert job.inputs == {"mode": "daily"} and job.thread is None
     assert [(p.status, p.error) for p in _polls(sqlite_engine, trigger.id)] == [("skipped", pollers.MISSED),
                                                                                  ("ok", None)]
     assert _state(sqlite_engine, trigger.id).next_run_at == datetime(2026, 10, 27, 12, 30, tzinfo=UTC)
@@ -435,7 +437,7 @@ def test_queue_it_anyway_requeues_a_seen_key_and_is_audited(sqlite_engine, keyri
     response = _post(lead, f"/api/triggers/{trigger.id}/requeue", {"key": "ENG-1"})
     assert response.status_code == 200, response.text
     [job] = _jobs(sqlite_engine)
-    assert response.json()["job_id"] == job.id and job.inputs == {"issue": "ENG-1"}
+    assert response.json()["job_id"] == job.id and job.inputs == {"issue": "ENG-1"} and job.thread == "ENG-1"
     seen = _seen(sqlite_engine, trigger.id)["ENG-1"]
     assert seen.outcome == "queued" and seen.job_id == job.id
     clock.advance(seconds=11)

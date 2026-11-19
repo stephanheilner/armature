@@ -41,6 +41,7 @@ from armature.server.db.schema import (
 )
 from armature.server.db.schema import residents as resident_rows
 from armature.server.defs import detach_triggers
+from armature.server.threads import THREAD
 from armature.server.vendors import Item, VendorError, jira, linear
 
 log = logging.getLogger(__name__)
@@ -271,10 +272,11 @@ def fetch(keyring: Keyring, connection: Any, trigger: Any, *, only: str | None =
 
 
 def _queue(conn: Connection, trigger: Any, project_id: str | None, payload: Any, now: datetime,
-           **concurrency: Any) -> str:
+           thread: str | None = None, **concurrency: Any) -> str:
     return worker.queue_job(conn, team_id=trigger.team_id, project_id=project_id, workflow_id=trigger.workflow_id,
                             inputs=webhooks.map_inputs((trigger.config or {}).get("inputs", {}), payload), now=now,
-                            trigger_id=trigger.id, **concurrency)
+                            trigger_id=trigger.id, thread=thread if thread and THREAD.fullmatch(thread) else None,
+                            **concurrency)
 
 
 def _mark(conn: Connection, trigger_id: str, key: str, outcome: str, now: datetime) -> bool:
@@ -297,7 +299,7 @@ def _take(engine: Engine, trigger: Any, project_id: str | None, item: Item, now:
         if shadow:
             return "shadow", ""
         try:
-            job_id = _queue(conn, trigger, project_id, item.fields, now)
+            job_id = _queue(conn, trigger, project_id, item.fields, now, item.key)
         except ValueError as exc:
             conn.execute(update(trigger_seen).where(trigger_seen.c.trigger_id == trigger.id,
                                                     trigger_seen.c.item_key == item.key).values(outcome="skipped"))
@@ -907,7 +909,7 @@ def requeue(engine: Engine, keyring: Keyring, row: Any, *, key: Any, actor_id: s
         if seen is None:
             raise TriggerError(409, f"{key} hasn't been seen. The next poll picks it up if the query returns it.")
         try:
-            job_id = _queue(conn, row, project_of(conn, row, connection), payload, now)
+            job_id = _queue(conn, row, project_of(conn, row, connection), payload, now, key)
         except ValueError as exc:
             raise TriggerError(409, f"A workflow it calls doesn't resolve: {exc}") from exc
         conn.execute(update(trigger_seen).where(trigger_seen.c.trigger_id == row.id, trigger_seen.c.item_key == key)
