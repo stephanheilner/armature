@@ -21,13 +21,13 @@ export function watchText(watch) {
   return `Next: ${watch.workflow_label || watch.workflow} checks ${SOURCES[watch.source] || watch.source} ${every}${next ? ` (next check ${next})` : ''}.`;
 }
 
-// What follows the newest run: the pollers that may still pick the issue up, else why the chain stopped.
+// What follows the newest run: pollers that may still pick the issue up, else the reason it reported for stopping.
 export function nextLines(detail) {
   const last = (detail?.runs || []).at(-1);
   if (!last || ACTIVE.has(last.status)) return [];
   const watching = detail.watching || [];
   if (watching.length) return watching.map(watchText);
-  const reason = [last.verdict, last.title].filter(Boolean).join(': ');
+  const reason = [last.verdict, last.fields?.reason || last.title].filter(Boolean).join(': ').replace(/[.\s]+$/, '');
   return [`Stopped: ${reason || `${last.workflow_label || last.workflow || 'the last run'} ${statusText(last.status).toLowerCase()}`}.`];
 }
 

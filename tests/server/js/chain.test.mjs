@@ -65,6 +65,8 @@ test('the newest finished run says which poller is next, else why the chain stop
   assert.equal(watchText({ workflow: 'ship', source: 'linear', interval_minutes: 1, next_poll_at: null }), 'Next: ship checks Linear every minute.');
   assert.deepEqual(nextLines({ runs: chain, watching: [] }), ['Stopped: blocked: Unreserve does nothing.']);
   assert.deepEqual(nextLines({ runs: [step(1, 'bug-triage', 'failed')] }), ['Stopped: bug-triage failed.']);
+  const reasoned = step(4, 'development', 'succeeded', { verdict: 'blocked', title: 'Unreserve does nothing', fields: { reason: 'Nothing changed: no skills in the VM.' } });
+  assert.deepEqual(nextLines({ runs: [...chain.slice(0, 3), reasoned], watching: [] }), ['Stopped: blocked: Nothing changed: no skills in the VM.']);
   assert.deepEqual(nextLines({ runs: [...chain.slice(0, 3), step(4, 'development', 'running')], watching: [fixWatch] }), []);
   assert.deepEqual(nextLines({ runs: [] }), []);
 });
