@@ -1264,3 +1264,66 @@ def test_0037_adds_the_replay_report_and_downgrade_drops_it(db_url):
             assert conn.execute(text("SELECT id FROM eval_experiments")).scalars().all() == [experiment_id]
     finally:
         engine.dispose()
+
+
+def test_0038_threads_issue_runs_and_their_handoffs_and_leaves_the_rest(db_url):
+    from alembic import command
+
+    from armature.server.db import alembic_config
+    from armature.server.db.schema import jobs
+    migrate(db_url, "0037")
+    team, workflow = new_id(), new_id()
+    ids = {name: new_id() for name in ("triage", "approve", "fix", "grandchild", "linear", "threaded", "child",
+                                       "bad_key", "orphan", "review", "loose")}
+    seeded = [("triage", "jira", {"trigger_id": "t1", "issue": "MEM-9"}, None),
+              ("approve", "handoff", {"run_id": ids["triage"], "step": "handoff"}, None),
+              ("grandchild", "handoff", {"run_id": ids["approve"], "step": "next"}, None),
+              ("fix", "jira", {"trigger_id": "t2", "issue": "MEM-9"}, None),
+              ("linear", "linear", {"trigger_id": "t3", "issue": "ENG-4"}, None),
+              ("threaded", "jira", {"issue": "MEM-1"}, "slack:C1:1700.1"),
+              ("child", "handoff", {"run_id": ids["threaded"], "step": "handoff"}, None),
+              ("bad_key", "jira", {"issue": "mem 2"}, None),
+              ("orphan", "handoff", {"run_id": new_id(), "step": "handoff"}, None),
+              ("review", "webhook", {"issue": "MEM-9"}, None),
+              ("loose", None, None, None)]
+    job_of = {name: new_id() for name in ("approve", "review")}
+    engine = make_engine(db_url)
+    try:
+        with engine.begin() as conn:
+            at = {"at": "2026-11-19 12:00:00"}
+            conn.execute(text("INSERT INTO teams (id, name, created_at) VALUES (:t, 'own', :at)"), {"t": team, **at})
+            conn.execute(text("INSERT INTO workflows (id, team_id, scope, name, kind, current_version, created_at, "
+                              "updated_at) VALUES (:w, :t, :t, 'bug-fix', 'fix', 1, :at, :at)"),
+                         {"w": workflow, "t": team, **at})
+            for name, kind, ref, thread in seeded:
+                conn.execute(text("INSERT INTO runs (id, team_id, status, started_at, trigger_kind, trigger_ref, "
+                                  "thread) VALUES (:r, :t, 'succeeded', :at, :k, :ref, :th)"),
+                             {"r": ids[name], "t": team, "k": kind, "ref": json.dumps(ref) if ref else None,
+                              "th": thread, **at})
+            for name, job_id in job_of.items():
+                conn.execute(text("INSERT INTO jobs (id, team_id, workflow_id, run_id, status, attempts, created_at) "
+                                  "VALUES (:j, :t, :w, :r, 'succeeded', 1, :at)"),
+                             {"j": job_id, "t": team, "w": workflow, "r": ids[name], **at})
+    finally:
+        engine.dispose()
+    migrate(db_url)
+    migrate(db_url)
+    engine = make_engine(db_url)
+    try:
+        with engine.connect() as conn:
+            threads = dict(conn.execute(select(runs.c.id, runs.c.thread)).all())
+            job_threads = dict(conn.execute(select(jobs.c.run_id, jobs.c.thread)).all())
+    finally:
+        engine.dispose()
+    assert {name: threads[run_id] for name, run_id in ids.items()} == {
+        "triage": "MEM-9", "approve": "MEM-9", "grandchild": "MEM-9", "fix": "MEM-9", "linear": "ENG-4",
+        "threaded": "slack:C1:1700.1", "child": "slack:C1:1700.1", "bad_key": None, "orphan": None,
+        "review": None, "loose": None}
+    assert job_threads == {ids["approve"]: "MEM-9", ids["review"]: None}
+    command.downgrade(alembic_config(db_url), "0037")
+    engine = make_engine(db_url)
+    try:
+        with engine.connect() as conn:
+            assert conn.execute(select(runs.c.thread).where(runs.c.id == ids["fix"])).scalar() == "MEM-9"
+    finally:
+        engine.dispose()
