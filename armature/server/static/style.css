@@ -97,6 +97,7 @@ h2.inline { margin: 0 0 12px; }
 .chain-current::marker { color: var(--accent); }
 .chain-title { display: block; color: var(--ink-2); font-size: 13px; font-weight: 400; overflow-wrap: anywhere; }
 .chain-next { margin: 12px 0 0; font-size: 14px; }
+.chain-pull h3 { font-size: 14px; margin: 14px 0 6px; }
 
 /* Tables */
 table { width: 100%; border-collapse: collapse; font-size: 14px; }

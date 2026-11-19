@@ -11,10 +11,9 @@ import { findingCard, resultView } from '../result.js';
 import { hashFor } from '../router.js';
 import { activeTab, artifactForTab, byteSize, canCancel, canRerun, downloadType, LOG_TAB, orderArtifacts, OUTPUT_TAB, outputText, prettyJson, progress, rerunNote, rerunPending, runTabs, settledJob } from '../runpage.js';
 import { currentSession } from '../session.js';
-import { chainPanel, replacedBy } from './chain.js';
+import { threadNote } from './chain.js';
 import { gateCard } from './gates.js';
-import { chained, locationChip, runStatus, subjectHref } from './runs.js';
-import { subjectPath } from './subject.js';
+import { locationChip, runStatus, subjectHref } from './runs.js';
 
 const PAGE = 1000;
 const EARLIER_PAGE = 500;
@@ -174,27 +173,6 @@ function findingNode(finding) {
     element('div', {}, element('span', { class: `chip ${finding.severity === 'high' || finding.severity === 'critical' ? 'bad' : 'warn'}` }, String(finding.severity || 'finding')), oneLine(finding.title || 'Finding', 200)),
     where ? element('code', { class: 'wrap-anywhere' }, where) : null,
     finding.body ? element('p', { class: 'finding-body' }, oneLine(finding.body, 400)) : null);
-}
-
-// Where this run sits in its thread, and a pointer to the newest run when a later one replaced it.
-async function threadNote(slot, run, signal) {
-  const thread = run.thread || run.subject;
-  let detail;
-  try {
-    detail = (await api(subjectPath(thread)))?.subject;
-  } catch {
-    return;
-  }
-  const others = (detail?.runs || []).filter((other) => String(other.id) !== String(run.id));
-  const chain = chained(run);
-  if (signal?.aborted || !(others.length || (chain && detail?.watching?.length))) return;
-  const newer = replacedBy(run, others, chain);
-  if (newer.length) {
-    slot.append(element('div', { class: 'banner warn' }, `${newer.length === 1 ? 'A later run' : `${newer.length} later runs`} replaced this one, so its result may be out of date. `,
-      link(subjectHref(thread), 'See the latest')));
-  }
-  if (chain) slot.append(chainPanel(detail, run));
-  else if (!newer.length) slot.append(element('p', { class: 'note' }, `This is the latest of ${others.length + 1} runs on `, link(subjectHref(thread), detail.title || thread), '.'));
 }
 
 function artifactBody(artifact) {
