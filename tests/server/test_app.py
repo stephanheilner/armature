@@ -192,3 +192,26 @@ def test_a_pull_requests_runs_group_with_the_issue_thread(engine, keyring, clock
     assert listed(thread="acme/app#7") == []
     detail = client.get(f"/api/runs/{made['review']}").json()["run"]
     assert (detail["subject"], detail["thread"]) == ("acme/app#7", "MEM-1")
+
+
+def test_an_issue_chain_groups_into_one_row_showing_its_latest_step(engine, keyring, clock):
+    _user_id, secret = add_user(engine, keyring, clock, "ana", is_admin=True)
+    team_id = new_id()
+    made = {}
+    with engine.begin() as conn:
+        conn.execute(insert(teams).values(id=team_id, name="mobile", created_at=clock()))
+        for name, subject, workflow, status, kind in [
+            ("triage", None, "bug-triage", "succeeded", "jira"), ("approve", None, "bug-approve", "succeeded", "handoff"),
+            ("fix", None, "bug-fix", "succeeded", "jira"), ("dev", "MEM-9", "development", "running", "jira"),
+            ("hook", None, "webhook-job", "succeeded", "webhook"),
+        ]:
+            clock.advance(seconds=1)
+            made[name] = new_id()
+            conn.execute(insert(runs).values(id=made[name], team_id=team_id, status=status, started_at=clock(),
+                                             subject=subject, thread=None if kind == "webhook" else "MEM-9",
+                                             workflow_name=workflow, trigger_kind=kind))
+    client = make_client(engine, keyring, clock)
+    assert login(client, "ana", clock.code(secret)).status_code == 200
+    rows = client.get("/api/runs", params={"group": True}).json()["runs"]
+    assert [(r["id"], r["group_size"], r["workflow"], r["status"], r["thread"]) for r in rows] == [
+        (made["hook"], 1, "webhook-job", "succeeded", None), (made["dev"], 4, "development", "running", "MEM-9")]

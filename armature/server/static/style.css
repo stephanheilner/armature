@@ -92,6 +92,11 @@ h2.inline { margin: 0 0 12px; }
 .banner:has(.banner-dismiss) { display: flex; align-items: flex-start; gap: 12px; justify-content: space-between; }
 .banner-dismiss { flex: none; border: 0; background: transparent; color: var(--ink-2); font-size: 20px; line-height: 1; padding: 0 4px; cursor: pointer; border-radius: 6px; }
 .banner-dismiss:hover { color: var(--ink); background: var(--surface-2); }
+.chain-steps { margin: 0; padding-left: 22px; display: grid; gap: 6px; font-size: 14px; }
+.chain-current { font-weight: 600; }
+.chain-current::marker { color: var(--accent); }
+.chain-title { display: block; color: var(--ink-2); font-size: 13px; font-weight: 400; overflow-wrap: anywhere; }
+.chain-next { margin: 12px 0 0; font-size: 14px; }
 
 /* Tables */
 table { width: 100%; border-collapse: collapse; font-size: 14px; }

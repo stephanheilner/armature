@@ -33,7 +33,7 @@ export function shortWhen(timestamp, now = new Date()) {
   return date.getFullYear() === now.getFullYear() ? `${day} ${time}` : `${day}/${String(date.getFullYear()).slice(2)} ${time}`;
 }
 
-export const prTitle = (run, pr, display) => pr?.title || run.title || workflowLabel(display, run.workflow);
+export const prTitle = (run, pr, display) => pr?.title || run.title || (chained(run) ? threadOf(run) : null) || workflowLabel(display, run.workflow);
 
 export function verdictText(verdict) {
   const text = String(verdict || '').trim();
@@ -85,6 +85,11 @@ export function hashParams(filter) {
 }
 
 export const threadOf = (run) => run.thread || run.subject || '';
+
+const ISSUE_KEY = /^[A-Z][A-Z0-9_]{1,100}-[1-9][0-9]{0,9}$/;
+
+// An issue's own runs are a chain of workflows. A run on one of its pull requests is not one of its steps.
+export const chained = (run) => ISSUE_KEY.test(threadOf(run)) && (!run.subject || run.subject === threadOf(run));
 
 export const rethreaded = (shown, run) => (shown || '') !== threadOf(run);
 

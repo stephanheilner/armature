@@ -11,8 +11,9 @@ import { findingCard, resultView } from '../result.js';
 import { hashFor } from '../router.js';
 import { activeTab, artifactForTab, byteSize, canCancel, canRerun, downloadType, LOG_TAB, orderArtifacts, OUTPUT_TAB, outputText, prettyJson, progress, rerunNote, rerunPending, runTabs, settledJob } from '../runpage.js';
 import { currentSession } from '../session.js';
+import { chainPanel, replacedBy } from './chain.js';
 import { gateCard } from './gates.js';
-import { isNewer, locationChip, runStatus, subjectHref } from './runs.js';
+import { chained, locationChip, runStatus, subjectHref } from './runs.js';
 import { subjectPath } from './subject.js';
 
 const PAGE = 1000;
@@ -185,12 +186,15 @@ async function threadNote(slot, run, signal) {
     return;
   }
   const others = (detail?.runs || []).filter((other) => String(other.id) !== String(run.id));
-  if (signal?.aborted || !others.length) return;
-  const newer = others.filter((other) => isNewer(other, run));
-  slot.append(newer.length
-    ? element('div', { class: 'banner warn' }, `${newer.length === 1 ? 'A later run' : `${newer.length} later runs`} replaced this one, so its result may be out of date. `,
-      link(subjectHref(thread), 'See the latest'))
-    : element('p', { class: 'note' }, `This is the latest of ${others.length + 1} runs on `, link(subjectHref(thread), detail.title || thread), '.'));
+  const chain = chained(run);
+  if (signal?.aborted || !(others.length || (chain && detail?.watching?.length))) return;
+  const newer = replacedBy(run, others, chain);
+  if (newer.length) {
+    slot.append(element('div', { class: 'banner warn' }, `${newer.length === 1 ? 'A later run' : `${newer.length} later runs`} replaced this one, so its result may be out of date. `,
+      link(subjectHref(thread), 'See the latest')));
+  }
+  if (chain) slot.append(chainPanel(detail, run));
+  else if (!newer.length) slot.append(element('p', { class: 'note' }, `This is the latest of ${others.length + 1} runs on `, link(subjectHref(thread), detail.title || thread), '.'));
 }
 
 function artifactBody(artifact) {
