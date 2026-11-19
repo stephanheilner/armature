@@ -11,16 +11,21 @@ from sqlalchemy import Connection, String, and_, cast, func, or_, select
 from armature.server import actions, display, rbac
 from armature.server.config import ActionConfig
 from armature.server.db.schema import (
+    connections,
     findings,
     jobs,
     run_artifacts,
     runner_keys,
     runs,
+    trigger_seen,
+    trigger_state,
+    triggers,
     webhook_deliveries,
     workflows,
 )
 from armature.server.ingest import HOST_RUN, RUN_KIND
-from armature.server.threads import PULL_SUBJECT, PULL_URL, links
+from armature.server.pollers import CONNECTION_KIND, DEFAULT_INTERVAL
+from armature.server.threads import ISSUE_KEY, PULL_SUBJECT, PULL_URL, links
 
 RUNS_MAX = 500
 FINDINGS_MAX = 2000
@@ -65,8 +70,8 @@ def make_cursor(at: datetime, subject: str) -> str:
 
 
 def _run_query(scope: rbac.Scope):
-    return (select(runs.c.id, runs.c.subject, runs.c.team_id, runs.c.project_id, WORKFLOW.label("workflow"),
-                   RUN_KIND.label("kind"),
+    return (select(runs.c.id, runs.c.subject, runs.c.team_id, runs.c.project_id, runs.c.workflow_id,
+                   WORKFLOW.label("workflow"), RUN_KIND.label("kind"),
                    runs.c.status, runs.c.started_at, runs.c.finished_at, runs.c.cost_usd, runs.c.summary,
                    runs.c.trigger_ref, runs.c.outcome, runs.c.risk, runs.c.risk_reasons, runs.c.location,
                    HOST_RUN.label("host_run"))
@@ -281,6 +286,43 @@ def finding_history(rows: list[Any]) -> list[dict[str, Any]]:
     return sorted(grouped.values(), key=lambda e: (e["history"][-1]["started_at"], e["finding_key"]), reverse=True)
 
 
+def watching(conn: Connection, scope: rbac.Scope, subject: str, ordered: list[Any],
+             labels: dict[str, Any]) -> list[dict[str, Any]]:
+    """The issue pollers in the thread's projects that may still pick the issue up: their workflow hasn't run in
+    the thread and they haven't seen the key. Only when, never how, so no query or connection detail."""
+    projects = {run.project_id for run in ordered if run.project_id}
+    if not ISSUE_KEY.fullmatch(subject) or not projects:
+        return []
+    ran = {run.workflow_id for run in ordered if run.workflow_id} | {run.workflow for run in ordered if run.workflow}
+    rows = conn.execute(
+        select(triggers.c.id, triggers.c.team_id, triggers.c.kind, triggers.c.config, workflows.c.name,
+               triggers.c.workflow_id, workflows.c.project_id, trigger_state.c.last_run_at, trigger_state.c.next_run_at)
+        .select_from(triggers.join(workflows, workflows.c.id == triggers.c.workflow_id)
+                     .outerjoin(trigger_state, trigger_state.c.trigger_id == triggers.c.id))
+        .where(triggers.c.kind.in_(CONNECTION_KIND), triggers.c.enabled.is_(True),
+               triggers.c.team_id.in_({run.team_id for run in ordered}))
+        .order_by(workflows.c.name, triggers.c.id)).all()
+    rows = [row for row in rows if row.workflow_id not in ran and row.name not in ran
+            and not _dict(row.config).get("shadow") and not _dict(row.config).get("resident")]
+    owners = {row.connection_id: row.project_id for row in conn.execute(
+        select(connections.c.id.label("connection_id"), connections.c.project_id)
+        .where(connections.c.id.in_(sorted({_dict(row.config).get("connection_id") for row in rows} - {None}))))}
+    seen = set(conn.execute(select(trigger_seen.c.trigger_id).where(
+        trigger_seen.c.trigger_id.in_([row.id for row in rows]), trigger_seen.c.item_key == subject)).scalars())
+    shown = []
+    for row in rows:
+        config = _dict(row.config)
+        project = config.get("project_id") or owners.get(config.get("connection_id")) or row.project_id
+        if row.id in seen or project not in projects or not rbac.in_scope(scope, row.team_id, project):
+            continue
+        shown.append({"workflow": row.name,
+                      "workflow_label": _text(_dict(labels.get(row.name)).get("label")) or row.name,
+                      "source": CONNECTION_KIND[row.kind],
+                      "interval_minutes": config.get("interval_minutes") or DEFAULT_INTERVAL,
+                      "last_poll_at": row.last_run_at, "next_poll_at": row.next_run_at})
+    return shown
+
+
 def subject_detail(conn: Connection, scope: rbac.Scope, subject: str,
                    configured: Sequence[ActionConfig] = ()) -> dict[str, Any] | None:
     settings = display.load(conn)
@@ -332,5 +374,5 @@ def subject_detail(conn: Connection, scope: rbac.Scope, subject: str,
         "latest_outcome": next((run.outcome for run in reversed(own) if run.outcome), None),
         "risk": own[-1].risk, "repo": repo, "number": number,
         "links": merged_links(ordered), "runs": [row(run) for run in ordered],
-        "findings": finding_history(finding_rows),
+        "findings": finding_history(finding_rows), "watching": watching(conn, scope, subject, ordered, labels),
     }

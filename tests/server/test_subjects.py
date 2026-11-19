@@ -16,6 +16,9 @@ from armature.server.db.schema import (
     runs,
     settings,
     teams,
+    trigger_seen,
+    trigger_state,
+    triggers,
     workflows,
 )
 from tests.server.app_support import (
@@ -384,3 +387,52 @@ def test_list_rows_name_the_author_and_the_latest_runs_environment(engine, keyri
     assert all(run["job"] is None for run in page["runs"] if run["id"] != latest)
     listed = {r["id"]: r for r in client.get("/api/runs?every=1").json()["runs"]}
     assert listed[latest]["job"]["status"] == "running" and listed[seeded["first"]]["job"] is None
+
+
+def _poller(conn, team_id, workflow, *, project_id=None, enabled=True, **config):
+    trigger_id = new_id()
+    workflow_id = conn.execute(select(workflows.c.id).where(workflows.c.name == workflow)).scalar()
+    conn.execute(insert(triggers).values(id=trigger_id, team_id=team_id, workflow_id=workflow_id, kind="jira_poll",
+                                         enabled=enabled, created_at=NOW,
+                                         config={"jql": "project = SECRET", "connection_id": new_id(),
+                                                 "project_id": project_id, **config}))
+    conn.execute(insert(trigger_state).values(trigger_id=trigger_id, last_run_at=at(9), next_run_at=at(9, 5),
+                                              failures=0))
+    return trigger_id
+
+
+def test_an_issue_lists_the_pollers_that_may_still_pick_it_up_in_scope(engine, keyring, seeded):
+    with engine.begin() as conn:
+        project = conn.execute(select(projects.c.id).where(projects.c.name == "app")).scalar()
+        hidden = new_id()
+        conn.execute(insert(projects).values(id=hidden, team_id=seeded["own"], name="hidden", created_at=NOW))
+        for name in ("bug-triage", "bug-fix", "bug-ship"):
+            conn.execute(insert(workflows).values(id=new_id(), name=name, kind="work", current_version=1,
+                                                  created_at=NOW, updated_at=NOW))
+        _run(conn, seeded["own"], "bug-triage", at(8), None, project_id=project)
+        _run(conn, seeded["own"], "dev-work", at(8, 30), None, project_id=hidden)
+        conn.execute(update(runs).where(runs.c.subject.is_(None), runs.c.project_id.is_not(None)).values(thread="PROJ-9"))
+        _poller(conn, seeded["own"], "bug-triage", project_id=project, interval_minutes=15)
+        _poller(conn, seeded["own"], "bug-fix", project_id=project, interval_minutes=5)
+        _poller(conn, seeded["own"], "bug-ship", project_id=hidden)
+        _poller(conn, seeded["own"], "pr-fix", project_id=project, shadow=True)
+        _poller(conn, seeded["own"], "pr-merged", project_id=project, enabled=False)
+        _poller(conn, seeded["other"], "code-review", project_id=project)
+        seen = _poller(conn, seeded["own"], "code-review", project_id=project)
+        conn.execute(insert(trigger_seen).values(trigger_id=seen, item_key="PROJ-9", outcome="queued",
+                                                 first_seen_at=NOW, last_seen_at=NOW))
+        _poller(conn, seeded["own"], "code-review", project_id=new_id())
+    team = _client(engine, keyring, seeded, "viewer").get(_path("PROJ-9")).json()["subject"]
+    assert [r["workflow"] for r in team["runs"]] == ["bug-triage", "dev-work"]
+    assert team["watching"] == [
+        {"workflow": "bug-fix", "workflow_label": "bug-fix", "source": "jira", "interval_minutes": 5,
+         "last_poll_at": at(9).isoformat().replace("+00:00", "Z"),
+         "next_poll_at": at(9, 5).isoformat().replace("+00:00", "Z")},
+        {"workflow": "bug-ship", "workflow_label": "bug-ship", "source": "jira", "interval_minutes": 5,
+         "last_poll_at": at(9).isoformat().replace("+00:00", "Z"),
+         "next_poll_at": at(9, 5).isoformat().replace("+00:00", "Z")}]
+    narrow = _client(engine, keyring, seeded, "project_viewer").get(_path("PROJ-9")).json()["subject"]
+    assert [r["workflow"] for r in narrow["runs"]] == ["bug-triage"]
+    assert [w["workflow"] for w in narrow["watching"]] == ["bug-fix"]
+    pull = _client(engine, keyring, seeded, "viewer").get(_path(PR)).json()["subject"]
+    assert pull["watching"] == []
