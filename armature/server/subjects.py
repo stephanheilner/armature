@@ -286,7 +286,8 @@ def finding_history(rows: list[Any]) -> list[dict[str, Any]]:
     return sorted(grouped.values(), key=lambda e: (e["history"][-1]["started_at"], e["finding_key"]), reverse=True)
 
 
-def watching(conn: Connection, subject: str, ordered: list[Any], labels: dict[str, Any]) -> list[dict[str, Any]]:
+def watching(conn: Connection, scope: rbac.Scope, subject: str, ordered: list[Any],
+             labels: dict[str, Any]) -> list[dict[str, Any]]:
     """The issue pollers in the projects of the thread's visible runs that may still pick the issue up: their
     workflow hasn't run in the thread and they haven't seen the key. Only when, never how, so anyone who sees the
     runs may see them, and no query or connection detail is in them."""
@@ -295,7 +296,7 @@ def watching(conn: Connection, subject: str, ordered: list[Any], labels: dict[st
         return []
     ran = {run.workflow_id for run in ordered if run.workflow_id} | {run.workflow for run in ordered if run.workflow}
     rows = conn.execute(
-        select(triggers.c.id, triggers.c.kind, triggers.c.config, workflows.c.name,
+        select(triggers.c.id, triggers.c.team_id, triggers.c.kind, triggers.c.config, workflows.c.name,
                triggers.c.workflow_id, workflows.c.project_id, trigger_state.c.last_run_at, trigger_state.c.next_run_at)
         .select_from(triggers.join(workflows, workflows.c.id == triggers.c.workflow_id)
                      .outerjoin(trigger_state, trigger_state.c.trigger_id == triggers.c.id))
@@ -313,7 +314,7 @@ def watching(conn: Connection, subject: str, ordered: list[Any], labels: dict[st
     for row in rows:
         config = _dict(row.config)
         project = config.get("project_id") or owners.get(config.get("connection_id")) or row.project_id
-        if row.id in seen or project not in projects:
+        if row.id in seen or project not in projects or not rbac.in_scope(scope, row.team_id, project):
             continue
         shown.append({"workflow": row.name,
                       "workflow_label": _text(_dict(labels.get(row.name)).get("label")) or row.name,
@@ -374,5 +375,5 @@ def subject_detail(conn: Connection, scope: rbac.Scope, subject: str,
         "latest_outcome": next((run.outcome for run in reversed(own) if run.outcome), None),
         "risk": own[-1].risk, "repo": repo, "number": number,
         "links": merged_links(ordered), "runs": [row(run) for run in ordered],
-        "findings": finding_history(finding_rows), "watching": watching(conn, subject, ordered, labels),
+        "findings": finding_history(finding_rows), "watching": watching(conn, scope, subject, ordered, labels),
     }
