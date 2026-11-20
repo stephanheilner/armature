@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 const STATIC = new URL('../../../armature/server/static/', import.meta.url);
-const { capsules, chosenWorkflows, groupText, hashParams, isHidden, isNewer, listParams, liveElapsed, matches, prTitle, runHeaders, runStatus, shortWhen,
+const { capsules, chosenWorkflows, groupText, hashParams, isHidden, isNewer, listParams, liveElapsed, matches, openParams, prTitle, runHeaders, runStatus, shortWhen,
   rethreaded, runRowHref, subjectHref, threadOf, triggerOf, verdictText, verdictTone, workflowOptions } =
   await import(new URL('views/runs.js', STATIC));
 const { hashFor } = await import(new URL('router.js', STATIC));
@@ -60,6 +60,15 @@ test('runStatus puts activity and failures before the pull request state', () =>
   for (const [run, pr, text, tone] of cases) assert.deepEqual(runStatus(run, pr), { text, tone }, JSON.stringify([run, pr]));
 });
 
+test('runStatus shows a grouped row whose thread has an open run as in progress, not its finished verdict', () => {
+  const approved = { verdict: 'approve', merged: false };
+  assert.deepEqual(runStatus({ status: 'succeeded' }, approved, true), { text: 'In Progress', tone: 'running' });
+  assert.deepEqual(runStatus({ status: 'failed' }, null, true), { text: 'In Progress', tone: 'running' });
+  assert.deepEqual(runStatus({ status: 'waiting' }, null, true), { text: 'Waiting for approval', tone: 'warn' });
+  assert.deepEqual(runStatus({ status: 'succeeded' }, approved, false), { text: 'Approved', tone: 'ok' });
+  assert.deepEqual(runStatus({ status: 'succeeded' }, approved), { text: 'Approved', tone: 'ok' });
+});
+
 test('subjectHref links the subject page', () => {
   assert.equal(subjectHref('fs-eng/android-tree#12'), '#/subject/fs-eng%2Fandroid-tree%2312');
 });
@@ -90,12 +99,21 @@ test('workflow choices round-trip through the hash', () => {
 test('listParams asks the API for the chosen workflows and hidden ones', () => {
   const params = listParams({ team: 't', subject: 'MEM-1', workflows: ['a', 'b'], hidden: true }, 'cursor');
   assert.equal(String(params), 'limit=50&team=t&subject=MEM-1&workflows=a%2Cb&include_hidden=1&group=1&before=cursor');
-  assert.equal(String(listParams({ workflows: [] })), 'limit=50&group=1');
-  assert.equal(String(listParams({ workflows: [], every: true })), 'limit=50');
+  assert.equal(String(listParams({ workflows: [] })), 'limit=10&group=1');
+  assert.equal(String(listParams({ workflows: [], every: true })), 'limit=10');
+});
+
+test('the recent list asks for ten rows, all asks for a page, and open runs come ungrouped', () => {
+  assert.equal(String(listParams({ workflows: [], all: true })), 'limit=50&group=1');
+  assert.equal(String(openParams({ team: 't', workflows: ['a'], all: false })), 'limit=200&team=t&status=queued%2Crunning%2Cwaiting&workflows=a');
+  assert.equal(String(openParams({ status: 'waiting', workflows: [] })), 'limit=200&status=waiting');
+  assert.equal(openParams({ status: 'failed', workflows: [] }), null);
+  assert.equal(hashFor('runs', [], hashParams({ workflows: [], all: true })), '#/runs?all=1');
+  assert.equal(hashFor('runs', [], hashParams({ workflows: [], all: false })), '#/runs');
 });
 
 test('a thread filter reaches the API and the hash, and groups a pull request with its issue', () => {
-  assert.equal(String(listParams({ thread: 'MEM-1', workflows: [], every: true })), 'limit=50&thread=MEM-1');
+  assert.equal(String(listParams({ thread: 'MEM-1', workflows: [], every: true })), 'limit=10&thread=MEM-1');
   assert.equal(hashFor('runs', [], hashParams({ thread: 'MEM-1', workflows: [], every: true })), '#/runs?thread=MEM-1&every=1');
   assert.equal(threadOf({ subject: 'acme/app#7', thread: 'MEM-1' }), 'MEM-1');
   assert.equal(threadOf({ subject: 'acme/app#7', thread: null }), 'acme/app#7');

@@ -11,6 +11,7 @@ import { currentSession } from '../session.js';
 
 const STATUSES = ['queued', 'running', 'waiting', 'succeeded', 'failed', 'canceled', 'lost'];
 const PAGE_SIZE = 50;
+const RECENT_ROWS = 10;
 const MAX_ROWS = 200;
 const POLL_MS = 5000;
 const APPROVED = new Set(['approve', 'approved', 'approval recommended']);
@@ -21,6 +22,7 @@ const OUT_KINDS = new Set(['pull', 'issue', 'slack']);
 const ACTIVE = new Set(['queued', 'running']);
 const ACTIVE_OR_WAITING = new Set(['queued', 'running', 'waiting']);
 const ENDED = new Set(['failed', 'canceled', 'lost']);
+const SETTLED = new Set(['succeeded', 'failed', 'canceled']);
 
 export const runHeaders = (display) => [['Started', 'col-tight'], ['Run', 'col-title'], ['Workflow', 'col-tight'], 'Links',
   ['Outcome', 'col-tight'], ['Where', 'col-tight'], 'Trigger', ['Time', 'num col-tight'], ...(display?.show_cost ? [['Cost', 'num col-tight']] : [])];
@@ -49,9 +51,11 @@ const outcomeTone = (label) => {
   return /fail|reject|block/i.test(label) ? 'bad' : 'ok';
 };
 
-export function runStatus(run, pr) {
+// threadOpen marks a grouped row whose thread still has an open run, which can be older than the row's own run.
+export function runStatus(run, pr, threadOpen = false) {
   if (ACTIVE.has(run.status)) return { text: 'In Progress', tone: 'running' };
   if (run.status === 'waiting') return { text: 'Waiting for approval', tone: 'warn' };
+  if (threadOpen) return { text: 'In Progress', tone: 'running' };
   if (ENDED.has(run.status)) return { text: statusText(run.status), tone: statusTone(run.status) };
   if (pr) {
     const verdict = verdictText(pr.verdict);
@@ -70,7 +74,7 @@ export function chosenWorkflows(query) {
 }
 
 export function listParams(filter, before = '') {
-  const params = new URLSearchParams({ limit: String(PAGE_SIZE) });
+  const params = new URLSearchParams({ limit: String(filter.all || before ? PAGE_SIZE : RECENT_ROWS) });
   for (const key of ['team', 'project', 'status', 'subject', 'thread']) if (filter[key]) params.set(key, filter[key]);
   if (filter.workflows?.length) params.set('workflows', filter.workflows.join(','));
   if (filter.hidden) params.set('include_hidden', '1');
@@ -79,9 +83,17 @@ export function listParams(filter, before = '') {
   return params;
 }
 
+// Null when the chosen status is never open, so nothing is in progress.
+export function openParams(filter) {
+  if (filter.status && !ACTIVE_OR_WAITING.has(filter.status)) return null;
+  const params = listParams({ ...filter, every: true, status: filter.status || [...ACTIVE_OR_WAITING].join(',') });
+  params.set('limit', String(MAX_ROWS));
+  return params;
+}
+
 export function hashParams(filter) {
   return { team: filter.team, project: filter.project, status: filter.status, subject: filter.subject, thread: filter.thread,
-    workflows: filter.workflows?.join(',') || '', hidden: filter.hidden ? '1' : '', every: filter.every ? '1' : '' };
+    workflows: filter.workflows?.join(',') || '', hidden: filter.hidden ? '1' : '', every: filter.every ? '1' : '', all: filter.all ? '1' : '' };
 }
 
 export const threadOf = (run) => run.thread || run.subject || '';
@@ -262,15 +274,17 @@ export async function render(root, { query, signal }) {
     subject ? element('span', { class: 'muted' }, `Subject: ${subject} `, link(hashFor('runs'), 'Clear')) : null,
     thread ? element('span', { class: 'muted' }, `Thread: ${thread} `, link(hashFor('runs'), 'Clear')) : null);
   const capsuleRow = element('div', { class: 'capsules', role: 'group', 'aria-label': 'Show one workflow' });
+  const all = query.get('all') === '1' || Boolean(query.get('before'));
+  const openArea = element('div', {}, loading());
   const body = element('div', {}, loading());
-  root.append(capsuleRow, filters, body);
+  root.append(capsuleRow, filters, element('h2', {}, 'In progress'), openArea, element('h2', {}, all ? 'All runs' : 'Recent'), body);
 
   const [teams, display, definitions] = await Promise.all([
     api('/api/teams').then((payload) => listOf(payload, 'teams')).catch(() => []),
     loadDisplay(),
     api('/api/workflows').then((payload) => listOf(payload, 'workflows')).catch(() => []),
   ]);
-  const filter = { team: '', project: '', status: statusSelect.value, subject, thread, workflows: chosenWorkflows(query), hidden: hiddenBox.checked, every: everyBox.checked };
+  const filter = { team: '', project: '', status: statusSelect.value, subject, thread, workflows: chosenWorkflows(query), hidden: hiddenBox.checked, every: everyBox.checked, all };
   let before = query.get('before') || '';
   const names = new Set(definitions.map((definition) => definition.name));
   const fillWorkflows = (more) => {
@@ -296,7 +310,7 @@ export async function render(root, { query, signal }) {
   filters.addEventListener('submit', (submitEvent) => {
     submitEvent.preventDefault();
     location.hash = hashFor('runs', [], hashParams({ team: teamSelect.value, project: projectSelect.value, status: statusSelect.value, subject, thread,
-      workflows: [...workflowSelect.selectedOptions].map((option) => option.value), hidden: hiddenBox.checked, every: everyBox.checked }));
+      workflows: [...workflowSelect.selectedOptions].map((option) => option.value), hidden: hiddenBox.checked, every: everyBox.checked, all }));
   });
 
   const prs = new Map();
@@ -307,10 +321,14 @@ export async function render(root, { query, signal }) {
   // Stream updates carry no group_size, so each row keeps the count its run was listed with.
   const sizes = new Map();
   const counted = new Set();
-  const cells = (run) => {
+  // Open run id to its thread, for the In progress table and for grouped rows whose thread is still open.
+  let openThreads = new Map();
+  const threadOpen = (key) => Boolean(key) && [...openThreads.values()].includes(key);
+  const shownRuns = new Map();
+  const cells = (run, grouped) => {
     const pr = prFor(run);
-    const status = runStatus(run, pr);
-    const count = groupText(sizes.get(String(run.id)));
+    const status = runStatus(run, pr, grouped && !filter.every && threadOpen(threadOf(run)));
+    const count = grouped ? groupText(sizes.get(String(run.id))) : '';
     return [
       link(hashFor('run', [run.id]), shortWhen(run.started_at), { title: `Open this run, started ${when(run.started_at)}` }),
       [link(runRowHref(run), prTitle(run, pr, display)), count ? element('span', { class: 'muted' }, ` · ${count}`) : null],
@@ -320,9 +338,10 @@ export async function render(root, { query, signal }) {
     ];
   };
   const headers = runHeaders(display);
-  const rowFor = (run) => {
+  const rowFor = (run, grouped = true) => {
     if (run.group_size) sizes.set(String(run.id), run.group_size);
-    const row = tableRow(headers, cells(run));
+    if (grouped) shownRuns.set(String(run.id), run);
+    const row = tableRow(headers, cells(run, grouped));
     row.dataset.runId = String(run.id);
     row.dataset.href = runRowHref(run);
     row.classList.add('row-link');
@@ -330,12 +349,104 @@ export async function render(root, { query, signal }) {
     if (threadOf(run)) row.dataset.thread = threadOf(run);
     return row;
   };
+  const refreshRow = (existing, fresh) => {
+    const freshCells = [...fresh.cells];
+    [...existing.cells].forEach((cell, index) => {
+      if (!cell.contains(document.activeElement)) cell.replaceWith(freshCells[index]);
+    });
+  };
+
+  const openTable = table(headers, []);
+  const openBody = openTable.querySelector('tbody');
+  const openCard = card(openTable);
+  const nothingOpen = card(empty('Nothing is in progress.'));
+  let openFailed = false;
+  const showOpen = () => {
+    const shown = openBody.rows.length ? openCard : nothingOpen;
+    if (!openFailed && !shown.isConnected) clear(openArea).append(shown);
+  };
+  // The stream can report a run ended before its row is written, so a later fetch may still list it open.
+  const settled = new Set();
+  const streamed = new Map();
+  let streamSeq = 0;
+  let openToken = 0;
+  const loadOpen = async () => {
+    const params = openParams(filter);
+    const token = ++openToken;
+    const seen = streamSeq;
+    let runs = [];
+    if (params) {
+      try {
+        runs = listOf(await api(`/api/runs?${params}`), 'runs');
+      } catch (err) {
+        if (token === openToken) {
+          openFailed = true;
+          clear(openArea).append(errorBox(err));
+        }
+        return;
+      }
+    }
+    if (token !== openToken || signal?.aborted) return;
+    const byId = new Map(runs.map((run) => [String(run.id), run]));
+    for (const [id, [seq, run]] of streamed) {
+      if (seq <= seen) streamed.delete(id);
+      else if (ACTIVE_OR_WAITING.has(run.status) && matches(run, filter, display)) byId.set(id, run);
+      else byId.delete(id);
+    }
+    const shown = [...byId.values()].filter((run) => !settled.has(String(run.id))).sort((left, right) => (isNewer(left, right) ? -1 : 1));
+    openThreads = new Map(shown.map((run) => [String(run.id), threadOf(run)]));
+    const scrolledPast = window.scrollY > 0 && openArea.getBoundingClientRect().top < 0;
+    const height = openArea.getBoundingClientRect().height;
+    openBody.replaceChildren(...shown.map((run) => rowFor(run, false)));
+    openFailed = false;
+    showOpen();
+    if (scrolledPast) window.scrollBy(0, openArea.getBoundingClientRect().height - height);
+    refreshThreads();
+  };
+  // Returns the threads whose open state the run changed.
+  const upsertOpen = (run) => {
+    const id = String(run.id);
+    const key = threadOf(run);
+    const was = openThreads.get(id);
+    streamed.set(id, [++streamSeq, run]);
+    if (SETTLED.has(run.status)) settled.add(id);
+    const keep = ACTIVE_OR_WAITING.has(run.status) && !settled.has(id) && matches(run, filter, display);
+    const existing = openBody.querySelector(`tr[data-run-id="${CSS.escape(id)}"]`);
+    if (keep && existing && rethreaded(existing.dataset.thread, run)) {
+      existing.replaceWith(rowFor(run, false));
+    } else if (keep && existing) {
+      refreshRow(existing, rowFor(run, false));
+    } else if (keep || existing) {
+      const scrolledPast = window.scrollY > 0 && openArea.getBoundingClientRect().top < 0;
+      const height = openArea.getBoundingClientRect().height;
+      if (existing) existing.remove();
+      else openBody.insertBefore(rowFor(run, false), [...openBody.rows].find((row) => isNewer(run, { started_at: row.dataset.startedAt, id: row.dataset.runId })) || null);
+      showOpen();
+      if (scrolledPast) window.scrollBy(0, openArea.getBoundingClientRect().height - height);
+    }
+    let touched = [];
+    if (keep && was !== key) {
+      openThreads.set(id, key);
+      touched = [was, key];
+    } else if (!keep && openThreads.has(id)) {
+      openThreads.delete(id);
+      touched = [was];
+    }
+    return touched.filter(Boolean);
+  };
 
   let runTable = table(headers, []);
   let tbody = runTable.querySelector('tbody');
   let tableCard = card(runTable);
   let emptyCard = card(empty('No runs yet.'));
   let listToken = 0;
+  const refreshThreads = (keys = null) => {
+    if (filter.every) return;
+    for (const row of [...tbody.rows]) {
+      const run = shownRuns.get(row.dataset.runId);
+      if (run && (!keys || keys.has(row.dataset.thread))) refreshRow(row, rowFor(run));
+    }
+  };
   const loadList = async () => {
     const token = ++listToken;
     let page;
@@ -355,6 +466,10 @@ export async function render(root, { query, signal }) {
     for (const run of runs) tbody.append(rowFor(run));
     tableCard = card(runTable);
     clear(body).append(runs.length ? tableCard : emptyCard);
+    if (!filter.all) {
+      if (runs.length) body.append(element('p', { class: 'note' }, link(hashFor('runs', [], { ...hashParams(filter), all: '1' }), 'See all runs')));
+      return;
+    }
     const pager = element('nav', { class: 'pager', 'aria-label': 'Pages' });
     if (before) pager.append(link(hashFor('runs', [], hashParams(filter)), 'Newest'));
     if (page.next_before) pager.append(link(hashFor('runs', [], { ...hashParams(filter), before: page.next_before }), 'Older'));
@@ -363,10 +478,11 @@ export async function render(root, { query, signal }) {
 
   const ticker = setInterval(() => {
     const now = Date.now();
-    for (const span of body.querySelectorAll('.row-elapsed')) setText(span, liveElapsed({ started_at: span.dataset.started }, now));
+    for (const span of root.querySelectorAll('.row-elapsed')) setText(span, liveElapsed({ started_at: span.dataset.started }, now));
   }, 1000);
   signal?.addEventListener('abort', () => clearInterval(ticker));
   body.addEventListener('click', openRow);
+  openArea.addEventListener('click', openRow);
 
   // Capsules filter in place, without reloading the page.
   const capsuleButtons = new Map();
@@ -377,9 +493,10 @@ export async function render(root, { query, signal }) {
     syncPicker();
     for (const item of capsules(display, [...names], filter.workflows)) capsuleButtons.get(item.id)?.setAttribute('aria-pressed', String(item.pressed));
     loadList();
+    loadOpen();
   };
 
-  await loadList();
+  await Promise.all([loadList(), loadOpen()]);
   const shownCapsules = capsules(display, [...names], filter.workflows);
   for (const item of shownCapsules) {
     const button = element('button', { type: 'button', class: 'capsule', 'aria-pressed': String(item.pressed) },
@@ -395,16 +512,18 @@ export async function render(root, { query, signal }) {
     frame = 0;
     const batch = [...pending.values()];
     pending.clear();
-    if (signal?.aborted || before) return;
-    for (const run of batch) upsert(run);
+    if (signal?.aborted) return;
+    const touched = new Set();
+    for (const run of batch) {
+      for (const key of upsertOpen(run)) touched.add(key);
+      if (!before) upsert(run);
+    }
+    if (touched.size && !before) refreshThreads(touched);
   };
   const upsert = (run) => {
     const existing = tbody.querySelector(`tr[data-run-id="${CSS.escape(String(run.id))}"]`);
     if (existing && (filter.every || !rethreaded(existing.dataset.thread, run))) {
-      const freshCells = [...rowFor(run).cells];
-      [...existing.cells].forEach((cell, index) => {
-        if (!cell.contains(document.activeElement)) cell.replaceWith(freshCells[index]);
-      });
+      refreshRow(existing, rowFor(run));
       return;
     }
     // A run whose thread changed mid-run moves into the row for its new thread.
@@ -417,6 +536,9 @@ export async function render(root, { query, signal }) {
     const key = threadOf(run);
     const grouped = !filter.every && key;
     const replaced = grouped ? [...tbody.rows].find((row) => row.dataset.thread === key) : null;
+    const last = tbody.lastElementChild;
+    // A full table only takes a run newer than its last row, so an older one never pushes out a listed one.
+    if (!replaced && last && tbody.rows.length >= (filter.all ? MAX_ROWS : RECENT_ROWS) && !isNewer(run, { started_at: last.dataset.startedAt, id: last.dataset.runId })) return;
     if (replaced) {
       if (!isNewer(run, { started_at: replaced.dataset.startedAt, id: replaced.dataset.runId })) return;
       sizes.set(id, (sizes.get(replaced.dataset.runId) || 1) + (counted.has(id) ? 0 : 1));
@@ -435,7 +557,7 @@ export async function render(root, { query, signal }) {
     tbody.prepend(row);
     if (!tableCard.isConnected) emptyCard.replaceWith(tableCard);
     if (scrolledPast) window.scrollBy(0, row.getBoundingClientRect().height);
-    while (tbody.rows.length > MAX_ROWS) tbody.lastElementChild.remove();
+    while (tbody.rows.length > (filter.all ? MAX_ROWS : RECENT_ROWS)) tbody.lastElementChild.remove();
   };
   const receive = (run) => {
     if (!run || run.id === undefined || run.id === null) return;
@@ -451,7 +573,10 @@ export async function render(root, { query, signal }) {
   subscribe(`/api/stream/runs?${streamParams}`, {
     events: { run: receive },
     onState: (state) => { liveNote.textContent = states[state] || ''; },
+    // Events missed while the stream was down would leave runs in progress that have ended.
+    onOpen: loadOpen,
     onFallback: () => every(POLL_MS, async () => {
+      await loadOpen();
       if (before) return;
       for (const run of listOf(await api(`/api/runs?${listParams(filter)}`), 'runs').reverse()) receive(run);
     }, signal),

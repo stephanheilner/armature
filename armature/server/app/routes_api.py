@@ -740,9 +740,10 @@ def list_runs(request: Request, team: str | None = None, project: str | None = N
         query = query.where(exists().where(run_steps.c.run_id == runs.c.id, run_steps.c.parent_step.is_(None),
                                            run_steps.c.output.is_not(None)))
     if status:
-        if status not in RUN_STATUSES:
+        wanted = sorted({s.strip() for s in status.split(",") if s.strip()})
+        if not wanted or any(s not in RUN_STATUSES for s in wanted):
             raise ApiError(400, f"status must be one of {', '.join(RUN_STATUSES)}.")
-        query = query.where(runs.c.status == status)
+        query = query.where(runs.c.status.in_(wanted))
     cursor = _cursor(before)
     configured = server(request).cfg.actions
     with server(request).engine.connect() as conn:

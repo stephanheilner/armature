@@ -54,6 +54,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   runner, or a test run launches, and each trace row records it as
   `server_run_id`.
 - `review/record-risk`, `review/record-post`, `review/record-mark`, and `review/is-marked` let a pack that makes its own GitHub calls keep risk, the review, and the mark in the server's database, without a connection. `review/decisions` no longer needs a verified GitHub connection either.
+- **In progress on the Runs page.** The Runs page lists every queued,
+  running, or waiting run in an In progress section at the top, each on its
+  own row and kept live. Below it, Recent shows the last 10 grouped runs
+  with a See all runs link to the full paged list. `status` on
+  `GET /api/runs` now takes a comma-separated list.
 
 ### Changed
 
@@ -79,6 +84,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- A grouped run on the Runs page no longer shows a finished run's verdict,
+  such as Approved, while an older run in its thread is still running. It
+  shows In Progress until every run in the thread ends.
 - Script steps no longer fail with "Argument list too long" on Linux once earlier stages' output passes 128 KiB. Every step gets `ARMATURE_CONTEXT_FILE`, a private temp file with the context JSON, and `ARMATURE_CONTEXT` stays inline only up to 64 KiB. A `with:` over 64 KiB arrives through `ARMATURE_WITH_FILE`, which `armature tool` reads.
 
 ## [0.11.0] - 2026-11-05

@@ -187,6 +187,7 @@ def test_lists_show_only_own_scope(sqlite_engine, keyring, clock, world, role):
     sign_in_as(client, sqlite_engine, keyring, clock, world.users[role])
     team_ids = {t["id"] for t in client.get("/api/teams").json()["teams"]}
     run_ids = {r["id"] for r in client.get("/api/runs").json()["runs"]}
+    assert {r["id"] for r in client.get("/api/runs?status=running,succeeded").json()["runs"]} == run_ids
     other_runs = client.get(f"/api/runs?team={world.other.team}").json()["runs"]
     projects_seen = {p["id"] for p in client.get(f"/api/teams/{world.own.team}/projects").json()["projects"]}
     if role == "admin":
@@ -218,6 +219,7 @@ def test_run_shape_and_paging(sqlite_engine, keyring, clock, world):
     assert len(first["runs"]) == 3 and len(rest["runs"]) == 1 and rest["next_before"] is None
     assert not {r["id"] for r in first["runs"]} & {r["id"] for r in rest["runs"]}
     assert client.get("/api/runs?status=bogus").status_code == 400
+    assert client.get("/api/runs?status=running,bogus").status_code == 400
 
 
 def test_membership_body_cannot_widen_scope(sqlite_engine, keyring, clock, world):

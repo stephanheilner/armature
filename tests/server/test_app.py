@@ -1,7 +1,7 @@
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import insert
+from sqlalchemy import insert, select
 
 from armature.server.db import new_id
 from armature.server.db.schema import INSTANCE_SCOPE, run_steps, runs, settings, teams
@@ -159,6 +159,30 @@ def test_grouped_runs_keep_the_latest_per_subject(engine, keyring, clock):
         if before is None:
             break
     assert seen == [made["review_new"], made["dev_rerun"], made["loose_new"], made["loose_old"]]
+
+
+def test_status_takes_a_list(engine, keyring, clock):
+    _user_id, secret = add_user(engine, keyring, clock, "ana", is_admin=True)
+    made = _subject_runs(engine, clock)
+    with engine.begin() as conn:
+        team_id = conn.execute(select(teams.c.id)).scalar_one()
+        for name, status in [("waiting", "waiting"), ("queued", "queued")]:
+            clock.advance(seconds=1)
+            made[name] = new_id()
+            conn.execute(insert(runs).values(id=made[name], team_id=team_id, status=status, started_at=clock(),
+                                             subject="acme/app#9", workflow_name="code-review"))
+    client = make_client(engine, keyring, clock)
+    assert login(client, "ana", clock.code(secret)).status_code == 200
+
+    def listed(**params):
+        return [r["id"] for r in client.get("/api/runs", params=params).json()["runs"]]
+
+    assert listed(status="queued,running,waiting") == [made["queued"], made["waiting"], made["dev_rerun"]]
+    assert listed(status="running, failed") == [made["dev_rerun"], made["fix"], made["dev_failed"]]
+    assert listed(status="succeeded", workflows="digest") == [made["loose_new"], made["loose_old"]]
+    assert listed(status="running") == [made["dev_rerun"]]
+    assert client.get("/api/runs", params={"status": "running,done"}).status_code == 400
+    assert client.get("/api/runs", params={"status": ","}).status_code == 400
 
 
 def test_a_pull_requests_runs_group_with_the_issue_thread(engine, keyring, clock):
