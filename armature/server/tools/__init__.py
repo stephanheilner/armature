@@ -107,6 +107,8 @@ def registry() -> dict[str, Tool]:
         "review.is-marked": Tool(NONE, marks.is_marked, reads=True),
         # Queues another stored workflow in the caller's own project, as a trigger would.
         "workflow.handoff": Tool(NONE, handoff.handoff),
+        # Queues the caller's own workflow again under the caller's concurrency key.
+        "workflow.again": Tool(NONE, handoff.again),
         # A self-heal run's own proposal: its evidence, its stored patch and that patch's rating, and, once approved,
         # the patch to apply.
         "insights.fix-context": Tool(NONE, fixes.context, reads=True),

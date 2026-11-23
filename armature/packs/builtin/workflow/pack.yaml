@@ -1,8 +1,8 @@
 name: workflow
 version: 1.0.0
 description: >-
-  Hand work on to another stored workflow, through the server. A run reaches only the workflows its own project
-  resolves by name, and never its own.
+  Hand work on to another stored workflow, or run the calling one again, through the server. A handoff reaches only
+  the workflows its own project resolves by name, and never its own.
 adapters:
   handoff:
     description: >-
@@ -19,6 +19,28 @@ adapters:
       additionalProperties: false
       properties:
         workflow: {type: string, minLength: 1, maxLength: 191}
+        inputs:
+          type: object
+          maxProperties: 64
+          propertyNames: {pattern: '^[A-Za-z_][A-Za-z0-9_]{0,63}$'}
+          additionalProperties:
+            anyOf:
+              - {type: string}
+              - {type: number}
+              - {type: boolean}
+              - {type: array, items: {type: string}}
+  again:
+    description: >-
+      Queue the calling workflow itself once more, at its current version, with inputs checked against its
+      contracts.inputs, under the calling job's concurrency key and dry mode, as a rerun of this run. The new run
+      waits for this one to end, and whatever supersedes the key supersedes it. A job with no concurrency key is
+      refused. A retried step gets the job its first call queued. Uses no connection.
+    cmd: armature tool workflow.again
+    writes: true
+    params:
+      type: object
+      additionalProperties: false
+      properties:
         inputs:
           type: object
           maxProperties: 64

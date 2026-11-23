@@ -32,6 +32,9 @@ CALLER = BODY + """  - id: handoff
   - id: templated
     adapter: workflow/handoff
     with: {workflow: "{{ target }}"}
+  - id: again
+    adapter: workflow/again
+    with: {inputs: {resume: "{{ resume }}"}}
 """
 APPROVE = """name: approve
 requires: [host]
@@ -76,6 +79,12 @@ def _handoff(app, run, step="handoff", **params):
     granted = ask_grant(app, run, step, tools=["workflow.handoff"])
     assert granted.status_code == 200, granted.text
     return use(app, granted.json()["token"], "workflow.handoff", params)
+
+
+def _again(app, run, step="again", **params):
+    granted = ask_grant(app, run, step, tools=["workflow.again"])
+    assert granted.status_code == 200, granted.text
+    return use(app, granted.json()["token"], "workflow.again", params)
 
 
 def _ok(response):
@@ -350,3 +359,124 @@ def test_a_runner_that_cant_pause_hands_off_to_a_gated_workflow_a_pausing_runner
         claimed = {j.id: j.runner_id for j in conn.execute(select(jobs)).all()}
     assert (opened.trigger_kind, opened.trigger_ref) == ("handoff", {"run_id": caller.id, "step": "handoff"})
     assert (claimed[caller_job], claimed[target.id]) == (foundry, local)
+
+
+KEY = "acme/app#7"
+AGAIN = """name: tools
+contracts:
+  inputs:
+    - {name: resume}
+stages:
+  - id: build
+    gate: human
+"""
+
+
+@pytest.fixture
+def keyed(sqlite_engine, clock, run, world):
+    """The caller's job holds a pull request's key, and its workflow has moved on to a version 3."""
+    with sqlite_engine.begin() as conn:
+        conn.execute(update(jobs).where(jobs.c.id == run.job).values(concurrency_key=KEY))
+        defs._add_version(conn, defs.WORKFLOW, world.workflow, 3, AGAIN, "next", None, clock())
+        conn.execute(update(defs.WORKFLOW.table).where(defs.WORKFLOW.table.c.id == world.workflow)
+                     .values(current_version=3))
+    return run
+
+
+def _ready(engine, clock):
+    with engine.connect() as conn:
+        return {row.id for row in conn.execute(select(jobs.c.id).where(jobs.c.status == "queued",
+                                                                       worker.ready(clock())))}
+
+
+def test_again_queues_the_callers_own_workflow_at_its_current_version_under_its_key(app, sqlite_engine, clock,
+                                                                                     keyed, world):
+    waiting = new_id()
+    with sqlite_engine.begin() as conn:
+        conn.execute(insert(jobs).values(id=waiting, team_id=world.team, project_id=world.project,
+                                         workflow_id=world.workflow, workflow_version=3, inputs={}, status="queued",
+                                         attempts=0, created_at=clock(), concurrency_key=KEY))
+    out = _ok(_again(app, keyed, inputs={"resume": "{}"}))
+    with sqlite_engine.connect() as conn:
+        job = conn.execute(select(jobs).where(jobs.c.id == out["job_id"])).one()
+        older = conn.execute(select(jobs.c.status).where(jobs.c.id == waiting)).scalar()
+        [audited] = conn.execute(select(audit).where(audit.c.action == "run.again")).all()
+    assert out == {"queued": True, "run_id": None, "job_id": job.id, "workflow": "tools"}
+    assert (job.workflow_id, job.workflow_version, job.concurrency_key, job.status) == (world.workflow, 3, KEY,
+                                                                                         "queued")
+    assert (job.inputs, job.rerun_of, bool(job.dry_run), job.requested_by) == ({"resume": "{}"}, keyed.id, False,
+                                                                                "user-1")
+    assert older == "queued" and audited.detail["step"] == "again"
+    # It waits for the caller, which holds the key, and goes once the caller ends.
+    assert job.id not in _ready(sqlite_engine, clock)
+    with sqlite_engine.begin() as conn:
+        conn.execute(update(jobs).where(jobs.c.id == keyed.job).values(status="succeeded"))
+    assert job.id in _ready(sqlite_engine, clock)
+
+
+def test_a_retried_again_step_gets_the_job_its_first_call_queued(app, sqlite_engine, keyed, world):
+    first = _ok(_again(app, keyed, inputs={"resume": "{}"}))
+    assert _ok(_again(app, keyed, inputs={"resume": "other"})) == first
+    assert len([j for j in _jobs(sqlite_engine, world.workflow) if j.rerun_of]) == 1
+
+
+def test_a_push_to_the_key_supersedes_the_queued_run_again(app, sqlite_engine, clock, keyed, world):
+    out = _ok(_again(app, keyed, inputs={"resume": "{}"}))
+    with sqlite_engine.begin() as conn:
+        newer = worker.queue_job(conn, team_id=world.team, project_id=world.project, workflow_id=world.workflow,
+                                 inputs={}, now=clock(), key=KEY, supersede=True, cancel_running=True)
+        statuses = {j.id: (j.status, j.cancel_requested_at is not None) for j in conn.execute(select(jobs)).all()}
+    assert statuses[out["job_id"]] == ("superseded", False) and statuses[keyed.job] == ("running", True)
+    assert statuses[newer] == ("queued", False)
+
+
+def test_the_run_again_opens_as_a_rerun_of_its_caller(app, sqlite_engine, keyring, clock, keyed):
+    out = _ok(_again(app, keyed, inputs={"resume": "{}"}))
+    with sqlite_engine.begin() as conn:
+        job = conn.execute(select(jobs).where(jobs.c.id == out["job_id"])).one()
+        bundle = worker.build_bundle(conn, keyring, job, now=clock(), lease=worker.LEASE, events="x")
+        opened = conn.execute(select(runs).where(runs.c.id == bundle.run_id)).one()
+    assert (opened.rerun_of, opened.workflow_version, opened.subject) == (keyed.id, 3, KEY)
+    assert bundle.inputs == {"resume": "{}"}
+
+
+def test_again_in_a_dry_run_queues_nothing(app, sqlite_engine, keyring, clock, world):
+    with sqlite_engine.begin() as conn:
+        defs._add_version(conn, defs.WORKFLOW, world.workflow, 2, CALLER, "handoff", None, clock())
+    run = start_run(sqlite_engine, keyring, clock, world, version=2, trigger_ref={"dry_run": True})
+    with sqlite_engine.begin() as conn:
+        conn.execute(update(jobs).where(jobs.c.id == run.job).values(concurrency_key=KEY, dry_run=True))
+    assert _ok(_again(app, run, inputs={"resume": "{}"}))["dry_run"] is True
+    assert [j.id for j in _jobs(sqlite_engine) if j.id != run.job] == []
+
+
+def test_again_carries_the_callers_dry_mode(app, sqlite_engine, keyed):
+    with sqlite_engine.begin() as conn:
+        conn.execute(update(jobs).where(jobs.c.id == keyed.job).values(dry_run=True))
+    out = _ok(_again(app, keyed, inputs={"resume": "{}"}))
+    with sqlite_engine.connect() as conn:
+        assert conn.execute(select(jobs.c.dry_run).where(jobs.c.id == out["job_id"])).scalar()
+
+
+def test_again_is_a_database_only_write():
+    spec = registry()["workflow.again"]
+    assert spec.kind == NONE and spec.reads is False
+
+
+def test_only_a_step_that_runs_again_may_and_a_handoff_still_never_reaches_its_own_workflow(app, sqlite_engine,
+                                                                                            keyed, world):
+    assert ask_grant(app, keyed, "handoff", tools=["workflow.again"]).status_code != 200
+    assert ask_grant(app, keyed, "again", tools=["workflow.handoff"]).status_code != 200
+    _refused(_handoff(app, keyed, "loop", workflow="tools"), 422, "A workflow can't hand off to itself.")
+    assert _again(app, keyed, workflow="tools").status_code == 400
+    assert len(_jobs(sqlite_engine, world.workflow)) == 1
+
+
+def test_again_refuses_a_caller_with_no_key_or_inputs_its_workflow_doesnt_declare(app, sqlite_engine, keyed, world):
+    _refused(_again(app, keyed, inputs={"other": "x"}), 422,
+             "tools declares no input other in contracts.inputs.")
+    with sqlite_engine.begin() as conn:
+        conn.execute(update(jobs).where(jobs.c.id == keyed.job).values(concurrency_key=None))
+    _refused(_again(app, keyed, inputs={"resume": "{}"}), 422,
+             "The calling job has no concurrency key, so a run of it again could overlap it.")
+    assert len(_jobs(sqlite_engine, world.workflow)) == 1

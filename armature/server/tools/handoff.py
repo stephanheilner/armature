@@ -2,6 +2,9 @@
 
 The target resolves by name the way a run in the caller's project resolves it, so a step never reaches another
 team's workflow. Each step queues at most one job, so a retried step gets the job its first call queued.
+
+workflow.again: queue the caller's own workflow once more, at its current version, under the calling job's
+concurrency key, so the new run waits for this one to end and anything that supersedes the key supersedes it too.
 """
 from __future__ import annotations
 
@@ -11,6 +14,7 @@ from sqlalchemy import select, update
 
 from armature.packs.params import is_template
 from armature.server import audit, broker, defs, worker
+from armature.server.db.schema import audit as audit_rows
 from armature.server.db.schema import jobs, runs, workflows
 from armature.server.tools import Call, ToolError
 from armature.spec.contract_io import InputError, resolve_inputs
@@ -43,6 +47,57 @@ def _check_target(conn: Any, run_id: str, step: str, name: str) -> None:
         raise ToolError(422, f"Step {step} hands off only to the workflow its with.workflow names.")
 
 
+def _caller(call: Call, conn: Any) -> Any:
+    # A write first, so a retried call waits for the first one and finds its job.
+    conn.execute(update(runs).where(runs.c.id == call.run_id).values(status=runs.c.status))
+    caller = conn.execute(select(runs).where(runs.c.id == call.run_id)).first()
+    if caller is None:
+        raise ToolError(404, "The calling run is gone.")
+    return caller
+
+
+def _queued_again(conn: Any, run_id: str, step: str) -> Any:
+    """The job an earlier call of this step queued, by the audit row it left, since its key is the caller's own."""
+    for detail in conn.execute(select(audit_rows.c.detail).where(audit_rows.c.action == "run.again",
+                                                                 audit_rows.c.target_id == run_id)).scalars():
+        if isinstance(detail, dict) and detail.get("step") == step:
+            return conn.execute(select(jobs.c.id, jobs.c.run_id).where(jobs.c.id == detail.get("job_id"))).first()
+    return None
+
+
+def again(call: Call, params: dict[str, Any]) -> dict[str, Any]:
+    if call.engine is None:
+        raise ToolError(500, "workflow.again needs the server's database.")
+    inputs = params.get("inputs") or {}
+    with call.engine.begin() as conn:
+        caller = _caller(call, conn)
+        target = conn.execute(select(workflows).where(workflows.c.id == caller.workflow_id)).first()
+        if target is None:
+            raise ToolError(404, "The calling run's workflow is gone.")
+        first = _queued_again(conn, call.run_id, call.step_id)
+        if first is not None:
+            return {"queued": True, "run_id": first.run_id, "job_id": first.id, "workflow": target.name}
+        # The run's newest job holds it, so its key is the one the next run waits behind.
+        own = conn.execute(select(jobs.c.concurrency_key, jobs.c.dry_run).where(jobs.c.run_id == call.run_id)
+                           .order_by(jobs.c.created_at.desc(), jobs.c.id.desc())).first()
+        if own is None or not own.concurrency_key:
+            raise ToolError(422, "The calling job has no concurrency key, so a run of it again could overlap it.")
+        if not target.current_version:
+            raise ToolError(422, f"{target.name} has no saved version.")
+        _check_inputs(target.name, defs.body_of(conn, defs.WORKFLOW, target.id, target.current_version), inputs)
+        try:
+            job_id = worker.queue_job(conn, team_id=caller.team_id, project_id=caller.project_id,
+                                      workflow_id=target.id, inputs=inputs, now=call.now, thread=caller.thread,
+                                      key=own.concurrency_key, dry_run=bool(own.dry_run), rerun_of=call.run_id,
+                                      requested_by=caller.triggered_by)
+        except ValueError as exc:
+            raise ToolError(422, f"A workflow {target.name} calls doesn't resolve: {exc}") from exc
+        audit.record(conn, action="run.again", actor_id=caller.triggered_by, team_id=caller.team_id,
+                     target_kind="run", target_id=call.run_id,
+                     detail={"step": call.step_id, "workflow": target.name, "job_id": job_id, "actor": caller.actor})
+    return {"queued": True, "run_id": None, "job_id": job_id, "workflow": target.name}
+
+
 def _check_inputs(name: str, body: str | None, inputs: dict[str, Any]) -> None:
     """``inputs`` fit the target's contracts.inputs, by the engine's own rules."""
     data = worker._load(body)
@@ -66,11 +121,7 @@ def handoff(call: Call, params: dict[str, Any]) -> dict[str, Any]:
         raise ToolError(400, "The step id is too long to hand off from.")
     name, inputs = params["workflow"], params.get("inputs") or {}
     with call.engine.begin() as conn:
-        # A write first, so a retried call waits for the first one and finds its job.
-        conn.execute(update(runs).where(runs.c.id == call.run_id).values(status=runs.c.status))
-        caller = conn.execute(select(runs).where(runs.c.id == call.run_id)).first()
-        if caller is None:
-            raise ToolError(404, "The calling run is gone.")
+        caller = _caller(call, conn)
         _check_target(conn, call.run_id, call.step_id, name)
         # Only a job this tool queued answers for the step. A rerun or a trigger's job may carry the same key.
         first = conn.execute(select(jobs.c.id, jobs.c.run_id, workflows.c.name).join(

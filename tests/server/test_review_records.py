@@ -79,7 +79,7 @@ def test_the_database_only_tools_resolve_no_connection(app, sqlite_engine, run, 
     assert {name for name, spec in registry().items() if spec.kind == NONE} == {
         "review.decisions", "review.record-risk", "review.record-post", "review.record-mark", "review.is-marked",
         "review.record-branch-review", "review.record-branch-mark", "insights.fix-context", "insights.fix-patch",
-        "insights.fix-risk", "insights.fix-apply", "workflow.handoff", "eval.replay-start", "eval.replay-report"}
+        "insights.fix-risk", "insights.fix-apply", "workflow.handoff", "workflow.again", "eval.replay-start", "eval.replay-report"}
     _risk(app, run)
     _post(app, run)
     assert _mark(app, run)["marked"] is True
