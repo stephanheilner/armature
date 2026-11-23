@@ -4,7 +4,8 @@ The target resolves by name the way a run in the caller's project resolves it, s
 team's workflow. Each step queues at most one job, so a retried step gets the job its first call queued.
 
 workflow.again: queue the caller's own workflow once more, at its current version, under the calling job's
-concurrency key, so the new run waits for this one to end and anything that supersedes the key supersedes it too.
+concurrency key, so the new run waits for this one to end and anything that supersedes the key supersedes it too. A
+dry run never reaches it, since the broker answers every write tool's dry run itself.
 """
 from __future__ import annotations
 
@@ -20,18 +21,19 @@ from armature.server.tools import Call, ToolError
 from armature.spec.contract_io import InputError, resolve_inputs
 
 ADAPTER = "workflow/handoff"
+AGAIN_ADAPTER = "workflow/again"
 KEY_MAX = 191
 
 
-def _named(conn: Any, job: Any, step: str) -> list[Any]:
-    """The with.workflow of each ``step`` stage that runs this adapter, in the bodies broker.step_tools reads."""
+def _named(conn: Any, job: Any, step: str, adapter: str = ADAPTER) -> list[Any]:
+    """The with.workflow of each ``step`` stage that runs ``adapter``, in the bodies broker.step_tools reads."""
     found = []
     for data in map(worker._load, broker.step_bodies(conn, job)):
         stages = data.get("stages") if isinstance(data, dict) else None
         adapters = data.get("adapters") if isinstance(data, dict) else None
         for stage in stages if isinstance(stages, list) else []:
-            if isinstance(stage, dict) and stage.get("id") == step and stage.get("adapter") == ADAPTER \
-                    and not (isinstance(adapters, dict) and ADAPTER in adapters):
+            if isinstance(stage, dict) and stage.get("id") == step and stage.get("adapter") == adapter \
+                    and not (isinstance(adapters, dict) and adapter in adapters):
                 given = stage.get("with")
                 found.append(given.get("workflow") if isinstance(given, dict) else None)
     return found
@@ -74,11 +76,15 @@ def again(call: Call, params: dict[str, Any]) -> dict[str, Any]:
         target = conn.execute(select(workflows).where(workflows.c.id == caller.workflow_id)).first()
         if target is None:
             raise ToolError(404, "The calling run's workflow is gone.")
+        job = conn.execute(select(jobs).where(jobs.c.run_id == call.run_id)).first()
+        if job is None or not _named(conn, job, call.step_id, AGAIN_ADAPTER):
+            raise ToolError(422, f"Step {call.step_id} runs its workflow again only when its stage names "
+                                 f"{AGAIN_ADAPTER}.")
         first = _queued_again(conn, call.run_id, call.step_id)
         if first is not None:
             return {"queued": True, "run_id": first.run_id, "job_id": first.id, "workflow": target.name}
         # The run's newest job holds it, so its key is the one the next run waits behind.
-        own = conn.execute(select(jobs.c.concurrency_key, jobs.c.dry_run).where(jobs.c.run_id == call.run_id)
+        own = conn.execute(select(jobs.c.concurrency_key).where(jobs.c.run_id == call.run_id)
                            .order_by(jobs.c.created_at.desc(), jobs.c.id.desc())).first()
         if own is None or not own.concurrency_key:
             raise ToolError(422, "The calling job has no concurrency key, so a run of it again could overlap it.")
@@ -88,7 +94,7 @@ def again(call: Call, params: dict[str, Any]) -> dict[str, Any]:
         try:
             job_id = worker.queue_job(conn, team_id=caller.team_id, project_id=caller.project_id,
                                       workflow_id=target.id, inputs=inputs, now=call.now, thread=caller.thread,
-                                      key=own.concurrency_key, dry_run=bool(own.dry_run), rerun_of=call.run_id,
+                                      key=own.concurrency_key, rerun_of=call.run_id,
                                       requested_by=caller.triggered_by)
         except ValueError as exc:
             raise ToolError(422, f"A workflow {target.name} calls doesn't resolve: {exc}") from exc

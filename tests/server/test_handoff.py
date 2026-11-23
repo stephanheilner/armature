@@ -450,14 +450,6 @@ def test_again_in_a_dry_run_queues_nothing(app, sqlite_engine, keyring, clock, w
     assert [j.id for j in _jobs(sqlite_engine) if j.id != run.job] == []
 
 
-def test_again_carries_the_callers_dry_mode(app, sqlite_engine, keyed):
-    with sqlite_engine.begin() as conn:
-        conn.execute(update(jobs).where(jobs.c.id == keyed.job).values(dry_run=True))
-    out = _ok(_again(app, keyed, inputs={"resume": "{}"}))
-    with sqlite_engine.connect() as conn:
-        assert conn.execute(select(jobs.c.dry_run).where(jobs.c.id == out["job_id"])).scalar()
-
-
 def test_again_is_a_database_only_write():
     spec = registry()["workflow.again"]
     assert spec.kind == NONE and spec.reads is False
@@ -479,4 +471,15 @@ def test_again_refuses_a_caller_with_no_key_or_inputs_its_workflow_doesnt_declar
         conn.execute(update(jobs).where(jobs.c.id == keyed.job).values(concurrency_key=None))
     _refused(_again(app, keyed, inputs={"resume": "{}"}), 422,
              "The calling job has no concurrency key, so a run of it again could overlap it.")
+    assert len(_jobs(sqlite_engine, world.workflow)) == 1
+
+
+def test_again_refuses_a_step_whose_stage_doesnt_name_it_even_past_the_broker(sqlite_engine, clock, keyed, world):
+    from armature.server.tools import ToolError, handoff
+
+    for step in ("handoff", "loop", "missing"):
+        call = SimpleNamespace(engine=sqlite_engine, run_id=keyed.id, step_id=step, now=clock())
+        with pytest.raises(ToolError, match=f"Step {step} runs its workflow again only when its stage names "
+                                            "workflow/again."):
+            handoff.again(call, {"inputs": {"resume": "{}"}})
     assert len(_jobs(sqlite_engine, world.workflow)) == 1

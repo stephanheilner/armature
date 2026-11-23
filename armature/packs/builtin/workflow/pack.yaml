@@ -32,9 +32,10 @@ adapters:
   again:
     description: >-
       Queue the calling workflow itself once more, at its current version, with inputs checked against its
-      contracts.inputs, under the calling job's concurrency key and dry mode, as a rerun of this run. The new run
+      contracts.inputs, under the calling job's concurrency key, as a rerun of this run. The new run
       waits for this one to end, and whatever supersedes the key supersedes it. A job with no concurrency key is
-      refused. A retried step gets the job its first call queued. Uses no connection.
+      refused, and so is a step whose stage doesn't name this adapter. A retried step gets the job its first call
+      queued. Uses no connection.
     cmd: armature tool workflow.again
     writes: true
     params:
