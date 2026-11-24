@@ -7,7 +7,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel
-from sqlalchemy import and_, delete, exists, func, insert, or_, select, update
+from sqlalchemy import and_, case, delete, exists, func, insert, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from armature.server import actions, audit, display, invites, rbac, subjects, trigger
@@ -42,7 +42,7 @@ from armature.server.db.schema import (
     users,
     workflows,
 )
-from armature.server.ingest import HOST_RUN, about
+from armature.server.ingest import HOST_RUN, RUN_KIND, about
 from armature.server.users import (
     LastAdmin,
     SlackTaken,
@@ -69,6 +69,7 @@ LIMIT_MAX = 200
 MAX_WORKFLOW_FILTER = 50
 LOOKUP_LIMIT = 20
 RUN_STATUSES = ("queued", "running", "waiting", "succeeded", "failed", "canceled", "lost")
+PR_FILTERS = ("done", "not_done")
 
 
 class NameBody(BaseModel):
@@ -694,14 +695,24 @@ def _fix_outcome(ref: Any) -> str | None:
     return outcome if isinstance(outcome, str) and outcome else None
 
 
-def _latest_per_subject(query):
-    """Keep the newest run of each thread or subject the query finds, with how many runs it stands for."""
+def _latest_per_subject(query, finished: bool = False):
+    """Keep the newest run of each thread or subject the query finds, with how many runs it stands for.
+
+    finished drops each group the query finds an open run in, so a thread lists as in progress until all of it ends.
+    """
     bucket = func.coalesce(runs.c.thread, runs.c.subject, runs.c.id)
     newest = (runs.c.started_at.desc(), runs.c.id.desc())
-    ranked = query.add_columns(func.row_number().over(partition_by=bucket, order_by=newest).label("subject_rank"),
-                               func.count().over(partition_by=bucket).label("group_size")).subquery()
-    latest = select(*[c for c in ranked.c if c.name != "subject_rank"]).where(ranked.c.subject_rank == 1)
-    return latest, ranked.c.started_at, ranked.c.id
+    windows = [func.row_number().over(partition_by=bucket, order_by=newest).label("subject_rank"),
+               func.count().over(partition_by=bucket).label("group_size")]
+    if finished:
+        windows.append(func.max(case((runs.c.status.in_(subjects.OPEN_RUNS), 1), else_=0))
+                       .over(partition_by=bucket).label("open_runs"))
+    ranked = query.add_columns(*windows).subquery()
+    latest = (select(*[c for c in ranked.c if c.name not in ("subject_rank", "open_runs")])
+              .where(ranked.c.subject_rank == 1))
+    if finished:
+        latest = latest.where(ranked.c.open_runs == 0)
+    return latest, ranked.c
 
 
 @router.get("/api/runs")
@@ -710,15 +721,19 @@ def list_runs(request: Request, team: str | None = None, project: str | None = N
               subject: str | None = Query(None, max_length=191), thread: str | None = Query(None, max_length=191),
               before: str | None = None,
               workflow_list: str | None = Query(None, alias="workflows", max_length=4000),
-              include_hidden: bool = False, group: bool = False,
+              include_hidden: bool = False, group: bool = False, finished: bool = False,
+              pr: str | None = None,
               limit: int = Query(LIMIT_DEFAULT, ge=1, le=LIMIT_MAX),
               session: Session = Depends(signed_in)) -> dict[str, Any]:
+    if pr not in (None, *PR_FILTERS):
+        raise ApiError(400, f"pr must be one of {', '.join(PR_FILTERS)}.")
     scope = rbac.visible_scope(_access(request, session))
     query = (select(runs.c.id, runs.c.team_id, runs.c.project_id,
-                    func.coalesce(workflows.c.name, runs.c.workflow_name).label("workflow"), runs.c.status,
-                    func.coalesce(runs.c.triggered_by, runs.c.actor).label("triggered_by"), runs.c.started_at,
-                    runs.c.finished_at, runs.c.cost_usd, runs.c.subject, runs.c.thread, runs.c.summary,
-                    runs.c.outcome, runs.c.risk, runs.c.location, HOST_RUN.label("host_run"), *trigger.columns())
+                    func.coalesce(workflows.c.name, runs.c.workflow_name).label("workflow"), RUN_KIND.label("kind"),
+                    runs.c.status, func.coalesce(runs.c.triggered_by, runs.c.actor).label("triggered_by"),
+                    runs.c.started_at, runs.c.finished_at, runs.c.cost_usd, runs.c.subject, runs.c.thread,
+                    runs.c.summary, runs.c.outcome, runs.c.risk, runs.c.location, HOST_RUN.label("host_run"),
+                    *trigger.columns())
              .select_from(runs.outerjoin(workflows, workflows.c.id == runs.c.workflow_id)
                           .outerjoin(runner_keys, runner_keys.c.id == runs.c.runner_key_id))
              .where(rbac.scope_clause(scope, runs.c.team_id, runs.c.project_id)))
@@ -756,21 +771,27 @@ def list_runs(request: Request, team: str | None = None, project: str | None = N
             if actors:
                 actor = func.coalesce(runs.c.triggered_by, runs.c.actor)
                 query = query.where(or_(actor.is_(None), actor.not_in(actors)))
-        at, row_id = runs.c.started_at, runs.c.id
+        listed_by = runs.c
         if group:
-            query, at, row_id = _latest_per_subject(query)
+            query, listed_by = _latest_per_subject(query, finished)
+        elif finished:
+            query = query.where(runs.c.status.not_in(subjects.OPEN_RUNS))
+        if pr:
+            done = subjects.pull_done(scope, listed_by.subject, listed_by.team_id)
+            query = query.where(done if pr == "done" else ~done)
+        at, row_id = listed_by.started_at, listed_by.id
         clause = _before_clause(cursor, at, row_id)
         if clause is not None:
             query = query.where(clause)
         rows = conn.execute(query.order_by(at.desc(), row_id.desc()).limit(limit)).all()
-        pulls = subjects.pull_states(conn, scope, {r.subject for r in rows if r.subject})
+        pulls = subjects.pull_states(conn, scope, {(r.subject, r.team_id) for r in rows if r.subject})
         started = trigger.describe(conn, [r._mapping for r in rows])
         job_of = subjects.open_jobs(conn, rows)
-    listed = [{"id": r.id, "team_id": r.team_id, "project_id": r.project_id, "workflow": r.workflow,
+    listed = [{"id": r.id, "team_id": r.team_id, "project_id": r.project_id, "workflow": r.workflow, "kind": r.kind,
                "status": r.status, "triggered_by": r.triggered_by, "started_at": r.started_at,
                "finished_at": r.finished_at,
                "cost_usd": float(r.cost_usd) if r.cost_usd is not None and settings["show_cost"] else None,
-               **about(r.subject, r.summary), "thread": r.thread, "pr": pulls.get(r.subject),
+               **about(r.subject, r.summary), "thread": r.thread, "pr": pulls.get((r.subject, r.team_id)),
                "outcome": r.outcome, "fix_outcome": _fix_outcome(r.trigger_ref), "risk": r.risk,
                "trigger": started[r.id], "location": r.location, "job": job_of.get(r.id),
                "host_cancel": actions.host_cancel(configured, r._mapping),

@@ -32,7 +32,7 @@ test('verdictText maps review verdicts and tidies the rest', () => {
   assert.equal(verdictText(null), '');
 });
 
-test('runStatus puts activity and failures before the pull request state', () => {
+test('runStatus puts activity first, then a merged or closed pull request, then failures and the verdict', () => {
   const approved = { verdict: 'approve', merged: false };
   const cases = [
     [{ status: 'running' }, { verdict: 'approve', merged: true }, 'In Progress', 'running'],
@@ -41,8 +41,8 @@ test('runStatus puts activity and failures before the pull request state', () =>
     [{ status: 'canceled' }, approved, 'Canceled', 'unknown'],
     [{ status: 'lost' }, approved, 'Lost', 'warn'],
     [{ status: 'succeeded', verdict: 'No changes' }, approved, 'Approved', 'ok'],
-    [{ status: 'succeeded' }, { verdict: 'Approval Recommended', merged: true }, 'Approved - Merged', 'ok'],
-    [{ status: 'succeeded' }, { verdict: 'comment', merged: true }, 'Changes Recommended - Merged', 'warn'],
+    [{ status: 'succeeded' }, { verdict: 'Approval Recommended', merged: true }, 'Merged', 'ok'],
+    [{ status: 'succeeded' }, { verdict: 'comment', merged: true }, 'Merged', 'ok'],
     [{ status: 'succeeded' }, { verdict: 'comment', merged: false }, 'Changes Recommended', 'warn'],
     [{ status: 'succeeded' }, { verdict: null, merged: true }, 'Merged', 'ok'],
     [{ status: 'succeeded', verdict: 'No changes' }, { verdict: null, merged: false }, 'No changes', 'ok'],
@@ -60,13 +60,16 @@ test('runStatus puts activity and failures before the pull request state', () =>
   for (const [run, pr, text, tone] of cases) assert.deepEqual(runStatus(run, pr), { text, tone }, JSON.stringify([run, pr]));
 });
 
-test('runStatus shows a grouped row whose thread has an open run as in progress, not its finished verdict', () => {
-  const approved = { verdict: 'approve', merged: false };
-  assert.deepEqual(runStatus({ status: 'succeeded' }, approved, true), { text: 'In Progress', tone: 'running' });
-  assert.deepEqual(runStatus({ status: 'failed' }, null, true), { text: 'In Progress', tone: 'running' });
-  assert.deepEqual(runStatus({ status: 'waiting' }, null, true), { text: 'Waiting for approval', tone: 'warn' });
-  assert.deepEqual(runStatus({ status: 'succeeded' }, approved, false), { text: 'Approved', tone: 'ok' });
-  assert.deepEqual(runStatus({ status: 'succeeded' }, approved), { text: 'Approved', tone: 'ok' });
+test('runStatus reads Merged or Closed for a pull request that ended, never its verdict', () => {
+  const merged = { verdict: 'approve', merged: true, state: 'merged' };
+  const incremental = { verdict: 'Approved (incremental)', merged: false, state: 'merged' };
+  const closed = { verdict: 'approve', merged: false, state: 'closed' };
+  assert.deepEqual(runStatus({ status: 'succeeded' }, merged), { text: 'Merged', tone: 'ok' });
+  assert.deepEqual(runStatus({ status: 'succeeded' }, incremental), { text: 'Merged', tone: 'ok' });
+  assert.deepEqual(runStatus({ status: 'failed' }, merged), { text: 'Merged', tone: 'ok' });
+  assert.deepEqual(runStatus({ status: 'succeeded' }, closed), { text: 'Closed', tone: 'unknown' });
+  assert.deepEqual(runStatus({ status: 'running' }, closed), { text: 'In Progress', tone: 'running' });
+  assert.deepEqual(runStatus({ status: 'succeeded' }, { verdict: 'approve', merged: false, state: 'open' }), { text: 'Approved', tone: 'ok' });
 });
 
 test('subjectHref links the subject page', () => {
@@ -98,22 +101,26 @@ test('workflow choices round-trip through the hash', () => {
 
 test('listParams asks the API for the chosen workflows and hidden ones', () => {
   const params = listParams({ team: 't', subject: 'MEM-1', workflows: ['a', 'b'], hidden: true }, 'cursor');
-  assert.equal(String(params), 'limit=50&team=t&subject=MEM-1&workflows=a%2Cb&include_hidden=1&group=1&before=cursor');
-  assert.equal(String(listParams({ workflows: [] })), 'limit=10&group=1');
-  assert.equal(String(listParams({ workflows: [], every: true })), 'limit=10');
+  assert.equal(String(params), 'limit=50&team=t&subject=MEM-1&workflows=a%2Cb&include_hidden=1&group=1&finished=1&pr=not_done&before=cursor');
+  assert.equal(String(listParams({ workflows: [] })), 'limit=10&group=1&finished=1&pr=not_done');
+  assert.equal(String(listParams({ workflows: [], every: true })), 'limit=10&finished=1&pr=not_done');
 });
 
-test('the recent list asks for ten rows, all asks for a page, and open runs come ungrouped', () => {
-  assert.equal(String(listParams({ workflows: [], all: true })), 'limit=50&group=1');
+test('the recent and completed lists ask for ten rows, a paged one for a page, and open runs come ungrouped', () => {
+  assert.equal(String(listParams({ workflows: [], all: true })), 'limit=50&group=1&finished=1&pr=not_done');
+  assert.equal(String(listParams({ workflows: [], all: true }, '', 'done')), 'limit=10&group=1&finished=1&pr=done');
+  assert.equal(String(listParams({ workflows: [], completed: true }, 'cursor', 'done')), 'limit=50&group=1&finished=1&pr=done&before=cursor');
+  assert.equal(String(listParams({ workflows: [], completed: true })), 'limit=10&group=1&finished=1&pr=not_done');
   assert.equal(String(openParams({ team: 't', workflows: ['a'], all: false })), 'limit=200&team=t&status=queued%2Crunning%2Cwaiting&workflows=a');
   assert.equal(String(openParams({ status: 'waiting', workflows: [] })), 'limit=200&status=waiting');
   assert.equal(openParams({ status: 'failed', workflows: [] }), null);
   assert.equal(hashFor('runs', [], hashParams({ workflows: [], all: true })), '#/runs?all=1');
   assert.equal(hashFor('runs', [], hashParams({ workflows: [], all: false })), '#/runs');
+  assert.equal(hashFor('runs', [], hashParams({ workflows: [], completed: true })), '#/runs?completed=1');
 });
 
 test('a thread filter reaches the API and the hash, and groups a pull request with its issue', () => {
-  assert.equal(String(listParams({ thread: 'MEM-1', workflows: [], every: true })), 'limit=10&thread=MEM-1');
+  assert.equal(String(listParams({ thread: 'MEM-1', workflows: [], every: true })), 'limit=10&thread=MEM-1&finished=1&pr=not_done');
   assert.equal(hashFor('runs', [], hashParams({ thread: 'MEM-1', workflows: [], every: true })), '#/runs?thread=MEM-1&every=1');
   assert.equal(threadOf({ subject: 'acme/app#7', thread: 'MEM-1' }), 'MEM-1');
   assert.equal(threadOf({ subject: 'acme/app#7', thread: null }), 'acme/app#7');

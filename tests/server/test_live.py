@@ -480,9 +480,10 @@ def test_runs_stream_is_scoped(live, world):
         rows = [f["data"] for f in mine_frames if f.get("event") == "run"]
         assert {r["id"] for r in rows} == {run["run_id"]}
         assert [r["status"] for r in rows] == ["running", "succeeded"]
-        assert set(rows[0]) == {"id", "team_id", "project_id", "workflow", "status", "triggered_by", "started_at",
-                                "finished_at", "cost_usd", "subject", "thread", "title", "verdict", "trigger",
-                                "links", "outcome", "risk", "location", "host_cancel"}
+        assert set(rows[0]) == set(rows[1]) == {
+            "id", "team_id", "project_id", "workflow", "kind", "status", "triggered_by", "started_at", "finished_at",
+            "cost_usd", "subject", "thread", "title", "verdict", "trigger", "links", "outcome", "risk", "location",
+            "host_cancel"}
         theirs_frames = theirs.until(lambda f: any(x.get("event") == "run" for x in f))
         assert [f["data"]["id"] for f in theirs_frames if f.get("event") == "run"] == [other_run["run_id"]]
 

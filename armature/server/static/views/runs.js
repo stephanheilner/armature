@@ -14,6 +14,9 @@ const PAGE_SIZE = 50;
 const RECENT_ROWS = 10;
 const MAX_ROWS = 200;
 const POLL_MS = 5000;
+const ENDED_HOLD_MS = 10000;
+// Past the writer's 1 s flush, so a list reloaded then has every end the stream reported.
+const LATE_RELOAD_MS = 1500;
 const APPROVED = new Set(['approve', 'approved', 'approval recommended']);
 const CHANGES = new Set(['comment', 'changes', 'request_changes', 'changes_requested', 'changes recommended']);
 const OUTCOMES = { opened: 'PR Created', pr_opened: 'PR Created', recommended: 'Changes Recommended', noop: 'Nothing to Do', pushed: 'Changes Pushed', 'review-blocked': 'Review Blocked', 'dry-run': 'Dry Run', 'push-failed': 'Push Failed',
@@ -23,6 +26,7 @@ const ACTIVE = new Set(['queued', 'running']);
 const ACTIVE_OR_WAITING = new Set(['queued', 'running', 'waiting']);
 const ENDED = new Set(['failed', 'canceled', 'lost']);
 const SETTLED = new Set(['succeeded', 'failed', 'canceled']);
+const PR_ENDS = { merged: { text: 'Merged', tone: 'ok' }, closed: { text: 'Closed', tone: 'unknown' } };
 
 export const runHeaders = (display) => [['Started', 'col-tight'], ['Run', 'col-title'], ['Workflow', 'col-tight'], 'Links',
   ['Outcome', 'col-tight'], ['Where', 'col-tight'], 'Trigger', ['Time', 'num col-tight'], ...(display?.show_cost ? [['Cost', 'num col-tight']] : [])];
@@ -51,17 +55,16 @@ const outcomeTone = (label) => {
   return /fail|reject|block/i.test(label) ? 'bad' : 'ok';
 };
 
-// threadOpen marks a grouped row whose thread still has an open run, which can be older than the row's own run.
-export function runStatus(run, pr, threadOpen = false) {
+// The end of a merged or closed pull request, else null.
+const prEnd = (pr) => PR_ENDS[pr?.state || (pr?.merged ? 'merged' : '')] || null;
+
+export function runStatus(run, pr) {
   if (ACTIVE.has(run.status)) return { text: 'In Progress', tone: 'running' };
   if (run.status === 'waiting') return { text: 'Waiting for approval', tone: 'warn' };
-  if (threadOpen) return { text: 'In Progress', tone: 'running' };
+  if (prEnd(pr)) return { ...prEnd(pr) };
   if (ENDED.has(run.status)) return { text: statusText(run.status), tone: statusTone(run.status) };
-  if (pr) {
-    const verdict = verdictText(pr.verdict);
-    const text = [verdict, pr.merged ? 'Merged' : ''].filter(Boolean).join(' - ');
-    if (text) return { text, tone: outcomeTone(verdict) };
-  }
+  const verdict = verdictText(pr?.verdict);
+  if (verdict) return { text: verdict, tone: outcomeTone(verdict) };
   // A typed outcome only exists on newer runs. Older ones read as they always did: verdict, then fix outcome.
   const own = verdictText(run.outcome) || verdictText(run.verdict) || verdictText(run.fix_outcome) || 'Done';
   return { text: own, tone: outcomeTone(own) };
@@ -73,12 +76,18 @@ export function chosenWorkflows(query) {
   return [...new Set(String(query.get('workflows') || '').split(',').map((name) => name.trim()).filter(Boolean))];
 }
 
-export function listParams(filter, before = '') {
-  const params = new URLSearchParams({ limit: String(filter.all || before ? PAGE_SIZE : RECENT_ROWS) });
+// section is 'recent' for finished runs on open work, 'done' for merged or closed pull requests, '' for every run.
+export function listParams(filter, before = '', section = 'recent') {
+  const paged = section === 'done' ? filter.completed : filter.all;
+  const params = new URLSearchParams({ limit: String(paged || before ? PAGE_SIZE : RECENT_ROWS) });
   for (const key of ['team', 'project', 'status', 'subject', 'thread']) if (filter[key]) params.set(key, filter[key]);
   if (filter.workflows?.length) params.set('workflows', filter.workflows.join(','));
   if (filter.hidden) params.set('include_hidden', '1');
   if (!filter.every) params.set('group', '1');
+  if (section) {
+    params.set('finished', '1');
+    params.set('pr', section === 'done' ? 'done' : 'not_done');
+  }
   if (before) params.set('before', before);
   return params;
 }
@@ -86,14 +95,15 @@ export function listParams(filter, before = '') {
 // Null when the chosen status is never open, so nothing is in progress.
 export function openParams(filter) {
   if (filter.status && !ACTIVE_OR_WAITING.has(filter.status)) return null;
-  const params = listParams({ ...filter, every: true, status: filter.status || [...ACTIVE_OR_WAITING].join(',') });
+  const params = listParams({ ...filter, every: true, status: filter.status || [...ACTIVE_OR_WAITING].join(',') }, '', '');
   params.set('limit', String(MAX_ROWS));
   return params;
 }
 
 export function hashParams(filter) {
   return { team: filter.team, project: filter.project, status: filter.status, subject: filter.subject, thread: filter.thread,
-    workflows: filter.workflows?.join(',') || '', hidden: filter.hidden ? '1' : '', every: filter.every ? '1' : '', all: filter.all ? '1' : '' };
+    workflows: filter.workflows?.join(',') || '', hidden: filter.hidden ? '1' : '', every: filter.every ? '1' : '', all: filter.all ? '1' : '',
+    completed: filter.completed ? '1' : '' };
 }
 
 export const threadOf = (run) => run.thread || run.subject || '';
@@ -274,17 +284,19 @@ export async function render(root, { query, signal }) {
     subject ? element('span', { class: 'muted' }, `Subject: ${subject} `, link(hashFor('runs'), 'Clear')) : null,
     thread ? element('span', { class: 'muted' }, `Thread: ${thread} `, link(hashFor('runs'), 'Clear')) : null);
   const capsuleRow = element('div', { class: 'capsules', role: 'group', 'aria-label': 'Show one workflow' });
-  const all = query.get('all') === '1' || Boolean(query.get('before'));
+  const completed = query.get('completed') === '1';
+  const all = !completed && (query.get('all') === '1' || Boolean(query.get('before')));
   const openArea = element('div', {}, loading());
   const body = element('div', {}, loading());
-  root.append(capsuleRow, filters, element('h2', {}, 'In progress'), openArea, element('h2', {}, all ? 'All runs' : 'Recent'), body);
+  const doneArea = element('div', {}, loading());
+  root.append(capsuleRow, filters, element('h2', {}, 'In progress'), openArea, element('h2', {}, 'Recent'), body, element('h2', {}, 'Completed'), doneArea);
 
   const [teams, display, definitions] = await Promise.all([
     api('/api/teams').then((payload) => listOf(payload, 'teams')).catch(() => []),
     loadDisplay(),
     api('/api/workflows').then((payload) => listOf(payload, 'workflows')).catch(() => []),
   ]);
-  const filter = { team: '', project: '', status: statusSelect.value, subject, thread, workflows: chosenWorkflows(query), hidden: hiddenBox.checked, every: everyBox.checked, all };
+  const filter = { team: '', project: '', status: statusSelect.value, subject, thread, workflows: chosenWorkflows(query), hidden: hiddenBox.checked, every: everyBox.checked, all, completed };
   let before = query.get('before') || '';
   const names = new Set(definitions.map((definition) => definition.name));
   const fillWorkflows = (more) => {
@@ -310,7 +322,7 @@ export async function render(root, { query, signal }) {
   filters.addEventListener('submit', (submitEvent) => {
     submitEvent.preventDefault();
     location.hash = hashFor('runs', [], hashParams({ team: teamSelect.value, project: projectSelect.value, status: statusSelect.value, subject, thread,
-      workflows: [...workflowSelect.selectedOptions].map((option) => option.value), hidden: hiddenBox.checked, every: everyBox.checked, all }));
+      workflows: [...workflowSelect.selectedOptions].map((option) => option.value), hidden: hiddenBox.checked, every: everyBox.checked, all, completed }));
   });
 
   const prs = new Map();
@@ -321,13 +333,12 @@ export async function render(root, { query, signal }) {
   // Stream updates carry no group_size, so each row keeps the count its run was listed with.
   const sizes = new Map();
   const counted = new Set();
-  // Open run id to its thread, for the In progress table and for grouped rows whose thread is still open.
+  // Open run id to its thread. While a thread has an open run it lists only in progress.
   let openThreads = new Map();
   const threadOpen = (key) => Boolean(key) && [...openThreads.values()].includes(key);
-  const shownRuns = new Map();
   const cells = (run, grouped) => {
     const pr = prFor(run);
-    const status = runStatus(run, pr, grouped && !filter.every && threadOpen(threadOf(run)));
+    const status = runStatus(run, pr);
     const count = grouped ? groupText(sizes.get(String(run.id))) : '';
     return [
       link(hashFor('run', [run.id]), shortWhen(run.started_at), { title: `Open this run, started ${when(run.started_at)}` }),
@@ -340,7 +351,6 @@ export async function render(root, { query, signal }) {
   const headers = runHeaders(display);
   const rowFor = (run, grouped = true) => {
     if (run.group_size) sizes.set(String(run.id), run.group_size);
-    if (grouped) shownRuns.set(String(run.id), run);
     const row = tableRow(headers, cells(run, grouped));
     row.dataset.runId = String(run.id);
     row.dataset.href = runRowHref(run);
@@ -401,7 +411,7 @@ export async function render(root, { query, signal }) {
     openFailed = false;
     showOpen();
     if (scrolledPast) window.scrollBy(0, openArea.getBoundingClientRect().height - height);
-    refreshThreads();
+    if (!filter.every) for (const key of new Set(openThreads.values())) dropThread(key);
   };
   // Returns the threads whose open state the run changed.
   const upsertOpen = (run) => {
@@ -438,42 +448,67 @@ export async function render(root, { query, signal }) {
   let runTable = table(headers, []);
   let tbody = runTable.querySelector('tbody');
   let tableCard = card(runTable);
-  let emptyCard = card(empty('No runs yet.'));
+  let emptyCard = card(empty('No finished runs yet.'));
   let listToken = 0;
-  const refreshThreads = (keys = null) => {
-    if (filter.every) return;
-    for (const row of [...tbody.rows]) {
-      const run = shownRuns.get(row.dataset.runId);
-      if (run && (!keys || keys.has(row.dataset.thread))) refreshRow(row, rowFor(run));
-    }
-  };
-  const loadList = async () => {
-    const token = ++listToken;
+  let doneToken = 0;
+  // Only the section the page is paging through takes the cursor.
+  const olderPage = (done) => Boolean(before) && (done ? filter.completed : filter.all);
+  // Shows one history section and returns its table, or null when it failed or a newer load replaced it.
+  const loadSection = async (area, done, token, latest) => {
+    const cursor = olderPage(done) ? before : '';
     let page;
     try {
-      page = await api(`/api/runs?${listParams(filter, before)}`);
+      page = await api(`/api/runs?${listParams(filter, cursor, done ? 'done' : 'recent')}`);
     } catch (err) {
-      if (token === listToken) clear(body).append(errorBox(err));
-      return;
+      if (token === latest()) clear(area).append(errorBox(err));
+      return null;
     }
-    if (token !== listToken || signal?.aborted) return;
-    const runs = listOf(page, 'runs');
-    fillWorkflows(runs.map((run) => run.workflow));
-    const isFiltered = [filter.team, filter.project, filter.status, filter.subject, filter.thread, filter.workflows.length, before].some(Boolean);
-    emptyCard = card(empty(isFiltered ? 'No runs match these filters. Clear a filter to see more.' : 'No runs yet.'));
-    runTable = table(headers, []);
-    tbody = runTable.querySelector('tbody');
-    for (const run of runs) tbody.append(rowFor(run));
-    tableCard = card(runTable);
-    clear(body).append(runs.length ? tableCard : emptyCard);
-    if (!filter.all) {
-      if (runs.length) body.append(element('p', { class: 'note' }, link(hashFor('runs', [], { ...hashParams(filter), all: '1' }), 'See all runs')));
-      return;
+    if (token !== latest() || signal?.aborted) return null;
+    const listed = listOf(page, 'runs');
+    fillWorkflows(listed.map((run) => run.workflow));
+    // A list fetched before the open runs can still hold a thread that is now in progress.
+    const runs = filter.every ? listed : listed.filter((run) => !threadOpen(threadOf(run)));
+    const isFiltered = [filter.team, filter.project, filter.status, filter.subject, filter.thread, filter.workflows.length, cursor].some(Boolean);
+    const shown = { runTable: table(headers, []) };
+    shown.emptyCard = card(empty(isFiltered ? 'No runs match these filters. Clear a filter to see more.'
+      : (done ? 'No merged or closed pull requests yet.' : 'No finished runs yet.')));
+    shown.tbody = shown.runTable.querySelector('tbody');
+    for (const run of runs) shown.tbody.append(rowFor(run));
+    shown.tableCard = card(shown.runTable);
+    const scrolledPast = window.scrollY > 0 && area.getBoundingClientRect().top < 0;
+    const height = area.getBoundingClientRect().height;
+    clear(area).append(runs.length ? shown.tableCard : shown.emptyCard);
+    if (!(done ? filter.completed : filter.all)) {
+      const seeAll = { ...hashParams(filter), all: done ? '' : '1', completed: done ? '1' : '' };
+      if (runs.length) area.append(element('p', { class: 'note' }, link(hashFor('runs', [], seeAll), done ? 'See all' : 'See all runs')));
+    } else {
+      const pager = element('nav', { class: 'pager', 'aria-label': 'Pages' });
+      if (cursor) pager.append(link(hashFor('runs', [], hashParams(filter)), 'Newest'));
+      if (page.next_before) pager.append(link(hashFor('runs', [], { ...hashParams(filter), before: page.next_before }), 'Older'));
+      if (pager.firstChild) area.append(pager);
     }
-    const pager = element('nav', { class: 'pager', 'aria-label': 'Pages' });
-    if (before) pager.append(link(hashFor('runs', [], hashParams(filter)), 'Newest'));
-    if (page.next_before) pager.append(link(hashFor('runs', [], { ...hashParams(filter), before: page.next_before }), 'Older'));
-    if (pager.firstChild) body.append(pager);
+    if (scrolledPast) window.scrollBy(0, area.getBoundingClientRect().height - height);
+    return shown;
+  };
+  // The writer stores a run's end up to a second after the stream reports it, and a list fetched between drops its thread.
+  const ended = new Map();
+  const loadList = async () => {
+    const shown = await loadSection(body, false, ++listToken, () => listToken);
+    if (!shown) return;
+    ({ runTable, tbody, tableCard, emptyCard } = shown);
+    const now = Date.now();
+    for (const [id, [at, run]] of [...ended].sort((left, right) => (isNewer(left[1][1], right[1][1]) ? 1 : -1))) {
+      if (now - at > ENDED_HOLD_MS) ended.delete(id);
+      else if (!olderPage(false)) upsert(run);
+    }
+  };
+  const loadDone = () => loadSection(doneArea, true, ++doneToken, () => doneToken);
+  const reloadHistory = () => Promise.all([olderPage(false) ? null : loadList(), olderPage(true) ? null : loadDone()]);
+  // Returns whether a row left, so the section can refill.
+  const dropThread = (key) => {
+    const rows = [body, doneArea].flatMap((area) => [...area.querySelectorAll('tr')]).filter((row) => row.dataset.thread === key);
+    for (const row of rows) row.remove();
+    return rows.length > 0;
   };
 
   const ticker = setInterval(() => {
@@ -483,6 +518,7 @@ export async function render(root, { query, signal }) {
   signal?.addEventListener('abort', () => clearInterval(ticker));
   body.addEventListener('click', openRow);
   openArea.addEventListener('click', openRow);
+  doneArea.addEventListener('click', openRow);
 
   // Capsules filter in place, without reloading the page.
   const capsuleButtons = new Map();
@@ -494,9 +530,10 @@ export async function render(root, { query, signal }) {
     for (const item of capsules(display, [...names], filter.workflows)) capsuleButtons.get(item.id)?.setAttribute('aria-pressed', String(item.pressed));
     loadList();
     loadOpen();
+    loadDone();
   };
 
-  await Promise.all([loadList(), loadOpen()]);
+  await Promise.all([loadList(), loadOpen(), loadDone()]);
   const shownCapsules = capsules(display, [...names], filter.workflows);
   for (const item of shownCapsules) {
     const button = element('button', { type: 'button', class: 'capsule', 'aria-pressed': String(item.pressed) },
@@ -508,20 +545,40 @@ export async function render(root, { query, signal }) {
 
   const pending = new Map();
   let frame = 0;
+  let lateReload = 0;
+  signal?.addEventListener('abort', () => clearTimeout(lateReload));
   const flush = () => {
     frame = 0;
     const batch = [...pending.values()];
     pending.clear();
     if (signal?.aborted) return;
-    const touched = new Set();
+    let reload = false;
     for (const run of batch) {
-      for (const key of upsertOpen(run)) touched.add(key);
-      if (!before) upsert(run);
+      for (const key of upsertOpen(run)) {
+        if (!threadOpen(key)) reload = true;
+        else if (!filter.every && dropThread(key)) reload = true;
+      }
+      if (!ACTIVE_OR_WAITING.has(run.status)) ended.set(String(run.id), [Date.now(), run]);
+      if (!olderPage(false)) upsert(run);
+      // A merge run moves its pull request to Completed, even when this page's filters leave the run itself out.
+      if (run.kind === 'merge') reload = true;
     }
-    if (touched.size && !before) refreshThreads(touched);
+    if (!reload) return;
+    reloadHistory();
+    if (batch.some((run) => !ACTIVE_OR_WAITING.has(run.status))) {
+      clearTimeout(lateReload);
+      lateReload = setTimeout(reloadHistory, LATE_RELOAD_MS);
+    }
   };
   const upsert = (run) => {
     const existing = tbody.querySelector(`tr[data-run-id="${CSS.escape(String(run.id))}"]`);
+    if (ACTIVE_OR_WAITING.has(run.status) || run.kind === 'merge' || prEnd(prFor(run)) || (!filter.every && threadOpen(threadOf(run)))) {
+      if (existing) {
+        existing.remove();
+        counted.delete(String(run.id));
+      }
+      return;
+    }
     if (existing && (filter.every || !rethreaded(existing.dataset.thread, run))) {
       refreshRow(existing, rowFor(run));
       return;
@@ -545,7 +602,7 @@ export async function render(root, { query, signal }) {
       counted.add(id);
       replaced.remove();
     } else if (grouped) {
-      const params = listParams({ ...filter, thread: key });
+      const params = listParams({ ...filter, thread: key }, '', 'recent');
       params.set('limit', '1');
       api(`/api/runs?${params}`).then((page) => {
         const latest = listOf(page, 'runs')[0];
@@ -574,11 +631,7 @@ export async function render(root, { query, signal }) {
     events: { run: receive },
     onState: (state) => { liveNote.textContent = states[state] || ''; },
     // Events missed while the stream was down would leave runs in progress that have ended.
-    onOpen: loadOpen,
-    onFallback: () => every(POLL_MS, async () => {
-      await loadOpen();
-      if (before) return;
-      for (const run of listOf(await api(`/api/runs?${listParams(filter)}`), 'runs').reverse()) receive(run);
-    }, signal),
+    onOpen: () => Promise.all([loadOpen(), reloadHistory()]),
+    onFallback: () => every(POLL_MS, () => Promise.all([loadOpen(), reloadHistory()]), signal),
   }, { signal });
 }

@@ -288,7 +288,7 @@ def about(subject: str | None, reported: Any) -> dict[str, Any]:
 
 def list_row(summary: dict[str, Any], configured: Sequence[ActionConfig] = ()) -> dict[str, Any]:
     """The fields a row of ``GET /api/runs`` has."""
-    return {**{k: summary[k] for k in ("id", "team_id", "project_id", "workflow", "status", "triggered_by",
+    return {**{k: summary[k] for k in ("id", "team_id", "project_id", "workflow", "kind", "status", "triggered_by",
                                        "started_at", "finished_at", "cost_usd")},
             **about(summary.get("subject"), summary.get("summary")), "thread": summary.get("thread"),
             "outcome": summary.get("outcome"), "risk": summary.get("risk"), "trigger": summary.get("trigger"),

@@ -6,13 +6,15 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import Connection, String, and_, cast, func, or_, select
+from sqlalchemy import Connection, String, and_, cast, func, or_, select, tuple_
 
 from armature.server import actions, display, rbac
 from armature.server.config import ActionConfig
 from armature.server.db.schema import (
     connections,
     findings,
+    gh_pull_requests,
+    gh_repos,
     jobs,
     run_artifacts,
     runner_keys,
@@ -33,6 +35,7 @@ SEARCH_BATCHES = 10
 HEAD_LENGTH = 12
 POSTED_LABEL = "Posted result"
 LOGIN_MAX = 100
+DONE_STATES = ("merged", "closed")
 
 WORKFLOW = func.coalesce(workflows.c.name, runs.c.workflow_name)
 
@@ -109,19 +112,71 @@ def _latest(ordered: list[Any], field: str) -> str | None:
     return None
 
 
-def pull_states(conn: Connection, scope: rbac.Scope, names: set[str]) -> dict[str, dict[str, Any]]:
-    """Each pull request subject's title, latest review verdict, and whether it merged, across its visible runs."""
-    pulls = sorted(name for name in names if PULL_SUBJECT.fullmatch(name))
-    if not pulls:
+def _stored_states(conn: Connection, keys: set[tuple[str, str]]) -> dict[tuple[str, str], str]:
+    """Each team and subject's merged or closed state as that team's GitHub sync stored it."""
+    wanted: dict[tuple[str, str, int], set[str]] = {}
+    for team_id, name in keys:
+        repo, _, number = name.rpartition("#")
+        wanted.setdefault((team_id, repo.lower(), int(number)), set()).add(name)
+    if not wanted:
         return {}
+    rows = conn.execute(select(gh_pull_requests.c.team_id, gh_repos.c.full_name, gh_pull_requests.c.number,
+                               gh_pull_requests.c.state)
+                        .join(gh_repos, gh_repos.c.id == gh_pull_requests.c.repo_row_id)
+                        .where(gh_repos.c.team_id == gh_pull_requests.c.team_id,
+                               gh_pull_requests.c.team_id.in_({team for team, _, _ in wanted}),
+                               gh_pull_requests.c.number.in_({number for _, _, number in wanted}),
+                               gh_pull_requests.c.state.in_(DONE_STATES)))
+    states: dict[tuple[str, str], str] = {}
+    for row in rows:
+        for name in wanted.get((row.team_id, row.full_name.lower(), row.number), ()):
+            if states.get((row.team_id, name)) != "merged":
+                states[(row.team_id, name)] = row.state
+    return states
+
+
+def pull_states(conn: Connection, scope: rbac.Scope,
+                listed: set[tuple[str, str]]) -> dict[tuple[str, str], dict[str, Any]]:
+    """Each listed subject and team's pull request title, latest review verdict, and merged or closed state.
+
+    Title, verdict, and merged come from the subject's visible runs. state is merged once one of them is a merge run,
+    else what the listed team's GitHub sync stored, merged or closed, else open, as pull_done filters.
+    """
+    keys = {(subject, team_id) for subject, team_id in listed if PULL_SUBJECT.fullmatch(subject)}
+    if not keys:
+        return {}
+    pulls = sorted({subject for subject, _ in keys})
     by_subject: dict[str, list[Any]] = {name: [] for name in pulls}
     query = _run_query(scope).where(runs.c.subject.in_(pulls)).order_by(runs.c.started_at, runs.c.id)
     for run in conn.execute(query).all():
         by_subject[run.subject].append(run)
-    return {name: {"title": _latest(ordered, "title"),
-                   "verdict": _latest([run for run in ordered if run.kind == "review"], "verdict"),
-                   "merged": any(run.kind == "merge" for run in ordered)}
-            for name, ordered in by_subject.items() if ordered}
+    stored = _stored_states(conn, {(team_id, subject) for subject, team_id in keys})
+    found: dict[tuple[str, str], dict[str, Any]] = {}
+    for subject, team_id in keys:
+        ordered = by_subject[subject]
+        if not ordered:
+            continue
+        merged = any(run.kind == "merge" for run in ordered)
+        found[(subject, team_id)] = {
+            "title": _latest(ordered, "title"),
+            "verdict": _latest([run for run in ordered if run.kind == "review"], "verdict"),
+            "merged": merged, "state": "merged" if merged else stored.get((team_id, subject), "open")}
+    return found
+
+
+def pull_done(scope: rbac.Scope, subject: Any, team_id: Any) -> Any:
+    """A filter for rows whose subject pull_states calls merged or closed, keyed on the row's own team."""
+    merges = runs.alias("merges")
+    merge_kind = workflows.alias("merge_kind")
+    merged = (select(merges.c.subject).join(merge_kind, merge_kind.c.id == merges.c.workflow_id)
+              .where(merges.c.subject.is_not(None), merge_kind.c.kind == "merge",
+                     rbac.scope_clause(scope, merges.c.team_id, merges.c.project_id)))
+    stored = (select(gh_pull_requests.c.team_id,
+                     func.lower(gh_repos.c.full_name, type_=String) + "#" + cast(gh_pull_requests.c.number, String))
+              .join(gh_repos, gh_repos.c.id == gh_pull_requests.c.repo_row_id)
+              .where(gh_repos.c.team_id == gh_pull_requests.c.team_id, gh_pull_requests.c.state.in_(DONE_STATES)))
+    keyed = tuple_(team_id, func.lower(subject, type_=String))
+    return and_(subject.is_not(None), or_(subject.in_(merged), keyed.in_(stored)))
 
 
 OPEN_RUNS = ("queued", "running", "waiting")

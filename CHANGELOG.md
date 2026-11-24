@@ -59,6 +59,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   own row and kept live. Below it, Recent shows the last 10 grouped runs
   with a See all runs link to the full paged list. `status` on
   `GET /api/runs` now takes a comma-separated list.
+- **Completed on the Runs page.** A live run's whole thread now lists only
+  in In progress, and moves to Recent once every run in it ends.
+  Once its pull request merges or closes it moves to a Completed section at
+  the bottom that reads Merged or Closed in place of the review verdict,
+  with its own See all link. `GET /api/runs` takes `finished=1` to leave out
+  open runs, and with `group=1` every thread that has one, and `pr=done` or
+  `pr=not_done` to split on the pull request's state. The `pr` object on
+  each run adds `state`: `merged` once a merge run exists or the run's team's
+  GitHub sync stored it merged, `closed` when sync stored it closed, else
+  `open`. Listed and streamed runs also carry their workflow's `kind`.
 
 ### Changed
 
